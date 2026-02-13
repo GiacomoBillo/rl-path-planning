@@ -1,6 +1,8 @@
 {
   "name": "Avoid Everything Dev Container",
-  "dockerComposeFile": ["docker-compose.yaml"],
+
+  // CPU version of the dev container
+  "dockerComposeFile": ["docker-compose.cpu.yaml"],
   "service": "avoid-everything-dev",
   "workspaceFolder": "/workspace",
   
@@ -48,7 +50,7 @@
   
   // Set environment variables
   "remoteEnv": {
-    "PYTHONPATH": "/workspace:/workspace/robofin:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:${PYTHONPATH}",
+    "PYTHONPATH": "/workspace:/workspace/robofin:/workspace/original_avoid_everything:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:${PYTHONPATH}",
     "DISPLAY": "${localEnv:DISPLAY}",
     "ROS_DOMAIN_ID": "0"
   },

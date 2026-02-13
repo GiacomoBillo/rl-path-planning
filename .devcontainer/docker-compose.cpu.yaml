@@ -1,0 +1,46 @@
+# remove GPU sections for CPU-only setup
+
+version: '3.8'
+
+services:
+  avoid-everything-dev:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+      args:
+        USERNAME: fishbotics
+    image: avoid-everything-cpu:latest
+    
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    
+    network_mode: host
+    privileged: true
+    
+    environment:
+      - DISPLAY=${DISPLAY}
+      # - NVIDIA_VISIBLE_DEVICES=all
+      # - NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
+      - NCCL_DEBUG=WARN
+      - PYTHONPATH=/workspace
+    
+    volumes:
+      - ..:/workspace:cached
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /etc/localtime:/etc/localtime:ro
+    
+    working_dir: /workspace
+    
+    # keep container running
+    stdin_open: true
+    tty: true
+
+    # increase shared memory size
+    shm_size: 10G
+    
+    command: /bin/bash -c "while sleep 1000; do :; done" 

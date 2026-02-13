@@ -27,7 +27,9 @@ ipdb==0.13.13
 torch-geometric==2.6.1
 fastapi==0.115.12
 numba==0.61.2
-bpy==4.0.0
+# bpy==4.0.0 # error during DevContainer build
+# ERROR: Could not find a version that satisfies the requirement bpy==4.0.0 (from versions: none)
+# ERROR: No matching distribution found for bpy==4.0.0
 pyzmq==27.0.0
 fasteners==0.19
 urdf_parser_py==0.0.4

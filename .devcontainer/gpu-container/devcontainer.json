@@ -1,0 +1,63 @@
+{
+  "name": "Avoid Everything Dev Container",
+
+  // GPU version of the dev container   
+  "dockerComposeFile": ["docker-compose.yaml"],
+  "service": "avoid-everything-dev",
+  "workspaceFolder": "/workspace",
+  
+  // Configure tool-specific properties
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.pylint",
+        "ms-python.black-formatter",
+        "ms-toolsai.jupyter",
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/bin/python3",
+        "python.linting.enabled": true,
+        "python.linting.pylintEnabled": true,
+        "python.formatting.provider": "black",
+        "python.analysis.extraPaths": [
+          "/opt/ros/humble/lib/python3.10/site-packages",
+          "/opt/ros/humble/local/lib/python3.10/dist-packages",
+          "/workspace/viz_server/src",
+          "/workspace/robofin"
+        ],
+        "python.linting.pylintArgs": [
+          "--init-hook=import sys; sys.path.append('/opt/ros/humble/lib/python3.10/site-packages'); sys.path.append('/opt/ros/humble/local/lib/python3.10/dist-packages')"
+        ],
+        "pylint.args": [
+          "--init-hook=import sys; sys.path.append('/opt/ros/humble/lib/python3.10/site-packages'); sys.path.append('/opt/ros/humble/local/lib/python3.10/dist-packages')"
+        ]
+      }
+    }
+  },
+  
+  // Add features to the dev container
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": false,
+      "installOhMyZsh": false,
+      "upgradePackages": false
+    }
+  },
+  
+  // Set environment variables
+  "remoteEnv": {
+    "PYTHONPATH": "/workspace:/workspace/robofin:/workspace/original_avoid_everything:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:${PYTHONPATH}",
+    "DISPLAY": "${localEnv:DISPLAY}",
+    "ROS_DOMAIN_ID": "0"
+  },
+  
+  // Set git safe directory and install robofin
+  "postCreateCommand": "git config --global --add safe.directory /workspace && pip install -e /workspace/robofin && pip install -e /workspace/viz_server",
+  
+  // Keep container running
+  "shutdownAction": "stopCompose"
+} 

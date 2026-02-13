@@ -163,9 +163,8 @@ WORKDIR /workspace
 
 # Set Blender startup file (start in scripting mode)
 RUN mkdir -p /home/$USERNAME/.config/blender/4.2/config
-COPY .devcontainer/blender_config/startup.blend /home/$USERNAME/.config/blender/4.2/config/startup.blend
+COPY --chown=$USERNAME:$USERNAME .devcontainer/blender_config/startup.blend /home/$USERNAME/.config/blender/4.2/config/startup.blend
 
 # Copy RViz configuration file
 RUN mkdir -p /home/$USERNAME/.rviz2
-COPY rviz_config/avoid_everything.rviz /home/$USERNAME/.rviz2/default.rviz
-RUN chown -R $USERNAME:$USERNAME /home/$USERNAME/.rviz2
+COPY --chown=$USERNAME:$USERNAME rviz_config/avoid_everything.rviz /home/$USERNAME/.rviz2/default.rviz

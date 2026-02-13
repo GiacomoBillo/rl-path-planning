@@ -2,7 +2,15 @@
 
 This directory contains the development container configuration for the Avoid Everything project.
 
-## Prerequisites
+This project supports both GPU and CPU configurations. 
+When opening the dev container, you can choose which configuration to use by selecting: 
+
++ ` cpu-container/devcontainer.json ` for CPU-only development
++ `gpu-container/devcontainer.json` for GPU development
+
+
+
+## Prerequisites (for GPU setup)
 
 1. **Docker** with NVIDIA Container Toolkit for GPU support
 2. **VS Code** or **Cursor** with Dev Containers extension

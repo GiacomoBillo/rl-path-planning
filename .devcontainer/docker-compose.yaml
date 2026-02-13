@@ -45,6 +45,9 @@ services:
     # Keep container running
     stdin_open: true
     tty: true
+
+    # increase shared memory size
+    shm_size: 10G
     
-    # Command to run
+    # command to run
     command: /bin/bash -c "while sleep 1000; do :; done" 
