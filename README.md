@@ -4,9 +4,40 @@ I had some trouble using the original project, so I made this fork to fix the is
 
 ## Quick start
 
-Run pre-training with:
+This section describes how you can training going with the simulated Franka Panda robot, which was used for the original Avoid Everything project. If you want to use another robot, you need to find a `.urdf` file for it, provide a configuration file with the same fields as `/workspace/assets/panda/robot_config.yaml`, and you need to generate a sphere representation of the robot, see **Spherification** below.
+
+First, open up this workspace in the Docker devcontainer, ideally using VSCode (or a fork thereof), alternatively using docker compose manually.
+
+Once inside the built devcontainer, download the training data for the cubby environment:
 ```
-python3 avoid_everything/run_training.py model_configs/pretraining.yaml
+cd /workspace
+mkdir datasets
+cd datasets
+wget https://zenodo.org/records/15249565/files/cubby_pretraining_data.zip?download=1 -o cubby_pretraining_data.zip
+unzip cubby_pretraining_data.zip
+```
+
+Optionally, download the trained model checkpoints:
+```
+cd /workspace
+mkdir checkpoints
+cd checkpoints
+wget https://zenodo.org/records/15249565/files/mpiformer_cubby.ckpt?download=1 -o mpiformer_cubby.ckpt
+wget https://zenodo.org/records/15249565/files/avoid_everything_cubby.ckpt?download=1 -o avoid_everything_cubby.ckpt
+```
+
+In the model config file for testing, `/workspace/model_configs/col_test.yaml`, set the `data_dir` parameter to 
+the path where the `train/` and `val/` data folders are.
+
+Optionally, set `load_model_from_checkpoint: true` and set `load_checkpoint_path` to the file path where you have the checkpoint that you want to start from. Set `load_actor_only: true` if using the downloaded checkpoints, since they do not include critic weights. 
+
+Most parameters are documented in `/workspace/model_configs/col_test.yaml`. Notably, `pretraining_steps` decides how many training steps to take before the replay buffer starts getting sampled from. Note that the training will appear to slow down at this point, judging from the progress bar, but this is not the case. It simply draws samples from the expert dataset at a slower rate, due to some samples being drawn from the replay buffer instead (ratio decided by parameter `expert_fraction`, default 25% -> looks like a 1/4 slowdown). `start_using_actor_loss` gives the number of global training steps to take before using the critic-guided actor loss.
+
+Setting `logging: true` will log to wandb, log into wandb (with API key) in the devcontainer terminal before running training with `logging: true`.
+
+Run the training with
+```
+python3 avoid_everything_except_exploration/run_training.py model_configs/col_test.yaml
 ```
 
 ### Spherification
