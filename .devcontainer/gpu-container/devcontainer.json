@@ -2,7 +2,7 @@
   "name": "Avoid Everything Dev Container",
 
   // GPU version of the dev container   
-  "dockerComposeFile": ["docker-compose.yaml"],
+  "dockerComposeFile": ["../docker-compose.yaml"],
   "service": "avoid-everything-dev",
   "workspaceFolder": "/workspace",
   
@@ -25,14 +25,15 @@
         "python.analysis.extraPaths": [
           "/opt/ros/humble/lib/python3.10/site-packages",
           "/opt/ros/humble/local/lib/python3.10/dist-packages",
+          "/workspace/avoid_everything",
           "/workspace/viz_server/src",
           "/workspace/robofin"
         ],
         "python.linting.pylintArgs": [
-          "--init-hook=import sys; sys.path.append('/opt/ros/humble/lib/python3.10/site-packages'); sys.path.append('/opt/ros/humble/local/lib/python3.10/dist-packages')"
+          "--init-hook=import sys; sys.path.append('/opt/ros/humble/lib/python3.10/site-packages'); sys.path.append('/opt/ros/humble/local/lib/python3.10/dist-packages'); sys.path.append('/workspace/avoid_everything')"
         ],
         "pylint.args": [
-          "--init-hook=import sys; sys.path.append('/opt/ros/humble/lib/python3.10/site-packages'); sys.path.append('/opt/ros/humble/local/lib/python3.10/dist-packages')"
+          "--init-hook=import sys; sys.path.append('/opt/ros/humble/lib/python3.10/site-packages'); sys.path.append('/opt/ros/humble/local/lib/python3.10/dist-packages'); sys.path.append('/workspace/avoid_everything')"
         ]
       }
     }
@@ -50,7 +51,7 @@
   
   // Set environment variables
   "remoteEnv": {
-    "PYTHONPATH": "/workspace:/workspace/robofin:/workspace/original_avoid_everything:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:${PYTHONPATH}",
+    "PYTHONPATH": "/workspace:/workspace/robofin:/workspace/avoid_everything:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:${PYTHONPATH}",
     "DISPLAY": "${localEnv:DISPLAY}",
     "ROS_DOMAIN_ID": "0"
   },
