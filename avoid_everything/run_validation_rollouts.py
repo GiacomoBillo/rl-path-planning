@@ -13,9 +13,12 @@ from avoid_everything.type_defs import DatasetType
 
 
 @torch.no_grad()
-def run(cfg_path):
+def run(cfg_path, debug_n_batches=None):
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Evaluating on device: {device}")
 
     # You can load a ROPE checkpoint into the Pretraining model class because
     # the architecture is the same (only the training implementation is different)
@@ -33,12 +36,18 @@ def run(cfg_path):
         disable_viz=True,
         **cfg["training_model_parameters"],
         **cfg["shared_parameters"],
-    ).cuda()
+    ).to(device)
     dm.setup("fit")
     mdl.setup("fit")
     dl = dm.val_dataloader()[DatasetType.VAL]
-    for ii, batch in enumerate(tqdm(dl)):
-        batch = {key: val.cuda() for key, val in batch.items()}
+    
+    # Limit batches in debug mode
+    total_batches = len(dl) if debug_n_batches is None else min(debug_n_batches, len(dl))
+    
+    for ii, batch in enumerate(tqdm(dl, total=total_batches)):
+        if debug_n_batches is not None and ii >= debug_n_batches:
+            break
+        batch = {key: val.to(device) for key, val in batch.items()}
         mdl.trajectory_validation_step(batch, DatasetType.VAL)
     print("Collision Rate:", f"{mdl.val_collision_rate.compute().item():.2%}")
     print("Reaching Success Rate:", f"{mdl.val_reaching_success_rate.compute().item():.2%}")
@@ -55,6 +64,13 @@ def run(cfg_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("cfg_path")
+    parser.add_argument("cfg_path", help="Path to the configuration YAML file")
+    parser.add_argument(
+        "--debug",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Debug mode: only process N batches (e.g., --debug 10)",
+    )
     args = parser.parse_args()
-    run(args.cfg_path)
+    run(args.cfg_path, debug_n_batches=args.debug)
