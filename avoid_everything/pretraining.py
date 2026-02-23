@@ -10,6 +10,7 @@ from avoid_everything.geometry import TorchCuboids, TorchCylinders
 from avoid_everything.loss import CollisionAndBCLossFn
 from avoid_everything.mpiformer import MotionPolicyTransformer
 from avoid_everything.type_defs import DatasetType
+from utils.failure_analysis import FailureAnalyzer
 
 from termcolor import cprint
 
@@ -39,6 +40,7 @@ class PretrainingMotionPolicyTransformer(MotionPolicyTransformer):
         decay_rate: float,
         pc_bounds: list[list[float]],
         action_chunk_length: int,
+        failure_analyzer: FailureAnalyzer = None,
     ):
         """
         Creates the network and assigns additional parameters for training
@@ -79,6 +81,7 @@ class PretrainingMotionPolicyTransformer(MotionPolicyTransformer):
         self.train_batch_size = train_batch_size
         self.corrected_step = 0
         self.action_chunk_length = action_chunk_length
+        self.failure_analyzer = failure_analyzer
 
     def configure_optimizers(self):
         """
@@ -427,6 +430,23 @@ class PretrainingMotionPolicyTransformer(MotionPolicyTransformer):
             self.val_success_rate.update(
                 torch.logical_and(~has_collision, has_reaching_success).float().detach()
             )
+            # Save failed trajectories for analysis if analyzer is enabled
+            if self.failure_analyzer is not None and has_collision.any():
+                try:
+                    self.failure_analyzer.save(
+                        batch=batch,
+                        rollouts=rollouts,
+                        has_collision=has_collision,
+                        position_error=position_error,
+                        orientation_error=orientation_error,
+                        has_reaching_success=has_reaching_success,
+                    )
+                except RuntimeError as e:
+                    if "max_failures" in str(e):
+                        cprint(f"Stopping validation: {e}", "red")
+                        raise
+                    else:
+                        raise
 
     def validation_step(  # type: ignore[override]
         self, batch: dict[str, torch.Tensor], _batch_idx: int, dataloader_idx: int
