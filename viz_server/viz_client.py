@@ -44,6 +44,11 @@ def _server_alive() -> bool:
         return False
 
 
+def is_connected() -> bool:
+    """Return True if viz_client has an active connection to viz_server."""
+    return _connected
+
+
 def connect(urdf: str, *, port: int = 5556) -> None:
     """
     Ensure viz_server is running and obtain a REQ socket.
