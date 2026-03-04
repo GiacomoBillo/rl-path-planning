@@ -34,6 +34,37 @@ def _seed_numba_rng(seed: int):
     np.random.seed(seed)
 
 
+def _compute_target_errors(
+    eef_pose: torch.Tensor,
+    target_position: np.ndarray,
+    target_orientation: np.ndarray,
+) -> tuple[float, float]:
+    """Compute position and orientation errors between an EEF pose and the target.
+
+    Mirrors the math in rope.py::check_reaching_success().
+
+    Args:
+        eef_pose: (1, 4, 4) tensor — end-effector pose from robot.fk_torch()
+        target_position: (3,) array — target EEF position in metres
+        target_orientation: (3, 3) array — target EEF rotation matrix
+
+    Returns:
+        position_error: float, L2 distance in metres
+        orientation_error: float, geodesic angle in degrees
+    """
+    target_pos_t = torch.tensor(target_position, dtype=torch.float32)          # (3,)
+    target_rot_t = torch.tensor(target_orientation, dtype=torch.float32)        # (3, 3)
+
+    position_error: float = torch.linalg.vector_norm(eef_pose[0, :3, -1] - target_pos_t).item()
+
+    R = torch.matmul(eef_pose[0, :3, :3], target_rot_t.T)                      # (3, 3)
+    trace = R.diagonal().sum()
+    cos_value = torch.clamp((trace - 1) / 2, -1.0, 1.0)
+    orientation_error: float = torch.abs(torch.rad2deg(torch.acos(cos_value))).item()
+
+    return position_error, orientation_error
+
+
 class AvoidEverythingEnv(gym.Env):
     """
     Gymnasium environment: the robot must reach a target pose while avoiding obstacles.
@@ -50,6 +81,8 @@ class AvoidEverythingEnv(gym.Env):
         num_target_points: int = 128,
         collision_mode: Literal["franka", "spheres", "torch"] = "franka",
         scene_buffer: float = 0.0,
+        position_threshold: float = 0.01,
+        orientation_threshold: float = 15.0,
         render_mode: str | None = None,
         render_backend: Literal["ros", "pybullet"] | None = None,
     ):
@@ -62,6 +95,8 @@ class AvoidEverythingEnv(gym.Env):
             num_target_points: number of points to sample on the target for the point cloud observation
             collision_mode: which collision checker to use ("franka", "spheres", or "torch")
             scene_buffer: additional buffer distance for collision checking (in meters)
+            position_threshold: max end-effector position error to consider target reached (meters, default 0.01)
+            orientation_threshold: max end-effector orientation error to consider target reached (degrees, default 15)
             render_mode: Gymnasium render mode ("human", "rgb_array", or None). None disables rendering.
             render_backend: rendering engine ("ros" or "pybullet"). None auto-selects:
                 "ros" for render_mode="human", "pybullet" for render_mode="rgb_array".
@@ -107,6 +142,10 @@ class AvoidEverythingEnv(gym.Env):
         # Cached per-episode scene primitives (populated in reset())
         self._scene_primitives = None
 
+        # Target-reaching thresholds (AvoidEverything default values)
+        self.position_threshold = position_threshold       # metres
+        self.orientation_threshold = orientation_threshold  # degrees
+
         # State space, state variables
         self.robot_config = None
         self.target_position = None
@@ -118,7 +157,7 @@ class AvoidEverythingEnv(gym.Env):
         self.observation_space = gym.spaces.Dict(
             { 
                 # TODO: raise warning, might need to set limited bounds 
-                "point_cloud": gym.spaces.Box(-np.inf, np.inf, shape=(total_points, 3), dtype=np.float32),  
+                "point_cloud": gym.spaces.Box(-5, 5, shape=(total_points, 3), dtype=np.float32),  
                 "point_cloud_labels": gym.spaces.Box(0, 2, shape=(total_points, 1), dtype=np.int32),
                 "configuration": gym.spaces.Box(-1.0, 1.0, shape=(self.robot.MAIN_DOF,), dtype=np.float32),
                 # "target_position": gym.spaces.Box(-np.inf, np.inf, shape=(3,), dtype=np.float32),
@@ -190,14 +229,14 @@ class AvoidEverythingEnv(gym.Env):
 
         # Check for collision and target reaching
         collision = self._check_collision()
-        target_reached = self._check_target_reached()
+        target_reached, pos_err, orien_err = self._check_target_reached()
 
         # Get new observation, compute reward, check termination and truncation
         obs = self._get_obs()
         reward = self._compute_reward(collision, target_reached)
         terminated = collision or target_reached # TODO: also terminate if max steps exceeded (with wrapper?)
         truncated = False  # TODO: No truncation for now, but could be used for max episode length, max steps exceeded with wrapper
-        info = {"collision": collision}
+        info = {"collision": collision, "target_reached": target_reached, "position_error": pos_err, "orientation_error": orien_err, "action_clipped": np.any(clipped_action > 0)}
 
         return obs, reward, terminated, truncated, info
 
@@ -324,10 +363,17 @@ class AvoidEverythingEnv(gym.Env):
 
 
     def _check_target_reached(self):
-        """Check if current end-effector pose is close enough to target using position and orientation thresholds 
-        and task space position and orientation errors."""
-        # TODO
-        return False
+        """Check if current end-effector pose is within position and orientation thresholds of the target."""
+        config = torch.tensor(
+            self.robot.unnormalize_joints(self.robot_config), dtype=torch.float32
+        ).unsqueeze(0)  # (1, MAIN_DOF)
+        eef_pose = self.robot.fk_torch(config, link_name=self.robot.tcp_link_name)
+        assert isinstance(eef_pose, torch.Tensor)
+        pos_err, orien_err = _compute_target_errors(
+            eef_pose, self.target_position, self.target_orientation
+        )
+        target_reached = pos_err < self.position_threshold and orien_err < self.orientation_threshold
+        return target_reached, pos_err, orien_err
 
     def _compute_reward(self, collision, target_reached):
         """Compute reward"""
@@ -507,7 +553,6 @@ class AvoidEverythingEnv(gym.Env):
             self._pb_obstacle_ids = []
 
         super().close()
-
 
 
 
