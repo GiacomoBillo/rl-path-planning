@@ -3,25 +3,29 @@ RL environment for reach traget while avoiding obstacles.
 Custom Gymnasium environment for training the RL agent.
 """
 
-import numpy as np
 import random
+from typing import Literal
+import numpy as np
 import gymnasium as gym
 import numba as nb
 import torch
 
-from typing import Literal
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from gymnasium.utils.env_checker import check_env
 from geometrout.primitive import Cuboid, CuboidArray, Cylinder, CylinderArray
 
 from robofin.robots import Robot
 from robofin.samplers import NumpyRobotSampler
-from robofin.geometry import construct_mixed_point_cloud
 from robofin.old.collision import FrankaCollisionSpheres
 from robofin.collision import CollisionSpheres
 from avoid_everything.geometry import TorchCuboids, TorchCylinders
 from avoid_everything.data_loader import StateDataset
 from avoid_everything.type_defs import DatasetType
+
+import viz_client
+from utils.visualization import visualize_problem
+
+import pybullet as _pybullet
 
 
 @nb.jit(nopython=True)
@@ -35,7 +39,7 @@ class AvoidEverythingEnv(gym.Env):
     Gymnasium environment: the robot must reach a target pose while avoiding obstacles.
     """
 
-    metadata = {"render_modes": []}  # No rendering for now
+    metadata = {"render_modes": ["human", "rgb_array"]}
 
     def __init__(
         self,
@@ -46,6 +50,8 @@ class AvoidEverythingEnv(gym.Env):
         num_target_points: int = 128,
         collision_mode: Literal["franka", "spheres", "torch"] = "franka",
         scene_buffer: float = 0.0,
+        render_mode: str | None = None,
+        render_backend: Literal["ros", "pybullet"] | None = None,
     ):
         """Initialize environment.
         Args:
@@ -56,11 +62,18 @@ class AvoidEverythingEnv(gym.Env):
             num_target_points: number of points to sample on the target for the point cloud observation
             collision_mode: which collision checker to use ("franka", "spheres", or "torch")
             scene_buffer: additional buffer distance for collision checking (in meters)
+            render_mode: Gymnasium render mode ("human", "rgb_array", or None). None disables rendering.
+            render_backend: rendering engine ("ros" or "pybullet"). None auto-selects:
+                "ros" for render_mode="human", "pybullet" for render_mode="rgb_array".
+                render_backend="ros" is incompatible with render_mode="rgb_array".
         """
         super().__init__()
 
         # Store dataset reference
         self.dataloader: DataLoader = dataloader
+
+        # Store URDF path
+        self.urdf_path = urdf_path
 
         # Initialize robot
         self.robot = Robot(urdf_path)
@@ -115,6 +128,9 @@ class AvoidEverythingEnv(gym.Env):
         # Action space: normalized joint deltas [-1, 1] for main DOF
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.robot.MAIN_DOF,), dtype=np.float32,)
 
+        # Render setup
+        self._render_setup(render_mode, render_backend)
+
     def reset(self, seed=None, options=None):
         """Reset environment
         sample random initial robot config, obstacle config and target config
@@ -140,6 +156,8 @@ class AvoidEverythingEnv(gym.Env):
 
             # Cache scene primitives for collision checking
             self._scene_primitives = self._build_scene_primitives()
+            # Mark static scene as not yet published so render() will publish obstacles + ghost EEF once
+            self._static_scene_published = False
         
         # Generate random problem
         else:
@@ -317,7 +335,180 @@ class AvoidEverythingEnv(gym.Env):
         reward = -100 if collision else 100 if target_reached else -0.1  
         return reward
 
-    # TODO: add render() method if needed: pybullet or viz_client/server   
+    def _render_setup(
+        self,
+        render_mode: str | None,
+        render_backend: Literal["ros", "pybullet"] | None,
+    ) -> None:
+        """Resolve and store render configuration; initialize lazy backend handles."""
+        self.render_mode = render_mode
+        if render_mode is None:
+            self._render_backend = None
+        elif render_backend is not None:
+            if render_mode == "rgb_array" and render_backend == "ros":
+                raise ValueError("render_backend='ros' does not support render_mode='rgb_array'.")
+            self._render_backend = render_backend
+        elif render_mode == "human":
+            self._render_backend = "ros"
+        elif render_mode == "rgb_array":
+            self._render_backend = "pybullet"
+        else:
+            raise ValueError(f"Unknown render_mode: {render_mode!r}. Choose 'human', 'rgb_array', or None.")
+
+        # backend-agnostic flag: static scene (obstacles + target marker) published once per episode
+        self._static_scene_published: bool = False
+        # PyBullet lazy handles — initialised on first render() call
+        self._pb_client = None
+        self._pb_robot_id = None
+        self._pb_joint_map: dict = {}
+        self._pb_obstacle_ids: list = []
+
+    def render(self):
+        """Render the environment according to render_mode and render_backend."""
+        if self.render_mode is None:
+            return None
+        if self._render_backend == "ros":
+            return self._render_ros()
+        elif self._render_backend == "pybullet":
+            return self._render_pybullet()
+
+    def _render_ros(self):
+        """Render via viz_client → RViz / Foxglove (render_mode='human', render_backend='ros').
+
+        Uses visualize_problem() from utils/visualization.py to publish the full scene
+        (obstacles + ghost EEF + robot config) once per episode, then only updates the
+        robot config on each subsequent call (obstacles and target are static per episode).
+        """
+        if not self._static_scene_published:
+            # Publish full scene: ghost EEF at target, obstacles, robot at current config
+            problem_with_current = {**self.problem, "configuration": self.robot_config}
+            visualize_problem(self.robot, problem_with_current)
+            self._static_scene_published = True
+        else:
+            # Only the robot moved — cheaply update its configuration
+            viz_client.publish_config(self.robot.unnormalize_joints(self.robot_config))
+
+        return None
+
+    def _render_pybullet(self):
+        """Render via PyBullet (render_mode='human'→GUI window, 'rgb_array'→ndarray)."""
+        # Lazy initialisation
+        if self._pb_client is None:
+            mode = _pybullet.GUI if self.render_mode == "human" else _pybullet.DIRECT
+            self._pb_client = _pybullet.connect(mode)
+            _pybullet.setGravity(0, 0, 0, physicsClientId=self._pb_client)
+            self._pb_robot_id = _pybullet.loadURDF(
+                self.urdf_path,
+                useFixedBase=True,
+                physicsClientId=self._pb_client,
+            )
+            # Build joint-name → joint-index map
+            for i in range(_pybullet.getNumJoints(self._pb_robot_id, physicsClientId=self._pb_client)):
+                info = _pybullet.getJointInfo(self._pb_robot_id, i, physicsClientId=self._pb_client)
+                self._pb_joint_map[info[1].decode()] = i
+
+        # Update robot joint states
+        unnorm_config = self.robot.unnormalize_joints(self.robot_config)
+        for joint_name, angle in zip(self.robot.main_joint_names, unnorm_config):
+            if joint_name in self._pb_joint_map:
+                _pybullet.resetJointState(
+                    self._pb_robot_id, self._pb_joint_map[joint_name], float(angle),
+                    physicsClientId=self._pb_client,
+                )
+
+        # Create static obstacles and target marker once per episode
+        if not self._static_scene_published:
+            obstacle_rgba = [0.8, 0.5, 0.2, 0.8]
+            for center, dims, quat_wxyz in zip(
+                self.problem["cuboid_centers"],
+                self.problem["cuboid_dims"],
+                self.problem["cuboid_quats"],
+            ):
+                if not np.all(dims > 0):
+                    continue
+                quat_xyzw = [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
+                vis = _pybullet.createVisualShape(
+                    _pybullet.GEOM_BOX, halfExtents=(dims / 2).tolist(),
+                    rgbaColor=obstacle_rgba, physicsClientId=self._pb_client,
+                )
+                body = _pybullet.createMultiBody(
+                    baseVisualShapeIndex=vis,
+                    basePosition=center.tolist(), baseOrientation=quat_xyzw,
+                    physicsClientId=self._pb_client,
+                )
+                self._pb_obstacle_ids.append(body)
+
+            for center, radius, height, quat_wxyz in zip(
+                self.problem["cylinder_centers"],
+                self.problem["cylinder_radii"],
+                self.problem["cylinder_heights"],
+                self.problem["cylinder_quats"],
+            ):
+                r, h = float(radius), float(height)
+                if r <= 0 or h <= 0:
+                    continue
+                quat_xyzw = [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
+                vis = _pybullet.createVisualShape(
+                    _pybullet.GEOM_CYLINDER, radius=r, length=h,
+                    rgbaColor=obstacle_rgba, physicsClientId=self._pb_client,
+                )
+                body = _pybullet.createMultiBody(
+                    baseVisualShapeIndex=vis,
+                    basePosition=center.tolist(), baseOrientation=quat_xyzw,
+                    physicsClientId=self._pb_client,
+                )
+                self._pb_obstacle_ids.append(body)
+
+            # target marker: small sphere at target_position
+            try:
+                tpos = np.array(self.target_position, dtype=np.float32)
+                tvis = _pybullet.createVisualShape(_pybullet.GEOM_SPHERE, radius=0.02, rgbaColor=[0.2, 0.8, 0.2, 0.9], physicsClientId=self._pb_client)
+                tbody = _pybullet.createMultiBody(baseVisualShapeIndex=tvis, basePosition=tpos.tolist(), physicsClientId=self._pb_client)
+                self._pb_obstacle_ids.append(tbody)
+            except Exception:
+                # If target_position missing or invalid, skip target marker
+                pass
+
+            self._static_scene_published = True
+
+        if self.render_mode == "rgb_array":
+            width, height_px = 640, 480
+            view_matrix = _pybullet.computeViewMatrix(
+                cameraEyePosition=[1.5, 1.5, 1.5],
+                cameraTargetPosition=[0.0, 0.0, 0.5],
+                cameraUpVector=[0.0, 0.0, 1.0],
+                physicsClientId=self._pb_client,
+            )
+            proj_matrix = _pybullet.computeProjectionMatrixFOV(
+                fov=60, aspect=width / height_px, nearVal=0.1, farVal=10.0,
+                physicsClientId=self._pb_client,
+            )
+            _, _, rgb, _, _ = _pybullet.getCameraImage(
+                width, height_px, view_matrix, proj_matrix,
+                physicsClientId=self._pb_client,
+            )
+            return np.array(rgb, dtype=np.uint8)[:, :, :3]
+
+        return None
+
+    def close(self):
+        """Clean up render backends and call super().close()."""
+        if self._render_backend == "ros" and viz_client is not None and viz_client.is_connected():
+            viz_client.shutdown()
+
+        if self._pb_client is not None:
+            try:
+                _pybullet.disconnect(self._pb_client)
+            except Exception:
+                pass
+            self._pb_client = None
+            self._pb_robot_id = None
+            self._pb_joint_map = {}
+            self._pb_obstacle_ids = []
+
+        super().close()
+
+
 
 
 
@@ -346,12 +537,12 @@ if __name__ == "__main__":
     print(f"✓ Dataset loaded: {len(dataset)} samples")
     # Create DataLoader with batch_size=1 (environment processes one problem at a time)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
-    print(f"✓ DataLoader created")
+    print("✓ DataLoader created")
 
 
     # Create environment
     env = AvoidEverythingEnv(dataloader=dataloader, urdf_path="assets/panda/panda.urdf")
-    print(f"✓ Environment created")
+    print("✓ Environment created")
 
     # Test reset
     obs, info = env.reset()
@@ -364,9 +555,9 @@ if __name__ == "__main__":
     action = np.zeros(env.action_space.shape, dtype=np.float32)  # No movement
     obs, reward, terminated, truncated, info = env.step(action)
     print("✓ Step executed:")
-    print(f"  - Reward: {reward}")
-    print(f"  - Terminated: {terminated}")
-    print(f"  - Info: {info}")
+    print("  - Reward:", reward)
+    print("  - Terminated:", terminated)
+    print("  - Info:", info)
 
     # Check Environment Validity
     # from https://gymnasium.farama.org/introduction/create_custom_env/#debugging-your-environment
