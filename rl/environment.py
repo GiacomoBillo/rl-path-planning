@@ -9,6 +9,7 @@ import numpy as np
 import gymnasium as gym
 import numba as nb
 import torch
+import time
 
 from torch.utils.data import DataLoader
 from gymnasium.utils.env_checker import check_env
@@ -70,11 +71,11 @@ class AvoidEverythingEnv(gym.Env):
     Gymnasium environment: the robot must reach a target pose while avoiding obstacles.
     """
 
-    metadata = {"render_modes": ["human", "rgb_array"]}
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": None}
 
     def __init__(
         self,
-        dataloader: DataLoader,  # Dataset object
+        dataloader: DataLoader = None,  # Dataset object
         urdf_path: str = "assets/panda/panda.urdf", # URDF path for the robot
         num_robot_points: int = 2048,
         num_obstacle_points: int = 4096,
@@ -85,6 +86,7 @@ class AvoidEverythingEnv(gym.Env):
         orientation_threshold: float = 15.0,
         render_mode: str | None = None,
         render_backend: Literal["ros", "pybullet"] | None = None,
+        render_fps: float | None = None,
     ):
         """Initialize environment.
         Args:
@@ -168,7 +170,7 @@ class AvoidEverythingEnv(gym.Env):
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.robot.MAIN_DOF,), dtype=np.float32,)
 
         # Render setup
-        self._render_setup(render_mode, render_backend)
+        self._render_setup(render_mode, render_backend, render_fps)
 
     def reset(self, seed=None, options=None):
         """Reset environment
@@ -385,6 +387,7 @@ class AvoidEverythingEnv(gym.Env):
         self,
         render_mode: str | None,
         render_backend: Literal["ros", "pybullet"] | None,
+        render_fps: float | None,
     ) -> None:
         """Resolve and store render configuration; initialize lazy backend handles."""
         self.render_mode = render_mode
@@ -409,14 +412,41 @@ class AvoidEverythingEnv(gym.Env):
         self._pb_joint_map: dict = {}
         self._pb_obstacle_ids: list = []
 
+        self.metadata["render_fps"] = render_fps
+        self._last_render_time = None
+        self._render_period = 1.0 / render_fps if render_fps is not None else None
+
+        # if self._render_backend == "ros":
+        #     viz_client.connect() # need to pass urdf??
+
     def render(self):
-        """Render the environment according to render_mode and render_backend."""
+        """Render the environment according to render_mode and render_backend.
+
+        If render_fps was set at initialization, this method will block as needed to
+        enforce the target frames-per-second (blocking throttle). This is simple and
+        suitable for manual visualization/debugging, but will slow down any caller
+        that calls env.render() frequently (e.g., training loops).
+        """
         if self.render_mode is None:
             return None
+
+        # Blocking to match render FPS 
+        if self.metadata["render_fps"] is not None:
+            now = time.perf_counter()
+            if self._last_render_time is not None:
+                elapsed = now - self._last_render_time
+                to_sleep = self._render_period - elapsed
+                if to_sleep > 0:
+                    time.sleep(to_sleep)
+
         if self._render_backend == "ros":
-            return self._render_ros()
+            result = self._render_ros()
         elif self._render_backend == "pybullet":
-            return self._render_pybullet()
+            result = self._render_pybullet()
+
+        # Update last render timestamp after performing render
+        self._last_render_time = time.perf_counter()
+        return result
 
     def _render_ros(self):
         """Render via viz_client → RViz / Foxglove (render_mode='human', render_backend='ros').
