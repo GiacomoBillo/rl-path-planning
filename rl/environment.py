@@ -13,6 +13,7 @@ import time
 
 from torch.utils.data import DataLoader
 from gymnasium.utils.env_checker import check_env
+from gymnasium.wrappers import TimeLimit
 from geometrout.primitive import Cuboid, CuboidArray, Cylinder, CylinderArray
 
 from robofin.robots import Robot
@@ -27,6 +28,71 @@ import viz_client
 from utils.visualization import visualize_problem
 
 import pybullet as _pybullet
+
+
+class AvoidEverythingEnv(TimeLimit):
+    """
+    Public environment: wraps `_AvoidEverythingEnv` with Gymnasium's `TimeLimit`.
+
+    Accepts all `_AvoidEverythingEnv` constructor arguments plus `max_episode_steps`.
+    Episodes are truncated (not terminated) once the step limit is reached.
+
+    Example::
+
+        env = AvoidEverythingEnv(dataloader=dl, urdf_path="assets/panda/panda.urdf",
+                                  max_episode_steps=200)
+    """
+
+    def __init__(
+        self,
+        dataloader: DataLoader = None,
+        urdf_path: str = "assets/panda/panda.urdf",
+        num_robot_points: int = 2048,
+        num_obstacle_points: int = 4096,
+        num_target_points: int = 128,
+        collision_mode: Literal["franka", "spheres", "torch"] = "franka",
+        scene_buffer: float = 0.0,
+        position_threshold: float = 0.01,
+        orientation_threshold: float = 15.0,
+        render_mode: Literal["human", "rgb_array"] | None = None,
+        render_backend: Literal["ros", "pybullet"] | None = None,
+        render_fps: float | None = None,
+        max_episode_steps: int = 50,
+    ):
+        """Initialize environment with an automatic TimeLimit wrapper.
+
+        Args:
+            dataloader: DataLoader providing batches of problems (start config, obstacles, target)
+            urdf_path: path to robot URDF file
+            num_robot_points: number of points to sample on the robot for the point cloud observation
+            num_obstacle_points: number of points to sample on the obstacles for the point cloud observation
+            num_target_points: number of points to sample on the target for the point cloud observation
+            collision_mode: which collision checker to use ("franka", "spheres", or "torch")
+            scene_buffer: additional buffer distance for collision checking (in meters)
+            position_threshold: max end-effector position error to consider target reached (meters, default 0.01)
+            orientation_threshold: max end-effector orientation error to consider target reached (degrees, default 15)
+            render_mode: Gymnasium render mode ("human", "rgb_array", or None). None disables rendering.
+            render_backend: rendering engine ("ros" or "pybullet"). None auto-selects.
+            render_fps: target frame rate for rendering (None = as fast as possible)
+            max_episode_steps: maximum number of steps per episode before truncation (default 50)
+        """
+        # instantiate the base env
+        env = _AvoidEverythingEnv(
+            dataloader=dataloader,
+            urdf_path=urdf_path,
+            num_robot_points=num_robot_points,
+            num_obstacle_points=num_obstacle_points,
+            num_target_points=num_target_points,
+            collision_mode=collision_mode,
+            scene_buffer=scene_buffer,
+            position_threshold=position_threshold,
+            orientation_threshold=orientation_threshold,
+            render_mode=render_mode,
+            render_backend=render_backend,
+            render_fps=render_fps,
+        )
+        # apply time limit wrapper
+        super().__init__(env, max_episode_steps=max_episode_steps)
 
 
 @nb.jit(nopython=True)
@@ -66,7 +132,7 @@ def _compute_target_errors(
     return position_error, orientation_error
 
 
-class AvoidEverythingEnv(gym.Env):
+class _AvoidEverythingEnv(gym.Env):
     """
     Gymnasium environment: the robot must reach a target pose while avoiding obstacles.
     """
@@ -84,7 +150,7 @@ class AvoidEverythingEnv(gym.Env):
         scene_buffer: float = 0.0,
         position_threshold: float = 0.01,
         orientation_threshold: float = 15.0,
-        render_mode: str | None = None,
+        render_mode: Literal["human", "rgb_array"] | None = None,
         render_backend: Literal["ros", "pybullet"] | None = None,
         render_fps: float | None = None,
     ):
@@ -236,8 +302,8 @@ class AvoidEverythingEnv(gym.Env):
         # Get new observation, compute reward, check termination and truncation
         obs = self._get_obs()
         reward = self._compute_reward(collision, target_reached)
-        terminated = collision or target_reached # TODO: also terminate if max steps exceeded (with wrapper?)
-        truncated = False  # TODO: No truncation for now, but could be used for max episode length, max steps exceeded with wrapper
+        terminated = collision or target_reached # episode ends if we collide or reach target
+        truncated = False # truncation applyed via TimeLimit wrapper, not handled here
         info = {"collision": collision, "target_reached": target_reached, "position_error": pos_err, "orientation_error": orien_err, "action_clipped": np.any(clipped_action > 0)}
 
         return obs, reward, terminated, truncated, info
@@ -586,7 +652,6 @@ class AvoidEverythingEnv(gym.Env):
 
 
 
-
 if __name__ == "__main__":
 
     # Create robot
@@ -614,9 +679,8 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     print("✓ DataLoader created")
 
-
-    # Create environment
-    env = AvoidEverythingEnv(dataloader=dataloader, urdf_path="assets/panda/panda.urdf")
+    # Create environment (TimeLimit wrapper, episodes truncated at 50 steps)
+    env = AvoidEverythingEnv(dataloader=dataloader, urdf_path="assets/panda/panda.urdf", max_episode_steps=50)
     print("✓ Environment created")
 
     # Test reset
@@ -637,7 +701,7 @@ if __name__ == "__main__":
     # Check Environment Validity
     # from https://gymnasium.farama.org/introduction/create_custom_env/#debugging-your-environment
     try:
-        check_env(env)
+        check_env(env.unwrapped)
         print("✓ Environment passes all checks!")
     except Exception as e:
         print(f"Environment has issues: {e}")
