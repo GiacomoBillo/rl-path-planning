@@ -176,6 +176,7 @@ class MotionPolicyTransformer(pl.LightningModule):
         dropout: float = 0.1,
     ):
         super().__init__()
+        self.d_model = d_model
         self.point_cloud_embedder = MPiFormerPointNet(
             num_robot_points, feature_dim, d_model
         )
@@ -207,13 +208,19 @@ class MotionPolicyTransformer(pl.LightningModule):
         self.token_type_embedding = nn.Embedding(3, d_model)
         self.pe_layer = PositionEncoding3D(d_model)
 
-    def forward(
+    def encode(
         self,
         point_cloud_labels: torch.Tensor,
         point_cloud: torch.Tensor,
         q: torch.Tensor,
         bounds: torch.Tensor,
-    ) -> torch.Tensor:  # type: ignore[override]
+    ) -> torch.Tensor:
+        """Run the full BC encoder and return action token features.
+
+        Returns:
+            Tensor of shape (B, d_model) — the action token after the transformer,
+            before the action decoder.
+        """
         assert point_cloud_labels.shape[:2] == point_cloud.shape[:2]
         pc_embedding, pos = self.point_cloud_embedder(point_cloud_labels, point_cloud)
         feature_embedding = self.feature_embedder(q).unsqueeze(1)
@@ -227,7 +234,6 @@ class MotionPolicyTransformer(pl.LightningModule):
             dim=1,
         ).transpose(0, 1)
 
-        # Indicator embeddings to label the token type
         pc_type_emb = self.token_type_embedding(
             torch.tensor(0, dtype=torch.long, device=self.device)
         )
@@ -240,7 +246,6 @@ class MotionPolicyTransformer(pl.LightningModule):
 
         pos_emb = torch.cat(
             (
-                # Use both sin/cos emb and type label emb for pc
                 self.pe_layer(pos, bounds) + pc_type_emb,
                 joint_state_type_emb.expand((B, -1, -1)),
                 action_type_emb.expand((B, 1, -1)),
@@ -248,5 +253,15 @@ class MotionPolicyTransformer(pl.LightningModule):
             dim=1,
         ).transpose(0, 1)
         embedded_sequence = sequence + pos_emb
-        action = self.encoder(embedded_sequence, mask=None)[-1:]
-        return self.action_decoder(action).transpose(0, 1)
+        action_token = self.encoder(embedded_sequence, mask=None)[-1:]  # (1, B, d_model)
+        return action_token.squeeze(0)  # (B, d_model)
+
+    def forward(
+        self,
+        point_cloud_labels: torch.Tensor,
+        point_cloud: torch.Tensor,
+        q: torch.Tensor,
+        bounds: torch.Tensor,
+    ) -> torch.Tensor:  # type: ignore[override]
+        features = self.encode(point_cloud_labels, point_cloud, q, bounds)  # (B, d_model)
+        return self.action_decoder(features.unsqueeze(0)).transpose(0, 1)  # (B, 1, robot_dof)

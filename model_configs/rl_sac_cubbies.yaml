@@ -29,6 +29,7 @@ bc_checkpoint_parameters:
   disable_viz: true
 
 # SAC / RL
+freeze_bc_encoder: true  # Freeze BC encoder during initial RL training; call extractor.unfreeze() to fine-tune end-to-end
 seed: 42
 total_timesteps: 1000
 n_eval_episodes: 100
