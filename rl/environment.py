@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from gymnasium.utils.env_checker import check_env
 from gymnasium.wrappers import TimeLimit
 from geometrout.primitive import Cuboid, CuboidArray, Cylinder, CylinderArray
+from stable_baselines3.common.env_checker import check_env as check_env_sb3
 
 from robofin.robots import Robot
 from robofin.samplers import NumpyRobotSampler
@@ -702,6 +703,8 @@ if __name__ == "__main__":
     # from https://gymnasium.farama.org/introduction/create_custom_env/#debugging-your-environment
     try:
         check_env(env.unwrapped)
-        print("✓ Environment passes all checks!")
+        print("✓ Environment passes all Gymnasium checks!")
+        check_env_sb3(env)
+        print("✓ Environment passes all SB3 checks!")
     except Exception as e:
         print(f"Environment has issues: {e}")
