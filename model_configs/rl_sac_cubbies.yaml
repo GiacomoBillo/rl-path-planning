@@ -1,0 +1,38 @@
+# Data
+data_dir: /workspace/datasets/ae_aristotle1_5mm_cubbies
+train_trajectory_key: "global_solutions"
+val_trajectory_key: "global_solutions"
+num_obstacle_points: 4096
+num_target_points: 128
+num_workers: 0
+
+# Robot & environment
+urdf_path: /workspace/assets/panda/panda.urdf
+num_robot_points: 2048
+action_chunk_length: 1
+
+# BC checkpoint (pre-trained AvoidEverything policy, for warm-start)
+# bc_checkpoint_parameters are baked into the checkpoint — they must match the architecture used during training and cannot be changed independently.
+# no need to change them because we are just loading the checkpoint, changing them could break the loading
+bc_checkpoint_path: /workspace/checkpoints/avoid_everything_cubby.ckpt
+bc_checkpoint_parameters: 
+  robot_dof: 7
+  point_match_loss_weight: 1
+  collision_loss_weight: 5
+  collision_loss_margin: 0.03
+  min_lr: 1.0e-5
+  max_lr: 5.0e-5
+  warmup_steps: 5000
+  decay_rate: null
+  pc_bounds: [[-1.5, -1.5, -0.1], [1.5, 1.5, 1.5]]
+  train_batch_size: 10
+  disable_viz: true
+
+# SAC / RL
+seed: 42
+total_timesteps: 1000
+n_eval_episodes: 100
+save_path: checkpoints/sac_cubbies
+# Default buffer_size=1_000_000 requires ~200GB for this observation space (OOM crash).
+# Tune based on available RAM (limited locally, larger on cloud)
+buffer_size: 10000
