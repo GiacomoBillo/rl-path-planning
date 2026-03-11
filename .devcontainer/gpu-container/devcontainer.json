@@ -1,5 +1,5 @@
 {
-  "name": "Avoid Everything Dev Container",
+  "name": "Avoid Everything (GPU)",
 
   // GPU version of the dev container   
   "dockerComposeFile": ["../docker-compose.yaml"],
@@ -56,9 +56,9 @@
     "ROS_DOMAIN_ID": "0"
   },
   
-  // Set git safe directory and install robofin
-  "postCreateCommand": "git config --global --add safe.directory /workspace && pip install -e /workspace/robofin && pip install -e /workspace/viz_server",
-  
+    // Set git safe directory, initialize submodules, apply patches to submodules and install robofin
+  "postCreateCommand": "git config --global --add safe.directory /workspace && git config --global --add safe.directory /workspace/robofin && git -C /workspace submodule update --init --recursive && git -C /workspace/robofin apply --check /workspace/.devcontainer/patches/robofin-fixes.patch 2>/dev/null && git -C /workspace/robofin apply /workspace/.devcontainer/patches/robofin-fixes.patch; pip install -e /workspace/robofin && pip install -e /workspace/viz_server",
+
   // Keep container running
   "shutdownAction": "stopCompose"
 } 

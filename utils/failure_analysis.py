@@ -99,11 +99,16 @@ class FailureAnalyzer:
             if not self._hdf5_path.exists():
                 raise FileNotFoundError(f"HDF5 file not found: {self._hdf5_path}")
             
+            print(f"✓ Loaded existing FailureAnalyzer from: {self._hdf5_path}")
             # Read creation timestamp from file
             with h5py.File(self._hdf5_path, "r") as f:
                 self._creation_timestamp = f.attrs.get("creation_timestamp")
             # Infer metadata path from HDF5 path
             self._metadata_path = self._hdf5_path.parent / f"{self._hdf5_path.stem}.json"
+            if not self._metadata_path.exists():
+                # warning
+                print(f"Warning: Metadata file not found: {self._metadata_path}.")    
+
             self.mode = "r" # only read existing file, no saving
         
         # new file mode, write enabled
@@ -290,16 +295,29 @@ class FailureAnalyzer:
             pidx = int(metadata["pidx"])  # get problem index to load scene from original dataset
             scene_data = self._original_dataset[pidx]
             result.update(
-                **scene_data.items() # unpack all key-value pairs from scene_data into result
+                **scene_data # unpack all key-value pairs from scene_data into result
             )
         
         return result
     
-
-
 
     def __repr__(self) -> str:
         status = f"mode={self.mode}, saved={self.num_saved}"
         if self.max_failures:
             status += f", max={self.max_failures}"
         return f"FailureAnalyzer({status})"
+
+
+
+class SavedTrajectoryDataset(torch.utils.data.Dataset):
+    """
+        TrajectoryDataset wrapper to load all saved trajectories and embed them in the original dataset
+    """
+    def __init__(self, failure_analyzer: "FailureAnalyzer"):
+        self.failure_analyzer = failure_analyzer
+
+    def __len__(self):
+        return self.failure_analyzer.num_saved
+
+    def __getitem__(self, idx):
+        return self.failure_analyzer.load(idx)

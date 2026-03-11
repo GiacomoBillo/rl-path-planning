@@ -1,3 +1,20 @@
+# Fork: Giacomo
+
+## Dev Container Setup
+
+This project uses a VS Code Dev Container that **automatically handles all setup** on first launch:
+
+- **Submodule initialization**: the `robofin` submodule is cloned and initialized automatically — no need to run `git submodule update --init` manually
+- **Patch application**: a small patch is applied to `robofin` submodule (from `.devcontainer/patches/`) to fix a bug
+- **Package installation**: `robofin` and `viz_server` are installed as editable packages (`pip install -e`) so local edits are reflected immediately without reinstalling
+- **PYTHONPATH**: the workspace, `robofin`, and ROS paths are pre-configured
+
+Two container variants are available — choose at container open time:
+- `cpu-container/devcontainer.json` — CPU-only, lighter weight
+- `gpu-container/devcontainer.json` — CUDA 12.1.1 with GPU support
+
+---
+
 # Fork: Avoid Everything (WIP)
 
 I had some trouble using the original project, so I made this fork to fix the issues with the code and make a more stable development container for the project that anyone can use. I added my own fork of robofin package as a submodule, so that I could edit its contents to make it more general, not specific to the Franka Panda robot, for which the fishbotics project is currently adapted. I might add the atob project as a submodule as well. 

@@ -1,0 +1,55 @@
+diff --git a/robofin/collision.py b/robofin/collision.py
+index b4f7650..1fe278c 100644
+--- a/robofin/collision.py
++++ b/robofin/collision.py
+@@ -97,16 +97,17 @@ class CollisionSpheres:
+ 
+     def has_self_collision(self, config, auxiliary_joint_values=None, buffer=0.0):
+         """Check for self-collision given robot configuration"""
+-        # Build full configuration
+-        full_config = self._build_full_config(config, auxiliary_joint_values)
+-        
+-        # Get FK for all links
+-        fk_result = self.robot.fk_torch(torch.tensor(full_config, dtype=torch.float32, device=self.robot.device).unsqueeze(0))
++        # fk_torch expects MAIN_DOF and handles auxiliary joints internally;
++        # do NOT expand to full DOF here.
++        config_torch = torch.tensor(
++            np.asarray(config, dtype=np.float32), dtype=torch.float32, device=self.robot.device
++        ).unsqueeze(0)
++        fk_result = self.robot.fk_torch(config_torch)
+         
+         fk_points = []
+         for link_name, centers in self.points:
+             if link_name in fk_result:
+-                pose = fk_result[link_name][0].cpu().numpy()
++                pose = fk_result[link_name][0].cpu().double().numpy()  # float64 required by numba transform
+                 transformed_points = transform_in_place(np.copy(centers), pose)
+                 fk_points.append(transformed_points)
+         
+@@ -150,11 +151,12 @@ class CollisionSpheres:
+ 
+     def csphere_info(self, config, auxiliary_joint_values=None, base_pose=np.eye(4), with_base_link=False):
+         """Get collision sphere information for given configuration"""
+-        full_config = self._build_full_config(config, auxiliary_joint_values)
+-        
+-        # Get FK for all links
+-        config_torch = torch.tensor(full_config, dtype=torch.float32, device=self.robot.device)
+-        fk_result = self.robot.fk_torch(config_torch.unsqueeze(0))
++        # fk_torch expects MAIN_DOF and handles auxiliary joints internally;
++        # do NOT expand to full DOF here.
++        config_torch = torch.tensor(
++            np.asarray(config, dtype=np.float32), dtype=torch.float32, device=self.robot.device
++        ).unsqueeze(0)
++        fk_result = self.robot.fk_torch(config_torch)
+         
+         radii = []
+         centers = []
+@@ -164,7 +166,7 @@ class CollisionSpheres:
+                 continue
+                 
+             if link_name in fk_result:
+-                pose = fk_result[link_name][0].cpu().numpy()
++                pose = fk_result[link_name][0].cpu().double().numpy()  # float64 required by numba transform
+                 # Apply base pose transformation
+                 pose = base_pose @ pose
+                 transformed_centers = transform_in_place(np.copy(info.centers), pose)
