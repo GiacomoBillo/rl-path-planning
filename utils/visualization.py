@@ -669,7 +669,7 @@ def create_nested_slider(
     # _run_inner_callback()  # populate robot state on first render
 
 
-def visualize_expert_trajectory_slider(
+def expert_traj_slider(
         dataset: TrajectoryDataset,
         robot: Robot,
         animation_mode="discrete",
@@ -697,7 +697,7 @@ def visualize_expert_trajectory_slider(
     )
 
 
-def visualize_saved_trajectory_slider(
+def saved_traj_slider(
         dataset: TrajectoryDataset,
         robot: Robot,
         animation_mode="discrete",
@@ -737,7 +737,7 @@ def visualize_saved_trajectory_slider(
 
 
 # visualize
-def visualize_state_from_trajectory(
+def visualize_step_in_traj(
     robot: Robot,
     sample: dict[str, torch.Tensor],
     index: int,
@@ -802,7 +802,7 @@ def visualize_state_from_trajectory(
         viz_client.clear_ghost_robot()
 
 
-def visualize_states_in_trajectories_slider(
+def step_in_traj_slider(
         sample: dict[str, torch.Tensor], # sample from TrajectoryDataset
         robot: Robot,
         expert=False,
@@ -817,7 +817,7 @@ def visualize_states_in_trajectories_slider(
     def callback(index, trajectory, sample, **kwargs): 
         robot = kwargs.get("robot")
         # Trigger ROS/Robot visualization
-        visualize_state_from_trajectory(
+        visualize_step_in_traj(
             robot=robot, sample=sample, index=index, expert=expert,
             highlight_collisions=highlight_collisions, collision_color=collision_color,
         )
@@ -866,7 +866,7 @@ def visualize_states_in_trajectories_slider(
     on_value_change({'new': slider.value})
 
 
-def visualize_states_nested_slider(
+def traj_and_step_nested_slider(
     dataset,
     robot: Robot,
     expert: bool = False,
