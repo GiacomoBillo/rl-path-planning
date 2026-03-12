@@ -21,7 +21,7 @@ import yaml
 from stable_baselines3 import SAC
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 from avoid_everything.data_loader import DataModule
@@ -51,13 +51,9 @@ def make_eval_progress_callback(n_eval_episodes: int) -> Callable:
 
     return callback
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("cfg_path", help="Path to the RL config YAML file")
-    args = parser.parse_args()
 
-    with open(args.cfg_path) as f:
-        cfg = yaml.safe_load(f)
+def get_dataloaders(cfg: dict, args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
+    """Create train and eval dataloaders from the AvoidEverything dataset."""
 
     # --- Data ---
     # DataModule handles all dataset construction (same pattern as run_validation_rollouts.py).
@@ -78,14 +74,50 @@ if __name__ == "__main__":
         num_workers=cfg["num_workers"],
     )
     dm.setup("fit")
-    print(f"✓ Datasets: {len(dm.data_train)} train samples, {len(dm.data_val_state)} val samples")
 
-    train_dl = dm.train_dataloader()  # StateDataset, shuffle=True
     # Construct eval dataloader with shuffle=True so eval_env sees varied problems per episode
     # (dm.val_dataloader()[VAL_STATE] uses shuffle=False, unsuitable for RL reset()).
-    eval_dl = DataLoader(
-        dm.data_val_state, batch_size=1, shuffle=True, num_workers=cfg["num_workers"]
+    if args.overfit is None:
+        train_dl = dm.train_dataloader()  # StateDataset, shuffle=True
+        eval_dl = DataLoader(
+            dm.data_val_state, batch_size=1, shuffle=True, num_workers=cfg["num_workers"]
+        )
+        print(f"✓ Datasets: {len(dm.data_train)} train samples, {len(dm.data_val_state)} val samples")
+    else:
+        n = args.overfit
+        overfit_dataset = Subset(dm.data_train, list(range(n)))
+        train_dl = DataLoader(overfit_dataset, batch_size=1, shuffle=True, num_workers=cfg["num_workers"])
+        eval_dl = DataLoader(overfit_dataset, batch_size=1, shuffle=True, num_workers=cfg["num_workers"])
+        print(f"⚠  Overfitting mode: using {n} training scene(s) for both train and eval")
+
+    return train_dl, eval_dl
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("cfg_path", help="Path to the RL config YAML file")
+    parser.add_argument("--eval_bc", action="store_true", help="Whether to evaluate the pretrained BC policy before training")
+    parser.add_argument(
+        "--overfit",
+        nargs="?",
+        type=int,
+        const=1,
+        default=None,
+        metavar="N",
+        help=(
+            "Overfit on N training scenes to verify the agent can learn. "
+            "Pass without a value to use 1 scene, or specify a number of samples to use. "
+            "Omit entirely to train on the full dataset."
+        ),
     )
+    args = parser.parse_args()
+
+    with open(args.cfg_path) as f:
+        cfg = yaml.safe_load(f)
+
+    
+    # --- Data ---
+    train_dl, eval_dl = get_dataloaders(cfg, args)
+
 
     # --- Environments ---
     # Wrap with Monitor explicitly so SB3 doesn't auto-wrap and episode stats are tracked consistently.
@@ -127,6 +159,7 @@ if __name__ == "__main__":
         seed=cfg["seed"],
         buffer_size=cfg["buffer_size"],
         policy_kwargs=policy_kwargs,
+        batch_size=1 # for fast iteration in prototyping an avoid OoD locally
     )
     # TODO: HER (requires adding achieved_goal/desired_goal keys to observation space)
 
@@ -137,12 +170,13 @@ if __name__ == "__main__":
     print("✓ Warm-started actor mu from BC action_decoder")
 
     # --- Evaluate BC-warm-started policy (pre-training baseline) ---
-    print("\nEvaluating BC-warm-started policy...")
-    mean_reward, std_reward = evaluate_policy(
-        model, eval_env, n_eval_episodes=cfg["n_eval_episodes"], deterministic=True,
-        callback=make_eval_progress_callback(cfg["n_eval_episodes"]),
-    )
-    print(f"BC-warm-started agent: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}")
+    if args.eval_bc:
+        print("\nEvaluating BC-warm-started policy...")
+        mean_reward, std_reward = evaluate_policy(
+            model, eval_env, n_eval_episodes=cfg["n_eval_episodes"], deterministic=True,
+            callback=make_eval_progress_callback(cfg["n_eval_episodes"]),
+        )
+        print(f"BC-warm-started agent: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}")
 
     # --- Train ---
     print("\nTraining SAC agent...")
