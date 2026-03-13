@@ -27,7 +27,7 @@ from tqdm.auto import tqdm
 from avoid_everything.data_loader import DataModule
 from avoid_everything.pretraining import PretrainingMotionPolicyTransformer
 from rl.environment import AvoidEverythingEnv
-from rl.feature_extractor import MPiFormerExtractor
+from rl.feature_extractor import MPiFormerBackbone, MPiFormerTransformerExtractor
 
 
 def make_eval_progress_callback(n_eval_episodes: int) -> Callable:
@@ -136,21 +136,28 @@ if __name__ == "__main__":
     ).to(device)
     print(f"✓ BC checkpoint loaded from: {cfg['bc_checkpoint_path']}")
 
-    # --- SAC model with BC feature extractor ---
-    # Empty actor net (net_arch={"pi": []}) means mu = Linear(512, 7) — same shape as BC action_decoder — so we can copy its weights for a full warm-start.
-    # Standard critic net (net_arch={"qf": [256, 256]}) keeps a proper Q-value MLP.
+    # --- SAC model with split BC feature extractor ---
+    # 1) Shared frozen backbone (PointNet++ + joint encoder) via MPiFormerBackbone
+    # 2) Per-instance trainable transformer via MPiFormerTransformerExtractor
+    # 3) Linear-only heads (net_arch={"pi": [], "qf": []})
+    
+    # Create shared backbone
+    shared_backbone = MPiFormerBackbone(bc_model)
+    
     policy_kwargs = {
-        "features_extractor_class": MPiFormerExtractor,
+        "features_extractor_class": MPiFormerTransformerExtractor,
         "features_extractor_kwargs": {
+            "shared_backbone": shared_backbone, # pass same backbone object to all transformer extractors to share backbone
             "bc_model": bc_model,
             "pc_bounds": cfg["bc_checkpoint_parameters"]["pc_bounds"],
-            "freeze": cfg["freeze_bc_encoder"],
+            "freeze_backbone": True,  # Always freeze the backbone (PointNet++ + joint encoder)
+            "shared_transformer": False,  # Each actor/critic gets its own transformer instance
         },
         "net_arch": {
-            "pi": [], # Actor/Policy no hidden layers, just Linear(512, 7) from encoded_features to action space, 
-                      # to copy weights from pretrained BC action_decoder 
-            "qf": []}, # Critic TODO: might need some hidden layers here for good Q-estimation (e.g. [256, 256])
-        "share_features_extractor": True,
+            "pi": [],  # Actor/Policy no hidden layers, just Linear(d_model, robot_dof)
+            "qf": []   # Critic no hidden layers, just Linear(d_model + action_dim, 1)
+        },
+        "share_features_extractor": False,  # Each (actor, critic) gets separate transformer
     }
     model = SAC(
         "MultiInputPolicy",
@@ -159,7 +166,7 @@ if __name__ == "__main__":
         seed=cfg["seed"],
         buffer_size=cfg["buffer_size"],
         policy_kwargs=policy_kwargs,
-        batch_size=1 # for fast iteration in prototyping an avoid OoD locally
+        batch_size=1  # for fast iteration in prototyping and avoid OoD locally
     )
     # TODO: HER (requires adding achieved_goal/desired_goal keys to observation space)
 
