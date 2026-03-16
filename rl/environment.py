@@ -31,6 +31,9 @@ from utils.visualization import visualize_problem
 import pybullet as _pybullet
 
 
+BYPASS_LAZY_ROS_RENDER = True # if True, always publish the full scene on each render call instead of only on the first call per episode. 
+
+
 class AvoidEverythingEnv(TimeLimit):
     """
     Public environment: wraps `_AvoidEverythingEnv` with Gymnasium's `TimeLimit`.
@@ -59,6 +62,7 @@ class AvoidEverythingEnv(TimeLimit):
         render_backend: Literal["ros", "pybullet"] | None = None,
         render_fps: float | None = None,
         max_episode_steps: int = 50,
+        highlight_collisions: bool = True,
     ):
         """Initialize environment with an automatic TimeLimit wrapper.
 
@@ -76,6 +80,7 @@ class AvoidEverythingEnv(TimeLimit):
             render_backend: rendering engine ("ros" or "pybullet"). None auto-selects.
             render_fps: target frame rate for rendering (None = as fast as possible)
             max_episode_steps: maximum number of steps per episode before truncation (default 50)
+            highlight_collisions: whether to highlight the robot in red when in collision (only applies to render_backend='ros')
         """
         # instantiate the base env
         env = _AvoidEverythingEnv(
@@ -91,6 +96,7 @@ class AvoidEverythingEnv(TimeLimit):
             render_mode=render_mode,
             render_backend=render_backend,
             render_fps=render_fps,
+            highlight_collisions=highlight_collisions,
         )
         # apply time limit wrapper
         super().__init__(env, max_episode_steps=max_episode_steps)
@@ -154,6 +160,7 @@ class _AvoidEverythingEnv(gym.Env):
         render_mode: Literal["human", "rgb_array"] | None = None,
         render_backend: Literal["ros", "pybullet"] | None = None,
         render_fps: float | None = None,
+        highlight_collisions: bool = True,
     ):
         """Initialize environment.
         Args:
@@ -170,6 +177,7 @@ class _AvoidEverythingEnv(gym.Env):
             render_backend: rendering engine ("ros" or "pybullet"). None auto-selects:
                 "ros" for render_mode="human", "pybullet" for render_mode="rgb_array".
                 render_backend="ros" is incompatible with render_mode="rgb_array".
+            highlight_collisions: whether to highlight the robot in red when in collision (only applies to render_backend='ros')
         """
         super().__init__()
 
@@ -242,6 +250,7 @@ class _AvoidEverythingEnv(gym.Env):
 
         # Render setup
         self._render_setup(render_mode, render_backend, render_fps)
+        self.highlight_collisions = highlight_collisions
 
     def reset(self, seed=None, options=None):
         """Reset environment
@@ -277,6 +286,7 @@ class _AvoidEverythingEnv(gym.Env):
 
         obs = self._get_obs()
         info = {} # TODO: add info if needed
+        self.collision = False
         return obs, info
 
     def step(self, action):
@@ -302,6 +312,7 @@ class _AvoidEverythingEnv(gym.Env):
 
         # Check for collision and target reaching
         collision = self._check_collision()
+        self.collision = collision
         target_reached, pos_err, orien_err = self._check_target_reached()
 
         # Get new observation, compute reward, check termination and truncation
@@ -488,8 +499,14 @@ class _AvoidEverythingEnv(gym.Env):
         self._last_render_time = None
         self._render_period = 1.0 / render_fps if render_fps is not None else None
 
-        # if self._render_backend == "ros":
-        #     viz_client.connect() # need to pass urdf??
+        # connect to viz server
+        if self._render_backend == "ros":
+            viz_client.shutdown()
+            viz_client.connect(str(self.robot.urdf_path))
+            viz_client.clear_ghost_robot()
+            viz_client.clear_obstacles()
+            viz_client.clear_ghost_end_effector()
+
 
     def render(self):
         """Render the environment according to render_mode and render_backend.
@@ -527,7 +544,15 @@ class _AvoidEverythingEnv(gym.Env):
         (obstacles + ghost EEF + robot config) once per episode, then only updates the
         robot config on each subsequent call (obstacles and target are static per episode).
         """
-        if not self._static_scene_published:
+
+        # highlight collision
+        if self.highlight_collisions and self.collision:
+            viz_client.publish_ghost_robot(self.robot.unnormalize_joints(self.robot_config), color=[0.9, 0.1, 0.1], alpha=0.6)
+        else:
+            viz_client.clear_ghost_robot()
+
+        # if not self._static_scene_published:
+        if BYPASS_LAZY_ROS_RENDER or not self._static_scene_published: # if pybass, always publish full scene
             # Publish full scene: ghost EEF at target, obstacles, robot at current config
             problem_with_current = {**self.problem, "configuration": self.robot_config}
             visualize_problem(self.robot, problem_with_current)
