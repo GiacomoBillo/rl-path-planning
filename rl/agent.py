@@ -31,6 +31,33 @@ from rl.environment import AvoidEverythingEnv
 from rl.feature_extractor import MPiFormerBackbone, MPiFormerTransformerExtractor
 
 
+def get_args_and_cfg() -> tuple[argparse.Namespace, dict]:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("cfg_path", help="Path to the RL config YAML file")
+    parser.add_argument("--eval_bc", action="store_true", help="Whether to evaluate the pretrained BC policy before training")
+    parser.add_argument(
+        "--overfit",
+        nargs="?",
+        type=int,
+        const=1,
+        default=None,
+        metavar="N",
+        help=(
+            "Overfit on N training scenes to verify the agent can learn. "
+            "Pass without a value to use 1 scene, or specify a number of samples to use. "
+            "Omit entirely to train on the full dataset."
+        ),
+    )
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    with open(args.cfg_path) as f:
+        cfg = yaml.safe_load(f)
+
+    return args, cfg
+
+
 class DebugCallback(BaseCallback):
     """Unified callback for training and evaluation.
 
@@ -196,44 +223,14 @@ def get_dataloaders(cfg: dict, args: argparse.Namespace) -> tuple[DataLoader, Da
 
     return train_dl, eval_dl
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("cfg_path", help="Path to the RL config YAML file")
-    parser.add_argument("--eval_bc", action="store_true", help="Whether to evaluate the pretrained BC policy before training")
-    parser.add_argument(
-        "--overfit",
-        nargs="?",
-        type=int,
-        const=1,
-        default=None,
-        metavar="N",
-        help=(
-            "Overfit on N training scenes to verify the agent can learn. "
-            "Pass without a value to use 1 scene, or specify a number of samples to use. "
-            "Omit entirely to train on the full dataset."
-        ),
-    )
-    parser.add_argument("--render", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
 
-    with open(args.cfg_path) as f:
-        cfg = yaml.safe_load(f)
-
-    
-    # --- Data ---
-    train_dl, eval_dl = get_dataloaders(cfg, args)
-
-
-    # --- Environments ---
-    # Wrap with Monitor explicitly so SB3 doesn't auto-wrap and episode stats are tracked consistently.
-    # Order: Monitor (outermost) → TimeLimit (inside AvoidEverythingEnv) → _AvoidEverythingEnv (core).
-    render_mode = "human" if args.render else None
-    render_backend = "ros"
-    print(f"Render mode: {render_mode}")
-    env = Monitor(AvoidEverythingEnv(dataloader=train_dl, render_mode=render_mode, render_backend=render_backend))
-    eval_env = Monitor(AvoidEverythingEnv(dataloader=eval_dl, render_mode=render_mode, render_backend=render_backend))
-
+def bootstrap_agent(
+        env: AvoidEverythingEnv,
+        eval_env: AvoidEverythingEnv,
+        cfg: dict,
+        args: argparse.Namespace,
+        eval_callback: DebugCallback,
+) -> SAC:
     # --- Load BC checkpoint (must happen before SAC model creation for warm-start) ---
     device = "cuda" if torch.cuda.is_available() else "cpu"
     bc_model = PretrainingMotionPolicyTransformer.load_from_checkpoint(
@@ -275,7 +272,7 @@ if __name__ == "__main__":
         seed=cfg["seed"],
         buffer_size=cfg["buffer_size"],
         policy_kwargs=policy_kwargs,
-        batch_size=1  # for fast iteration in prototyping and avoid OoD locally
+        batch_size=1,  # for fast iteration in prototyping and avoid OoD locally
     )
     vec_env = model.get_env()
     print(f"Train will run with n_envs={vec_env.num_envs if vec_env is not None else 'unknown'}")
@@ -290,12 +287,6 @@ if __name__ == "__main__":
     # --- Evaluate BC-warm-started policy (pre-training baseline) ---
     if args.eval_bc:
         print("\nEvaluating BC-warm-started policy...")
-        eval_callback = DebugCallback(
-            n_eval_episodes=cfg["n_eval_episodes"],
-            is_eval=True,
-            log_steps=args.verbose,
-            render=args.render,
-        )
         mean_reward, std_reward = evaluate_policy(
             model,
             eval_env,
@@ -305,12 +296,47 @@ if __name__ == "__main__":
         )
         print(f"BC-warm-started agent: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}")
 
-    # --- Train ---
-    print("\nTraining SAC agent...")
+    return model
+
+
+
+if __name__ == "__main__":
+    args, cfg = get_args_and_cfg()
+
+    
+    # --- Data ---
+    train_dl, eval_dl = get_dataloaders(cfg, args)
+
+
+    # --- Environments ---
+    # Wrap with Monitor explicitly so SB3 doesn't auto-wrap and episode stats are tracked consistently.
+    # Order: Monitor (outermost) → TimeLimit (inside AvoidEverythingEnv) → _AvoidEverythingEnv (core).
+    render_mode = "human" if args.render else None
+    render_backend = "ros"
+    print(f"Render mode: {render_mode}")
+    env = Monitor(AvoidEverythingEnv(dataloader=train_dl, render_mode=render_mode, render_backend=render_backend))
+    eval_env = Monitor(AvoidEverythingEnv(dataloader=eval_dl, render_mode=render_mode, render_backend=render_backend))
+
+    # callbacks to debug train and eval
+    eval_callback = DebugCallback(
+            n_eval_episodes=cfg["n_eval_episodes"],
+            is_eval=True,
+            log_steps=args.verbose,
+            render=args.render,
+        )
     train_callback = DebugCallback(
         log_steps=args.verbose,
         render=args.render,
     )
+
+
+    # --- Bootstrap RL agent from BC pretrained policy ---
+    model: SAC = bootstrap_agent(env, eval_env, cfg, args, eval_callback)
+
+    
+    # --- Train ---
+    print("\nTraining SAC agent...")
+
     model.learn(
         total_timesteps=cfg["total_timesteps"],
         progress_bar=True,
