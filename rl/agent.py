@@ -13,12 +13,13 @@ Usage:
 
 
 import argparse
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 import torch
 import yaml
 from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 from torch.utils.data import DataLoader, Subset
@@ -30,26 +31,129 @@ from rl.environment import AvoidEverythingEnv
 from rl.feature_extractor import MPiFormerBackbone, MPiFormerTransformerExtractor
 
 
-def make_eval_progress_callback(n_eval_episodes: int) -> Callable:
-    """Return a callback for evaluate_policy that shows a tqdm progress bar.
+class DebugCallback(BaseCallback):
+    """Unified callback for training and evaluation.
 
-    The callback is called at every env step. It watches ``episode_rewards``
-    (a list in evaluate_policy's locals that grows by one per completed episode)
-    to drive the bar and display a live mean reward.
+    Handles:
+    - Progress bar (for evaluation)
+    - Step logging (reward, done, info) with formatting
+    - Rendering (safely restricted to single-env to avoid clutter)
+
+    'locals' refers to the local variables of the scope where the callback is called.
+
+    About 'infos':
+    - In Stable Baselines3, environments are typically wrapped in a VecEnv.
+    - 'infos' is a list of dictionaries, one per environment.
+    - We log/render only the first environment (index 0) to avoid clutter.
     """
-    pbar = tqdm(total=n_eval_episodes, desc="Evaluating", unit="ep")
-    last_count = [0]  # list so the closure can mutate it
 
-    def callback(locals_: dict, _globals: dict) -> None:
-        n_done = len(locals_["episode_rewards"])
-        if n_done > last_count[0]:
-            pbar.update(n_done - last_count[0])
-            last_count[0] = n_done
-            pbar.set_postfix({"mean_r": f"{np.mean(locals_['episode_rewards']):.2f}"})
-        if last_count[0] >= n_eval_episodes:
-            pbar.close()
+    def __init__(
+        self,
+        n_eval_episodes: int = 0,
+        is_eval: bool = False,
+        log_steps: bool = False,
+        render: bool = False,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose)
+        self.n_eval_episodes = n_eval_episodes
+        self.is_eval = is_eval
+        self.log_steps = log_steps
+        self.render_enabled = render
 
-    return callback
+        self.pbar = None
+        self.last_done_count = 0
+
+        if self.is_eval and self.n_eval_episodes > 0:
+            self.pbar = tqdm(total=self.n_eval_episodes, desc="Evaluating", unit="ep")
+
+    def _on_rollout_start(self):
+        """Called by model.learn() at the beginning of every rollout.
+        TODO: missing equivalent for evaluate_policy()
+        """
+        if self.log_steps:
+            print(f"[{'eval' if self.is_eval else 'train'}-rollout-start] ")
+
+        env = self.training_env
+        if self.render_enabled and env is not None:
+            # Check if it's a Stable Baselines3 VecEnv
+            if hasattr(env, "env_method"):
+                # Safely call render ONLY on the first environment (index 0)
+                env.env_method("render", indices=0)
+            else:
+                # Fallback for standard, non-vectorized Gymnasium environments
+                env.render()
+        
+
+    def _on_step(self) -> bool:
+        """Called by model.learn() at every step."""
+        return self._process_step(self.locals, self.training_env)
+
+    def __call__(self, locals_: dict, globals_: dict) -> None:
+        """Called by evaluate_policy() at every step."""
+        # evaluate_policy passes 'env' in locals_
+        env = locals_.get("env")
+        self._process_step(locals_, env)
+
+    def _process_step(self, locals_: dict, env: Any) -> bool:
+        # 1. Normalize variable names
+        # Check keys explicitly to avoid False-y issues with boolean/numpy arrays
+        infos = locals_.get("infos", locals_.get("info", []) )
+        dones = locals_.get("dones", locals_.get("done", []) )
+        rewards = locals_.get("rewards", locals_.get("reward", []) )
+
+        # 2. Select first env (index 0) in case of parallel envs
+        info = infos[0] if (isinstance(infos, list) and len(infos) > 0) else infos
+        done_val = dones[0] if (isinstance(dones, (list, np.ndarray)) and len(dones) > 0) else dones
+        reward_val = rewards[0] if (isinstance(rewards, (list, np.ndarray)) and len(rewards) > 0) else rewards
+
+        # 3. Log steps
+        if self.log_steps:
+            # Approximate numbers for cleaner logs
+            reward_str = f"{float(reward_val):.3f}"
+            info_str = self._format_info(info)
+            collision = info.get("collision", None) if isinstance(info, dict) else None
+            
+            phase = "eval" if self.is_eval else "train"
+            print(f"[{phase}-step] reward={reward_str} terminated={done_val} collision={collision} info={info_str}")
+
+
+        # 4. Render
+        if self.render_enabled and env is not None:
+            # Check if it's a Stable Baselines3 VecEnv
+            if hasattr(env, "env_method"):
+                # Safely call render ONLY on the first environment (index 0)
+                env.env_method("render", indices=0)
+            else:
+                # Fallback for standard, non-vectorized Gymnasium environments
+                env.render()
+
+        # 5. Progress Bar (Eval only)
+        if self.is_eval and self.pbar:
+            # evaluate_policy accumulates 'episode_rewards' in locals
+            episode_rewards = locals_.get("episode_rewards", [])
+            n_done = len(episode_rewards)
+            if n_done > self.last_done_count:
+                self.pbar.update(n_done - self.last_done_count)
+                self.last_done_count = n_done
+                if n_done > 0:
+                    self.pbar.set_postfix({"mean_r": f"{np.mean(episode_rewards):.2f}"})
+
+            if self.last_done_count >= self.n_eval_episodes:
+                self.pbar.close()
+                self.pbar = None
+
+        return True
+
+    def _format_info(self, info: Any) -> Any:
+        """Recursively round floats in the info dict."""
+        if isinstance(info, float):
+            return round(info, 3)
+        elif isinstance(info, dict):
+            return {k: self._format_info(v) for k, v in info.items()}
+        elif isinstance(info, list):
+            return [self._format_info(x) for x in info]
+        return info
 
 
 def get_dataloaders(cfg: dict, args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
@@ -109,6 +213,8 @@ if __name__ == "__main__":
             "Omit entirely to train on the full dataset."
         ),
     )
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     with open(args.cfg_path) as f:
@@ -122,8 +228,11 @@ if __name__ == "__main__":
     # --- Environments ---
     # Wrap with Monitor explicitly so SB3 doesn't auto-wrap and episode stats are tracked consistently.
     # Order: Monitor (outermost) → TimeLimit (inside AvoidEverythingEnv) → _AvoidEverythingEnv (core).
-    env = Monitor(AvoidEverythingEnv(dataloader=train_dl, render_mode=None))
-    eval_env = Monitor(AvoidEverythingEnv(dataloader=eval_dl, render_mode=None))
+    render_mode = "human" if args.render else None
+    render_backend = "ros"
+    print(f"Render mode: {render_mode}")
+    env = Monitor(AvoidEverythingEnv(dataloader=train_dl, render_mode=render_mode, render_backend=render_backend))
+    eval_env = Monitor(AvoidEverythingEnv(dataloader=eval_dl, render_mode=render_mode, render_backend=render_backend))
 
     # --- Load BC checkpoint (must happen before SAC model creation for warm-start) ---
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -168,6 +277,8 @@ if __name__ == "__main__":
         policy_kwargs=policy_kwargs,
         batch_size=1  # for fast iteration in prototyping and avoid OoD locally
     )
+    vec_env = model.get_env()
+    print(f"Train will run with n_envs={vec_env.num_envs if vec_env is not None else 'unknown'}")
     # TODO: HER (requires adding achieved_goal/desired_goal keys to observation space)
 
     # Warm-start actor mean head from BC action_decoder (same Linear(512, 7) shape with net_arch={"pi": []})
@@ -179,21 +290,47 @@ if __name__ == "__main__":
     # --- Evaluate BC-warm-started policy (pre-training baseline) ---
     if args.eval_bc:
         print("\nEvaluating BC-warm-started policy...")
+        eval_callback = DebugCallback(
+            n_eval_episodes=cfg["n_eval_episodes"],
+            is_eval=True,
+            log_steps=args.verbose,
+            render=args.render,
+        )
         mean_reward, std_reward = evaluate_policy(
-            model, eval_env, n_eval_episodes=cfg["n_eval_episodes"], deterministic=True,
-            callback=make_eval_progress_callback(cfg["n_eval_episodes"]),
+            model,
+            eval_env,
+            n_eval_episodes=cfg["n_eval_episodes"],
+            deterministic=True,
+            callback=eval_callback,
         )
         print(f"BC-warm-started agent: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}")
 
     # --- Train ---
     print("\nTraining SAC agent...")
-    model.learn(total_timesteps=cfg["total_timesteps"], progress_bar=True)
+    train_callback = DebugCallback(
+        log_steps=args.verbose,
+        render=args.render,
+    )
+    model.learn(
+        total_timesteps=cfg["total_timesteps"],
+        progress_bar=True,
+        callback=train_callback,
+    )
 
     # --- Evaluate trained model ---
     print("\nEvaluating trained SAC agent...")
+    eval_callback = DebugCallback(
+        n_eval_episodes=cfg["n_eval_episodes"],
+        is_eval=True,
+        log_steps=args.verbose,
+        render=args.render,
+    )
     mean_reward, std_reward = evaluate_policy(
-        model, eval_env, n_eval_episodes=cfg["n_eval_episodes"], deterministic=True,
-        callback=make_eval_progress_callback(cfg["n_eval_episodes"]),
+        model,
+        eval_env,
+        n_eval_episodes=cfg["n_eval_episodes"],
+        deterministic=True,
+        callback=eval_callback,
     )
     print(f"Trained {model.__class__.__name__} agent: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}")
 
