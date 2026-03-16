@@ -225,8 +225,12 @@ class _AvoidEverythingEnv(gym.Env):
         total_points = num_robot_points + num_obstacle_points + num_target_points
         self.observation_space = gym.spaces.Dict(
             { 
-                # TODO: raise warning, might need to set limited bounds 
-                "point_cloud": gym.spaces.Box(-5, 5, shape=(total_points, 3), dtype=np.float32),  
+                #   pc_bounds: [[-1.5, -1.5, -0.1], [1.5, 1.5, 1.5]] from training config
+                "point_cloud": gym.spaces.Box(
+                    low=np.broadcast_to(np.array([-1.5, -1.5, -0.1], dtype=np.float32), (total_points, 3)), 
+                    high=np.broadcast_to(np.array([1.5, 1.5, 1.5], dtype=np.float32), (total_points, 3)), 
+                    dtype=np.float32
+                ),
                 "point_cloud_labels": gym.spaces.Box(0, 2, shape=(total_points, 1), dtype=np.int32),
                 "configuration": gym.spaces.Box(-1.0, 1.0, shape=(self.robot.MAIN_DOF,), dtype=np.float32),
                 # "target_position": gym.spaces.Box(-np.inf, np.inf, shape=(3,), dtype=np.float32),
@@ -303,7 +307,8 @@ class _AvoidEverythingEnv(gym.Env):
         # Get new observation, compute reward, check termination and truncation
         obs = self._get_obs()
         reward = self._compute_reward(collision, target_reached)
-        terminated = collision or target_reached # episode ends if we collide or reach target
+        # terminated = collision or target_reached # episode ends if we collide or reach target
+        terminated = target_reached # episodes ends only if we reach the target, not on collision (agent can learn to recover from collisions)
         truncated = False # truncation applyed via TimeLimit wrapper, not handled here
         info = {"collision": collision, "target_reached": target_reached, "position_error": pos_err, "orientation_error": orien_err, "action_clipped": np.any(clipped_action > 0)}
 
