@@ -224,6 +224,54 @@ def get_dataloaders(cfg: dict, args: argparse.Namespace) -> tuple[DataLoader, Da
     return train_dl, eval_dl
 
 
+def warmup_critic(
+        model: SAC, 
+        critic_warmup_steps: int,
+        train_callback: DebugCallback
+    ) -> SAC:
+    if critic_warmup_steps <= 0:
+        print("✓ No critic warmup steps specified, skipping warmup.")
+        return model
+    
+    print(f"\nWarming up critic for {critic_warmup_steps} steps (actor frozen)...")
+    # Freeze actor components that should be trainable later
+    # 1. Feature extractor (transformer part only; backbone remains frozen as per config)
+    model.policy.actor.features_extractor.freeze(components=["transformer"])
+    # 2. Policy heads (mu and log_std)
+    for param in model.policy.actor.mu.parameters():
+        param.requires_grad = False
+    for param in model.policy.actor.log_std.parameters():
+        param.requires_grad = False
+    # set log_std to zero
+    with torch.no_grad():
+        model.policy.actor.log_std.weight.fill_(0.0)
+        model.policy.actor.log_std.bias.fill_(-20.0)
+
+    # 3. Set to eval mode (disable Dropout/BatchNorm updates)
+    model.policy.actor.set_training_mode(False) # TODO is it needed?
+    # Prevent SB3 from switching actor back to train mode during learn()
+    original_actor_set_mode = model.policy.actor.set_training_mode
+    model.policy.actor.set_training_mode = lambda mode: None
+
+    # Train (only critic updates because actor has no gradients)
+    model.learn(
+        total_timesteps=critic_warmup_steps,
+        progress_bar=True,
+        callback=train_callback,
+        )
+
+    # Restore actor set_training_mode and Unfreeze actor components
+    model.policy.actor.set_training_mode = original_actor_set_mode
+    model.policy.actor.features_extractor.unfreeze(components=["transformer"])
+    for param in model.policy.actor.mu.parameters():
+        param.requires_grad = True
+    for param in model.policy.actor.log_std.parameters():
+        param.requires_grad = True
+    model.policy.actor.set_training_mode(True)
+    print("✓ Critic warmup complete. Unfroze actor.")
+
+
+
 def bootstrap_agent(
         env: AvoidEverythingEnv,
         eval_env: AvoidEverythingEnv,
@@ -264,6 +312,7 @@ def bootstrap_agent(
             "qf": []   # Critic no hidden layers, just Linear(d_model + action_dim, 1)
         },
         "share_features_extractor": False,  # Each (actor, critic) gets separate transformer
+        "log_std_init": -20.0,
     }
     model = SAC(
         "MultiInputPolicy",
@@ -273,6 +322,9 @@ def bootstrap_agent(
         buffer_size=cfg["buffer_size"],
         policy_kwargs=policy_kwargs,
         batch_size=1,  # for fast iteration in prototyping and avoid OoD locally
+        learning_starts=0,  # Start training immediately with BC policy, not random exploration
+        train_freq=(1, "episode"), # train at the end of every episode
+        ent_coef= 0, #'auto_0.1' # reduce entropy as the policy is pretrained
     )
     vec_env = model.get_env()
     print(f"Train will run with n_envs={vec_env.num_envs if vec_env is not None else 'unknown'}")
@@ -303,10 +355,8 @@ def bootstrap_agent(
 if __name__ == "__main__":
     args, cfg = get_args_and_cfg()
 
-    
     # --- Data ---
     train_dl, eval_dl = get_dataloaders(cfg, args)
-
 
     # --- Environments ---
     # Wrap with Monitor explicitly so SB3 doesn't auto-wrap and episode stats are tracked consistently.
@@ -334,9 +384,12 @@ if __name__ == "__main__":
     model: SAC = bootstrap_agent(env, eval_env, cfg, args, eval_callback)
 
     
+    # Warm-up critic with fixed/frozen actor
+    model = warmup_critic(model, cfg["critic_warmup_steps"], train_callback)
+
+
     # --- Train ---
     print("\nTraining SAC agent...")
-
     model.learn(
         total_timesteps=cfg["total_timesteps"],
         progress_bar=True,
@@ -345,12 +398,6 @@ if __name__ == "__main__":
 
     # --- Evaluate trained model ---
     print("\nEvaluating trained SAC agent...")
-    eval_callback = DebugCallback(
-        n_eval_episodes=cfg["n_eval_episodes"],
-        is_eval=True,
-        log_steps=args.verbose,
-        render=args.render,
-    )
     mean_reward, std_reward = evaluate_policy(
         model,
         eval_env,

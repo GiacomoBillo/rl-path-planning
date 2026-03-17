@@ -37,3 +37,4 @@ save_path: checkpoints/sac_cubbies
 # Default buffer_size=1_000_000 requires ~200GB for this observation space (OOM crash).
 # Tune based on available RAM (limited locally, larger on cloud)
 buffer_size: 10000
+critic_warmup_steps: 1000
