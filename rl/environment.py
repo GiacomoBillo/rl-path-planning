@@ -302,6 +302,9 @@ class _AvoidEverythingEnv(gym.Env):
             truncated (bool): whether episode is truncated
             info (dict): dict with additional info
         """
+        # check action dimension
+        assert action.shape == (self.robot.MAIN_DOF,), f"Expected action shape {(self.robot.MAIN_DOF,)}, got {action.shape}"
+
         # Apply action to configuration
         upclipped_config = self.robot_config + action
         # Clip action to make robot config in valid bounds

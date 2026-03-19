@@ -22,13 +22,15 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 from avoid_everything.data_loader import DataModule
 from avoid_everything.pretraining import PretrainingMotionPolicyTransformer
 from rl.environment import AvoidEverythingEnv
-from rl.feature_extractor import MPiFormerBackbone, MPiFormerTransformerExtractor
+from rl.feature_extractor import MPiFormerExtractor
+from rl.my_sac import SACDebug
 
 
 def get_args_and_cfg() -> tuple[argparse.Namespace, dict]:
@@ -224,11 +226,19 @@ def get_dataloaders(cfg: dict, args: argparse.Namespace) -> tuple[DataLoader, Da
     return train_dl, eval_dl
 
 
+def debug_actor_weights(model, stage):
+    s = 0
+    with torch.no_grad():
+        for p in model.policy.actor.parameters():
+            s += p.data.sum().item()
+    print(f"[DEBUG] Actor weight sum at {stage}: {s:.4f}")
+
 def warmup_critic(
         model: SAC, 
         critic_warmup_steps: int,
         train_callback: DebugCallback
     ) -> SAC:
+    debug_actor_weights(model, "START_WARMUP")
     if critic_warmup_steps <= 0:
         print("✓ No critic warmup steps specified, skipping warmup.")
         return model
@@ -236,16 +246,16 @@ def warmup_critic(
     print(f"\nWarming up critic for {critic_warmup_steps} steps (actor frozen)...")
     # Freeze actor components that should be trainable later
     # 1. Feature extractor (transformer part only; backbone remains frozen as per config)
-    model.policy.actor.features_extractor.freeze(components=["transformer"])
+    model.policy.actor.features_extractor.freeze_transformer()
     # 2. Policy heads (mu and log_std)
     for param in model.policy.actor.mu.parameters():
         param.requires_grad = False
     for param in model.policy.actor.log_std.parameters():
         param.requires_grad = False
     # set log_std to zero
-    with torch.no_grad():
-        model.policy.actor.log_std.weight.fill_(0.0)
-        model.policy.actor.log_std.bias.fill_(-20.0)
+    # with torch.no_grad():
+    #     model.policy.actor.log_std.weight.fill_(0.0)
+    #     model.policy.actor.log_std.bias.fill_(-20.0)
 
     # 3. Set to eval mode (disable Dropout/BatchNorm updates)
     model.policy.actor.set_training_mode(False) # TODO is it needed?
@@ -254,20 +264,47 @@ def warmup_critic(
     model.policy.actor.set_training_mode = lambda mode: None
 
     # Train (only critic updates because actor has no gradients)
+    print("[AUDIT] Capturing actor state before warmup...")
+    initial_params = {name: p.detach().clone() for name, p in model.policy.actor.named_parameters()}
+    
+    print("[AUDIT PRE-LEARN] Checking for unfrozen parameters...")
+    unfrozen_count = 0
+    for name, p in model.policy.actor.named_parameters():
+        if p.requires_grad:
+            print(f"  !!! UNFROZEN: {name}")
+            unfrozen_count += 1
+        else:
+            print(f"  ✓ Frozen: {name}")
+    if unfrozen_count == 0:
+        print("  ✓ All actor parameters are frozen.")
+    else:
+        print(f"  ⚠ Found {unfrozen_count} unfrozen actor parameters!")
+
     model.learn(
         total_timesteps=critic_warmup_steps,
         progress_bar=True,
         callback=train_callback,
         )
 
+    print("[AUDIT] Checking for changed parameters after warmup...")
+    for name, p in model.policy.actor.named_parameters():
+        if name in initial_params:
+            diff = (p.data - initial_params[name]).abs().sum().item()
+            if diff > 1e-6:
+                print(f"  !!! CHANGED: {name} | Diff: {diff:.6f} | Grad: {p.requires_grad}")
+            else:
+                print(f"  ✓ Unchanged: {name} | Diff: {diff:.6f} | Grad: {p.requires_grad}")
+
     # Restore actor set_training_mode and Unfreeze actor components
     model.policy.actor.set_training_mode = original_actor_set_mode
-    model.policy.actor.features_extractor.unfreeze(components=["transformer"])
+    model.policy.actor.features_extractor.unfreeze_transformer()
     for param in model.policy.actor.mu.parameters():
         param.requires_grad = True
     for param in model.policy.actor.log_std.parameters():
         param.requires_grad = True
     model.policy.actor.set_training_mode(True)
+
+    debug_actor_weights(model, "END_WARMUP")
     print("✓ Critic warmup complete. Unfroze actor.")
 
 
@@ -295,17 +332,15 @@ def bootstrap_agent(
     # 2) Per-instance trainable transformer via MPiFormerTransformerExtractor
     # 3) Linear-only heads (net_arch={"pi": [], "qf": []})
     
-    # Create shared backbone
-    shared_backbone = MPiFormerBackbone(bc_model)
-    
     policy_kwargs = {
-        "features_extractor_class": MPiFormerTransformerExtractor,
+        "features_extractor_class": MPiFormerExtractor,
         "features_extractor_kwargs": {
-            "shared_backbone": shared_backbone, # pass same backbone object to all transformer extractors to share backbone
             "bc_model": bc_model,
             "pc_bounds": cfg["bc_checkpoint_parameters"]["pc_bounds"],
-            "freeze_backbone": True,  # Always freeze the backbone (PointNet++ + joint encoder)
-            "shared_transformer": False,  # Each actor/critic gets its own transformer instance
+            "freeze_perception": True,  # Freeze perception encoder (equivalent to old freeze_backbone)
+            "freeze_transformer": False, # Transformer is trainable
+            "deep_copy_perception": True,
+            "deep_copy_transformer": True,
         },
         "net_arch": {
             "pi": [],  # Actor/Policy no hidden layers, just Linear(d_model, robot_dof)
@@ -314,10 +349,11 @@ def bootstrap_agent(
         "share_features_extractor": False,  # Each (actor, critic) gets separate transformer
         "log_std_init": -20.0,
     }
-    model = SAC(
+    model = SACDebug( # use deterministic actions for debug
         "MultiInputPolicy",
         env,
-        verbose=1,
+        deterministic_rollout=True,
+        verbose=True,
         seed=cfg["seed"],
         buffer_size=cfg["buffer_size"],
         policy_kwargs=policy_kwargs,
@@ -326,6 +362,18 @@ def bootstrap_agent(
         train_freq=(1, "episode"), # train at the end of every episode
         ent_coef= 0, #'auto_0.1' # reduce entropy as the policy is pretrained
     )
+    # model = SAC(
+        # "MultiInputPolicy",
+    #     env,
+    #     verbose=1,
+    #     seed=cfg["seed"],
+    #     buffer_size=cfg["buffer_size"],
+    #     policy_kwargs=policy_kwargs,
+    #     batch_size=1,  # for fast iteration in prototyping and avoid OoD locally
+    #     learning_starts=0,  # Start training immediately with BC policy, not random exploration
+    #     train_freq=(1, "episode"), # train at the end of every episode
+    #     ent_coef= 0, #'auto_0.1' # reduce entropy as the policy is pretrained
+    # )
     vec_env = model.get_env()
     print(f"Train will run with n_envs={vec_env.num_envs if vec_env is not None else 'unknown'}")
     # TODO: HER (requires adding achieved_goal/desired_goal keys to observation space)
@@ -366,6 +414,9 @@ if __name__ == "__main__":
     print(f"Render mode: {render_mode}")
     env = Monitor(AvoidEverythingEnv(dataloader=train_dl, render_mode=render_mode, render_backend=render_backend))
     eval_env = Monitor(AvoidEverythingEnv(dataloader=eval_dl, render_mode=render_mode, render_backend=render_backend))
+    # wrap vec
+    env = DummyVecEnv([lambda: env])
+    eval_env = DummyVecEnv([lambda: eval_env])
 
     # callbacks to debug train and eval
     eval_callback = DebugCallback(
@@ -382,10 +433,11 @@ if __name__ == "__main__":
 
     # --- Bootstrap RL agent from BC pretrained policy ---
     model: SAC = bootstrap_agent(env, eval_env, cfg, args, eval_callback)
+    debug_actor_weights(model, "AFTER_BOOTSTRAP")
 
     
     # Warm-up critic with fixed/frozen actor
-    model = warmup_critic(model, cfg["critic_warmup_steps"], train_callback)
+    warmup_critic(model, cfg["critic_warmup_steps"], train_callback)
 
 
     # --- Train ---
@@ -398,6 +450,7 @@ if __name__ == "__main__":
 
     # --- Evaluate trained model ---
     print("\nEvaluating trained SAC agent...")
+    debug_actor_weights(model, "BEFORE_EVAL")
     mean_reward, std_reward = evaluate_policy(
         model,
         eval_env,

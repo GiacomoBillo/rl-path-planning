@@ -23,225 +23,180 @@ if TYPE_CHECKING:
     from avoid_everything.mpiformer import MotionPolicyTransformer
 
 
-class MPiFormerBackbone(nn.Module):
-    """Frozen shared perception backbone: PointNet++ + joint encoder.
-    
-    Extracts point cloud and joint features from observations.
-    Intended to be frozen and shared across actor and critic.
-    
+class MPiFormerPerceptionEncoder(nn.Module):
+    """ Perception encoder (first part of the encoder) of MPiFormer.
+
+    contains:
+    - PointNet++ point cloud embedder
+    - robot joint state encoder
+    - action token
+    - positional encoding layer (not learnable)
+    - type embeddings
+
     Args:
-        bc_model: MotionPolicyTransformer instance with point_cloud_embedder, feature_embedder, etc.
+        bc_model: MotionPolicyTransformer to extract perception encoder components from.
+        deep_copy: If True, deep copy the components. If False, share the components.
     """
 
-    def __init__(self, bc_model: MotionPolicyTransformer):
+    def __init__(self, bc_model: MotionPolicyTransformer, deep_copy: bool = False):
         super().__init__()
-        self.point_cloud_embedder = bc_model.point_cloud_embedder
-        self.feature_embedder = bc_model.feature_embedder
-        self.pe_layer = bc_model.pe_layer
-        self.token_type_embedding = bc_model.token_type_embedding
         self.d_model = bc_model.d_model
+        if deep_copy:
+            self.point_cloud_embedder = copy.deepcopy(bc_model.point_cloud_embedder)
+            self.feature_embedder = copy.deepcopy(bc_model.feature_embedder)
+            self.action_tokens = nn.Parameter(bc_model.action_tokens.clone())
+            self.pe_layer = copy.deepcopy(bc_model.pe_layer)
+            self.token_type_embedding = copy.deepcopy(bc_model.token_type_embedding)
+        else:
+            self.point_cloud_embedder = bc_model.point_cloud_embedder
+            self.feature_embedder = bc_model.feature_embedder
+            self.action_tokens = bc_model.action_tokens
+            self.pe_layer = bc_model.pe_layer
+            self.token_type_embedding = bc_model.token_type_embedding
 
     def forward(
         self,
-        pc_labels: torch.Tensor,
-        pc: torch.Tensor,
+        point_cloud_labels: torch.Tensor,
+        point_cloud: torch.Tensor,
         q: torch.Tensor,
         bounds: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Extract embeddings and positional encoding.
-        
-        Returns:
-            pc_embedding: (B, N', D) point cloud embeddings after PointNet++
-            pos: (B, N', 3) point cloud positions after PointNet++
-            joint_embedding: (B, 1, D) joint state embedding
-            pos_emb: (B, N'+2, D) positional encodings for transformer sequence
+    ) -> torch.Tensor:
         """
-        # Point cloud through PointNet++
-        pc_embedding, pos = self.point_cloud_embedder(pc_labels, pc)
-        
-        # Joint state through encoder
-        B = pc.size(0)
-        joint_embedding = self.feature_embedder(q).unsqueeze(1)  # (B, 1, D)
-        
-        # Build positional encodings for transformer
+        Returns:
+            embedded_sequence: (SeqLen, B, D)
+        """
+        assert point_cloud_labels.shape[:2] == point_cloud.shape[:2]
+        pc_embedding, pos = self.point_cloud_embedder(point_cloud_labels, point_cloud)
+        feature_embedding = self.feature_embedder(q).unsqueeze(1)
+        B = point_cloud.size(0)
+        sequence = torch.cat(
+            (
+                pc_embedding,
+                feature_embedding,
+                self.action_tokens.expand((B, -1, -1)),
+            ),
+            dim=1,
+        ).transpose(0, 1)
+
         pc_type_emb = self.token_type_embedding(
-            torch.tensor(0, dtype=torch.long, device=pc.device)
+            torch.tensor(0, dtype=torch.long, device=point_cloud.device)
         )
         joint_state_type_emb = self.token_type_embedding(
-            torch.tensor(1, dtype=torch.long, device=pc.device)
+            torch.tensor(1, dtype=torch.long, device=point_cloud.device)
         )[None, None, :]
-        
+        action_type_emb = self.token_type_embedding(
+            torch.tensor(2, dtype=torch.long, device=point_cloud.device)
+        )[None, None, :]
+
         pos_emb = torch.cat(
             (
                 self.pe_layer(pos, bounds) + pc_type_emb,
                 joint_state_type_emb.expand((B, -1, -1)),
+                action_type_emb.expand((B, 1, -1)),
             ),
             dim=1,
-        )
-        
-        return pc_embedding, joint_embedding, pos_emb
+        ).transpose(0, 1)
+        embedded_sequence = sequence + pos_emb
+        return embedded_sequence
 
-    def freeze(self, components: list[Literal["pointnet", "joint_encoder"]] | None = None) -> None:
-        """Freeze backbone components.
-        
-        Args:
-            components: List of component names to freeze. None means all.
-        """
-        if components is None:
-            components = ["pointnet", "joint_encoder"]
-        
-        for comp in components:
-            if comp == "pointnet":
-                for p in self.point_cloud_embedder.parameters():
-                    p.requires_grad = False
-            elif comp == "joint_encoder":
-                for p in self.feature_embedder.parameters():
-                    p.requires_grad = False
-
-    def unfreeze(self, components: list[Literal["pointnet", "joint_encoder"]] | None = None) -> None:
-        """Unfreeze backbone components.
-        
-        Args:
-            components: List of component names to unfreeze. None means all.
-        """
-        if components is None:
-            components = ["pointnet", "joint_encoder"]
-        
-        for comp in components:
-            if comp == "pointnet":
-                for p in self.point_cloud_embedder.parameters():
-                    p.requires_grad = True
-            elif comp == "joint_encoder":
-                for p in self.feature_embedder.parameters():
-                    p.requires_grad = True
-
-
-class MPiFormerTransformerExtractor(BaseFeaturesExtractor):
-    """Per-instance transformer feature extractor for SB3 actor/critic.
-    
-    Takes frozen backbone embeddings, applies transformer, extracts action token.
-    Each actor/critic can have its own transformer instance (separate by default).
-    
-    Args:
-        observation_space: Dict observation space from AvoidEverythingEnv.
-        shared_backbone: MPiFormerBackbone instance (shared reference, frozen).
-        bc_model: MotionPolicyTransformer for copying transformer weights.
-        pc_bounds: Point-cloud normalisation bounds, shape (2, 3).
-        freeze_backbone: If True, freeze backbone parameters on construction.
-        shared_transformer: If True, share transformer across actor/critic (same object).
-            If False (default), each gets its own deepcopy of the transformer.
-    """
-
-    def __init__(
-        self,
-        observation_space: spaces.Dict,
-        shared_backbone: MPiFormerBackbone,
-        bc_model: MotionPolicyTransformer,
-        pc_bounds: list,
-        freeze_backbone: bool = True,
-        shared_transformer: bool = False,
-    ):
-        super().__init__(observation_space, features_dim=bc_model.d_model)
-        self.shared_backbone = shared_backbone
-        self.register_buffer(
-            "pc_bounds", torch.tensor(pc_bounds, dtype=torch.float32)
-        )
-        
-        # Transformer encoder and action tokens (shared only if specified)
-        if shared_transformer:
-            self.encoder = bc_model.encoder
-            self.action_tokens = bc_model.action_tokens  # Same Parameter object
-        else:
-            self.encoder = copy.deepcopy(bc_model.encoder)  # New independent module
-            self.action_tokens = nn.Parameter(bc_model.action_tokens.clone())  # New Parameter with cloned data
-        self.d_model = bc_model.d_model
-        
-        if freeze_backbone:
-            self.freeze(components=["pointnet", "joint_encoder"])
-
-    def forward(self, observations: dict) -> torch.Tensor:
-        """Extract features via backbone + transformer.
-        
-        Args:
-            observations: Dict with "point_cloud", "point_cloud_labels", "configuration"
-        
-        Returns:
-            (B, d_model) action token embeddings from transformer
-        """
-        pc = observations["point_cloud"]  # (B, N, 3)
-        pc_labels = observations["point_cloud_labels"]  # (B, N, 1)
-        q = observations["configuration"]  # (B, dof)
-        B = pc.size(0)
-        
-        # Get embeddings from backbone
-        pc_embedding, joint_embedding, pos_emb = self.shared_backbone(
-            pc_labels, pc, q, self.pc_bounds
-        )
-        
-        # Build full sequence for transformer
-        action_token_type_emb = self.shared_backbone.token_type_embedding(
-            torch.tensor(2, dtype=torch.long, device=pc.device)
-        )[None, None, :]
-        
-        sequence = torch.cat(
-            (
-                pc_embedding,
-                joint_embedding,
-                self.action_tokens.expand((B, -1, -1)),
-            ),
-            dim=1,
-        ).transpose(0, 1)  # (N'+2, B, D)
-        
-        action_type_emb = action_token_type_emb.expand((B, 1, -1))
-        pos_emb_full = torch.cat((pos_emb, action_type_emb), dim=1).transpose(0, 1)  # (N'+3, B, D)
-        
-        embedded_sequence = sequence + pos_emb_full
-        action_token = self.encoder(embedded_sequence, mask=None)[-1:]  # (1, B, D)
-        
-        return action_token.squeeze(0)  # (B, D)
-
-    def freeze(self, components: list[Literal["pointnet", "joint_encoder", "transformer"]] | None = None) -> None:
+    def freeze(self, components: list[Literal["pointnet", "joint_encoder", "action_token", "type_embeddings"]] | None = None) -> None:
         """Freeze components.
         
         Args:
             components: List of component names to freeze. None means all.
         """
         if components is None:
-            components = ["pointnet", "joint_encoder", "transformer"]
+            components = ["pointnet", "joint_encoder", "action_token", "type_embeddings"]
         
         for comp in components:
-            if comp in ["pointnet", "joint_encoder"]:
-                self.shared_backbone.freeze(components=[comp])
-            elif comp == "transformer":
-                for p in self.encoder.parameters():
+            if comp == "pointnet":
+                for p in self.point_cloud_embedder.parameters():
                     p.requires_grad = False
+            elif comp == "joint_encoder":
+                for p in self.feature_embedder.parameters():
+                    p.requires_grad = False
+            elif comp == "action_token":
                 self.action_tokens.requires_grad = False
+            elif comp == "type_embeddings":
+                for p in self.token_type_embedding.parameters():
+                    p.requires_grad = False
+            else:
+                raise ValueError(f"Unknown component name: {comp}")
 
-    def unfreeze(self, components: list[Literal["pointnet", "joint_encoder", "transformer"]] | None = None) -> None:
+    def unfreeze(self, components: list[Literal["pointnet", "joint_encoder", "action_token", "type_embeddings"]] | None = None) -> None:
         """Unfreeze components.
         
         Args:
             components: List of component names to unfreeze. None means all.
         """
         if components is None:
-            components = ["pointnet", "joint_encoder", "transformer"]
+            components = ["pointnet", "joint_encoder", "action_token", "type_embeddings"]
         
         for comp in components:
-            if comp in ["pointnet", "joint_encoder"]:
-                self.shared_backbone.unfreeze(components=[comp])
-            elif comp == "transformer":
-                for p in self.encoder.parameters():
+            if comp == "pointnet":
+                for p in self.point_cloud_embedder.parameters():
                     p.requires_grad = True
+            elif comp == "joint_encoder":
+                for p in self.feature_embedder.parameters():
+                    p.requires_grad = True
+            elif comp == "action_token":
                 self.action_tokens.requires_grad = True
+            elif comp == "type_embeddings":
+                for p in self.token_type_embedding.parameters():
+                    p.requires_grad = True
+            else:
+                raise ValueError(f"Unknown component name: {comp}")
 
+
+class MPiFormerTransformerEncoder(nn.Module):
+    """Transformer encoder (second part of the encoder) of MPiFormer.
+
+    contains:
+    - transformer layers
+
+    Args:
+        bc_model: MotionPolicyTransformer to extract transformer encoder components from.
+        deep_copy: If True, deep copy the components. If False, share the components.
+    """
+
+    def __init__(self, bc_model: MotionPolicyTransformer, deep_copy: bool = False):
+        super().__init__()
+        self.d_model = bc_model.d_model
+        if deep_copy:
+            self.transformer = copy.deepcopy(bc_model.encoder)
+        else:
+            self.transformer = bc_model.encoder
+
+    def forward(self, embedded_sequence: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            embedded_sequence: (SeqLen, B, D)
+            
+        Returns:
+            action_embedding: (B, D)
+        """
+        action_embedding = self.transformer(embedded_sequence, mask=None)[-1:]  # (1, B, D)
+        return action_embedding.squeeze(0)  # (B, D)
+
+    def freeze(self) -> None:
+        """Freeze transformer encoder parameters."""
+        for p in self.transformer.parameters():
+            p.requires_grad = False
+
+    def unfreeze(self) -> None:
+        """Unfreeze transformer encoder parameters."""
+        for p in self.transformer.parameters():
+            p.requires_grad = True
+   
 
 class MPiFormerExtractor(BaseFeaturesExtractor):
-    """Legacy feature extractor that wraps the MPiFormer BC encoder.
+    """Feature extractor that wraps/manages the MPiFormer BC encoder 
+    for loading a pre-trained model into the SB3 RL policy.
     
-    (DEPRECATED: Use MPiFormerTransformerExtractor + MPiFormerBackbone instead)
-
-    Wraps ``bc_model.encode()`` so SB3's actor and critic can share the pre-trained representation.  
-    The encoder can be frozen during early RL training and later unfrozen for end-2-end fine-tuning
+    Wraps ``bc_model.encode()`` via split encoders so SB3's actor and critic 
+    can share or copy the pre-trained representation.
+    
+    The encoders can be frozen/unfrozen independently.
 
     Args:
         observation_space: Dict observation space from AvoidEverythingEnv.
@@ -249,7 +204,10 @@ class MPiFormerExtractor(BaseFeaturesExtractor):
         pc_bounds: Point-cloud normalisation bounds, shape (2, 3) or equivalent
             nested list ``[min_xyz, max_xyz]``.  Registered as a buffer so it
             moves to the correct device automatically.
-        freeze: If True, freeze all BC encoder parameters on construction.
+        freeze_perception: If True, freeze perception encoder parameters on construction. Default: True.
+        freeze_transformer: If True, freeze transformer encoder parameters on construction. Default: False.
+        deep_copy_perception: If True, deep copy the perception components from bc_model. Default: True.
+        deep_copy_transformer: If True, deep copy the transformer components from bc_model. Default: True.
     """
 
     def __init__(
@@ -257,28 +215,55 @@ class MPiFormerExtractor(BaseFeaturesExtractor):
         observation_space: spaces.Dict,
         bc_model: MotionPolicyTransformer,
         pc_bounds: list,
-        freeze: bool = True,
+        freeze_perception: bool = True,
+        freeze_transformer: bool = False,
+        deep_copy_perception: bool = True,
+        deep_copy_transformer: bool = True,
     ):
         super().__init__(observation_space, features_dim=bc_model.d_model)
-        self.bc_model = bc_model
+        
+        self.perception_encoder = MPiFormerPerceptionEncoder(bc_model, deep_copy=deep_copy_perception)
+        self.transformer_encoder = MPiFormerTransformerEncoder(bc_model, deep_copy=deep_copy_transformer)
+        
         self.register_buffer(
             "pc_bounds", torch.tensor(pc_bounds, dtype=torch.float32)
         )
-        if freeze:
-            self.freeze()
+        
+        if freeze_perception:
+            self.freeze_perception()
+        else:
+            self.unfreeze_perception()
+            
+        if freeze_transformer:
+            self.freeze_transformer()
+        else:
+            self.unfreeze_transformer()
 
-    def freeze(self) -> None:
-        """Freeze all BC encoder parameters (no gradients)."""
-        for p in self.bc_model.parameters():
-            p.requires_grad = False
+    def freeze_perception(self) -> None:
+        """Freeze perception encoder parameters."""
+        self.perception_encoder.freeze()
 
-    def unfreeze(self) -> None:
-        """Unfreeze BC encoder parameters for end-to-end fine-tuning."""
-        for p in self.bc_model.parameters():
-            p.requires_grad = True
+    def unfreeze_perception(self) -> None:
+        """Unfreeze perception encoder parameters."""
+        self.perception_encoder.unfreeze()
+
+    def freeze_transformer(self) -> None:
+        """Freeze transformer encoder parameters."""
+        self.transformer_encoder.freeze()
+
+    def unfreeze_transformer(self) -> None:
+        """Unfreeze transformer encoder parameters."""
+        self.transformer_encoder.unfreeze()
 
     def forward(self, observations: dict) -> torch.Tensor:
-        pc = observations["point_cloud"]  # (B, N, 3) float32
-        pc_labels = observations["point_cloud_labels"]  # (B, N, 1) int32; .long() applied internally
-        q = observations["configuration"]  # (B, dof) float32
-        return self.bc_model.encode(pc_labels, pc, q, self.pc_bounds)  # (B, d_model)
+        """
+        Extract features from observations by running through the perception encoder
+        and then use the transformer encoder to get the final action embedding.
+        """
+        pc = observations["point_cloud"]  # (B, N, 3)
+        pc_labels = observations["point_cloud_labels"]  # (B, N, 1)
+        q = observations["configuration"]  # (B, dof)
+        
+        embedded_sequence = self.perception_encoder(pc_labels, pc, q, self.pc_bounds)
+        action_embedding = self.transformer_encoder(embedded_sequence)
+        return action_embedding
