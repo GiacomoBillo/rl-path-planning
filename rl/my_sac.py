@@ -4,7 +4,7 @@ from gymnasium import spaces
 from stable_baselines3 import SAC
 from typing import Optional, Tuple
 from stable_baselines3.common.noise import ActionNoise
-
+from stable_baselines3.common.callbacks import BaseCallback
 
 np.set_printoptions(precision=3, suppress=False)
 
@@ -13,11 +13,263 @@ class SACDebug(SAC):
     """
     Custom SAC class for debugging, with options for deterministic rollout and verbose logging
     """
-    def __init__(self, *args, deterministic_rollout=True, verbose=True, **kwargs):
+    def __init__(self, *args, force_deterministic=True, debug_verbose=1, **kwargs):
         super().__init__(*args, **kwargs)
-        self.deterministic_rollout = deterministic_rollout
-        self.debug_verbose = verbose
-        print(f"Using SACDebug, deterministic_rollout={self.deterministic_rollout}")
+        self.force_deterministic = force_deterministic
+        self.debug_verbose_level = debug_verbose
+        self.log_indent = ""
+        if self.debug_verbose_level > 0:
+            print(f"Using SACDebug, force_deterministic={self.force_deterministic}, debug_level={self.debug_verbose_level}")
+        
+        self.previous_weights = {}
+        
+        # Components to monitor for Level 2 summary
+        # Format: (Display Name, Path, Indent Level)
+        self.COMPONENTS_TO_MONITOR = [
+            ("Perception", "features_extractor.perception_encoder", 0),
+            ("PointNet", "features_extractor.perception_encoder.point_cloud_embedder", 1),
+            ("Features", "features_extractor.perception_encoder.feature_embedder", 1), 
+            ("Action Token", "features_extractor.perception_encoder.action_tokens", 1),
+            ("Type Emb", "features_extractor.perception_encoder.token_type_embedding", 1),
+            ("Transformer", "features_extractor.transformer_encoder", 0),
+            ("Mu", "mu", 0),
+            ("LogStd", "log_std", 0),
+            ("Q-Nets", ["qf0", "qf1"], 0),
+        ]
+
+    def log(self, msg: str, level: int = 0) -> None:
+        """
+        Log message if debug level is sufficient.
+        Level 0: Minimal, always print (only major events)
+        Level 1: Summary (high-level status)
+        Level 2: Component Summary (status of key components)
+        Level 3: Detailed (per-parameter details)
+
+        Default level is 0, meaning the message will always be printed. 
+        """
+        if self.debug_verbose_level >= level:
+            print(self.log_indent + msg)
+    
+    def indent(self):
+        self.log_indent += "  "
+        return self
+    
+    def unindent(self):
+        self.log_indent = self.log_indent[:-2]
+        return self
+
+
+    def _get_submodule(self, model: th.nn.Module, path: str) -> Optional[th.nn.Module]:
+        """Safely retrieve a submodule by dot-separated path."""
+        try:
+            curr = model
+            for part in path.split("."):
+                curr = getattr(curr, part)
+            return curr
+        except AttributeError:
+            return None
+
+
+    def monitor_weights_sum(self, model: th.nn.Module, name: str, context="", verbose_level=1) -> None:
+        """
+        Compute and log the sum of all weights in the given model.
+        
+        Args:
+            model: The module to check (e.g. self.policy.actor)
+            name: Human-readable name (e.g. "Actor")
+            context: Additional context to include in the log
+            verbose_level: Minimum debug level to print this message
+        """
+        s = 0
+        with th.no_grad():
+            for p in model.parameters():
+                s += p.data.sum().item()
+        self.log(f"[{name} weights sum] {context}: {s:.4f}", level=verbose_level)
+
+
+    def monitor_weight_changes(self, model: th.nn.Module, name: str, threshold: float = 1e-6) -> None:
+        """
+        Check which parameters have changed since the last check.
+        
+        Args:
+            model: The module to check (e.g. self.policy.actor)
+            name: Human-readable name (e.g. "Actor")
+            threshold: Minimum difference to consider a parameter changed
+        """
+        # Move to CPU to save GPU memory
+        current_params = {n: p.detach().cpu().clone() for n, p in model.named_parameters()}
+        total_scalars = sum(p.numel() for p in current_params.values())
+        
+        if name in self.previous_weights:
+            prev_params = self.previous_weights[name]
+            changed_scalar_count = 0
+            
+            # Level 2: Component Summary
+            if self.debug_verbose_level == 2:
+                self.log(f"[{name} Weights Changes Summary]", level=2)
+                for comp_name, comp_path, indent in self.COMPONENTS_TO_MONITOR:
+                    # Check if component exists in this model (Actor or Critic)
+                    # We can check if any parameter starts with comp_path
+                    comp_diff = 0.0
+                    comp_found = False
+                    
+                    # Iterate all params to find matches (inefficient but safe)
+                    # Convert list to tuple for startswith
+                    paths_to_check = tuple(comp_path) if isinstance(comp_path, list) else comp_path
+
+                    comp_scalar_count = 0
+                    for n, p in current_params.items():
+                        if n.startswith(paths_to_check):
+                            comp_found = True
+                            comp_scalar_count += p.numel()
+                            if n in prev_params:
+                                comp_diff += (p - prev_params[n]).abs().sum().item()
+                    
+                    if comp_found:
+                        status = "CHANGED" if comp_diff > threshold else "Unchanged"
+                        prefix = "  " * (indent + 1)
+                        
+                        # Normalize diff by scalar count
+                        norm_diff = comp_diff / comp_scalar_count if comp_scalar_count > 0 else 0.0
+                        
+                        diff_str = f"(Avg Diff: {norm_diff*100:.3f}%)" if status == "CHANGED" else ""
+                        self.log(f"{prefix}> {name} {comp_name}: {status} {diff_str}", level=2)
+
+            # Level 3: Detailed per-parameter check
+            if self.debug_verbose_level >= 3:
+                for n, p in current_params.items():
+                    num_scalars = p.numel()
+                    if n in prev_params:
+                        diff = (p - prev_params[n]).abs().sum().item()
+                        if diff > threshold:
+                            changed_scalar_count += num_scalars
+                            self.log(f"  !!! CHANGED: {n} ({num_scalars} scalars) | Diff: {diff:.6f}", level=3)
+                        else:
+                            self.log(f"  ✓ Unchanged: {n} ({num_scalars} scalars) | Diff: {diff:.6f}", level=3)
+            
+            # Calculate total changed count for summary (always needed)
+            if self.debug_verbose_level < 3: # Avoid double counting if loop didn't run
+                 for n, p in current_params.items():
+                    if n in prev_params:
+                        diff = (p - prev_params[n]).abs().sum().item()
+                        if diff > threshold:
+                            changed_scalar_count += p.numel()
+
+            self.log(f"[Count {name} Weights Changed] Changed scalars: {changed_scalar_count/total_scalars*100:.2f}% out of {total_scalars} params", level=1)
+        
+        # update previous weights
+        self.previous_weights[name] = current_params
+
+
+    def monitor_freeze_status(self, model: th.nn.Module, name: str) -> None:
+        """
+        Check which parameters are currently frozen.
+        
+        Args:
+            model: The module to check
+            name: Human-readable name
+        """
+        total_params = 0
+        unfrozen_count = 0
+
+        # Level 2: Component Summary
+        if self.debug_verbose_level == 2:
+            self.log(f"[{name} Freeze Status Summary]", level=2)
+            for comp_name, comp_path, indent in self.COMPONENTS_TO_MONITOR:
+                # Handle list of paths
+                if isinstance(comp_path, list):
+                    paths = comp_path
+                else:
+                    paths = [comp_path]
+
+                c_total = 0
+                c_frozen = 0
+                module_found = False
+
+                for path in paths:
+                    module = self._get_submodule(model, path)
+                    if module is not None:
+                        module_found = True
+                        
+                        if isinstance(module, th.nn.Module):
+                            params_to_check = module.parameters()
+                        elif isinstance(module, th.nn.Parameter):
+                            params_to_check = [module]
+                        else:
+                            continue
+
+                        for p in params_to_check:
+                            num_scalars = p.numel()
+                            c_total += num_scalars
+                            if not p.requires_grad:
+                                c_frozen += num_scalars
+                
+                if module_found and c_total > 0:
+                    if c_frozen == c_total:
+                        status = "all Frozen"
+                    elif c_frozen == 0:
+                        status = "all Trainable"
+                    else:
+                        status = f"Mixed ({c_frozen}/{c_total} frozen scalars)"
+                    
+                    prefix = "  " * (indent + 1)
+                    self.log(f"{prefix}> {name} {comp_name}: {status}", level=2)
+
+        # Level 3: Detailed per-parameter check
+        if self.debug_verbose_level >= 3:
+            for n, p in model.named_parameters():
+                num_scalars = p.numel()
+                total_params += num_scalars
+                if p.requires_grad:
+                    self.log(f"  !!! UNFROZEN: {n} ({num_scalars} scalars)", level=3)
+                    unfrozen_count += num_scalars
+                else:
+                    self.log(f"  ✓ Frozen: {n} ({num_scalars} scalars)", level=3)
+        else:
+             # Just count for summary
+             for n, p in model.named_parameters():
+                num_scalars = p.numel()
+                total_params += num_scalars
+                if p.requires_grad:
+                    unfrozen_count += num_scalars
+
+        self.log(f"[{name} Count Frozen Weights] Frozen scalars: {(total_params - unfrozen_count)/total_params*100:.2f}%  | Trainable scalars: {unfrozen_count/total_params*100:.2f}% | out of {total_params} params", level=1)
+
+    def monitor_agent(self, 
+                      description: str = "",
+                      monitor_actor: bool = True,
+                      monitor_critic: bool = True
+        ) -> None:
+        """
+        High-level function to monitor and debug both Actor and Critic status.
+        """
+        if self.debug_verbose_level < 1:
+            return
+        
+        if description != "":
+            description = f": {description} "
+        self.log("\n"+"-"*50, level=1)
+        self.log(f"--- Start Monitoring Policy Status {description}---", level=1)
+
+        if monitor_actor:
+            self.log(f"[DEBUG ACTOR{description}]", level=1)
+            self.indent()
+            self.monitor_weights_sum(self.policy.actor, "Actor")
+            self.monitor_freeze_status(self.policy.actor, "Actor")
+            self.monitor_weight_changes(self.policy.actor, "Actor")
+            self.unindent()
+        if monitor_critic:
+            self.log(f"\n[DEBUG CRITIC{description}]", level=1)
+            self.indent()
+            self.monitor_weights_sum(self.policy.critic, "Critic")
+            self.monitor_freeze_status(self.policy.critic, "Critic")
+            self.monitor_weight_changes(self.policy.critic, "Critic")
+            self.unindent()
+
+        # TODO: potentially monitor also target critic
+        self.log(f"--- End Monitoring Policy Status {description}---", level=1)
+        self.log("-"*50+"\n", level=1)
+
 
     # to overwrite off_policy_algorithm.py:OffPolicyAlgorithm._sample_action
     def _sample_action(
@@ -51,28 +303,24 @@ class SACDebug(SAC):
             # We use non-deterministic action in the case of SAC, for TD3, it does not matter
             assert self._last_obs is not None, "self._last_obs was not set"
             
-            if self.debug_verbose:
-                # DEBUG: Check weights
-                s = 0
-                with th.no_grad():
-                    for p in self.policy.actor.parameters():
-                         s += p.data.sum().item()
-                print(f"[SACDebug._sample_action] Actor weight sum: {s:.4f}")
+            if self.debug_verbose_level >= 3:
+                # DEBUG: Check weights sum
+                self.monitor_weights_sum(self.policy.actor, "Actor", verbose_level=3)
 
                 # DEBUG: Check action distribution parameters
                 obs_tensor, _ = self.policy.obs_to_tensor(self._last_obs)
                 with th.no_grad():
                     mean_actions, log_std, kwargs = self.actor.get_action_dist_params(obs_tensor)
                     # Note: the action is squashed
-                    sampled_action = self.actor.action_dist.actions_from_params(mean_actions, log_std, deterministic=self.deterministic_rollout, **kwargs)
+                    sampled_action = self.actor.action_dist.actions_from_params(mean_actions, log_std, deterministic=self.force_deterministic, **kwargs)
                     
-                    print("[debug]\n"
+                    self.log("[debug]\n"
                           f"mean_actions=\t{mean_actions.detach().cpu().numpy().squeeze()},\n"
                           f"log_std=\t{log_std.detach().cpu().numpy().squeeze()},\n"
                           f"squashed_sampled_action=\t{sampled_action.detach().cpu().numpy().squeeze()}\n"
-                          f"difference sample-mean=\t{th.abs(sampled_action - mean_actions).detach().cpu().numpy().squeeze()}")
+                          f"difference sample-mean=\t{th.abs(sampled_action - mean_actions).detach().cpu().numpy().squeeze()}", level=3)
 
-            unscaled_action, _ = self.predict(self._last_obs, deterministic=self.deterministic_rollout)
+            unscaled_action, _ = self.predict(self._last_obs, deterministic=self.force_deterministic)
             
         # Rescale the action from [low, high] to [-1, 1]
         if isinstance(self.action_space, spaces.Box):
@@ -91,3 +339,115 @@ class SACDebug(SAC):
             action = buffer_action
 
         return action, buffer_action
+
+
+class MySAC(SACDebug):
+    """
+    Expantion of SB3 SAC class
+
+    - Added functions to freeze/unfreeze learnable parts of the actor and critic
+    - Added function to warm up the critic by training with frozen actor
+    """
+
+    def freeze_learnable_actor(self) -> None:
+        """
+        Freeze learnable part of the actor
+        """
+        if "perception" not in self.policy.actor.features_extractor.permanently_frozen_components:
+            self.log("Freezing actor perception module...", level=1)
+            self.policy.actor.features_extractor.freeze_perception()
+        if "transformer" not in self.policy.actor.features_extractor.permanently_frozen_components:
+            self.log("Freezing actor transformer module...", level=1)
+            self.policy.actor.features_extractor.freeze_transformer()
+
+        # always freeze policy heads (mu and log_std)
+        self.log("Freezing actor policy heads (mu and log_std)...", level=1)
+        for param in self.policy.actor.mu.parameters():
+            param.requires_grad = False
+        for param in self.policy.actor.log_std.parameters():
+            param.requires_grad = False
+
+    def unfreeze_learnable_actor(self) -> None:
+        """
+        Unfreeze learnable part of the actor
+        """
+        if "perception" not in self.policy.actor.features_extractor.permanently_frozen_components:
+            self.log("Unfreezing actor perception module...", level=1)
+            self.policy.actor.features_extractor.unfreeze_perception()
+        if "transformer" not in self.policy.actor.features_extractor.permanently_frozen_components:
+            self.log("Unfreezing actor transformer module...", level=1)
+            self.policy.actor.features_extractor.unfreeze_transformer()
+        
+        self.log("Unfreezing actor policy heads (mu and log_std)...", level=1)
+        for param in self.policy.actor.mu.parameters():
+            param.requires_grad = True
+        for param in self.policy.actor.log_std.parameters():
+            param.requires_grad = True
+
+    def freeze_learnable_critic(self) -> None:
+        """
+        Freeze learnable part of the critic
+        """
+        if "perception" not in self.policy.critic.features_extractor.permanently_frozen_components:
+            self.log("Freezing critic perception module...", level=1)
+            self.policy.critic.features_extractor.freeze_perception()
+        if "transformer" not in self.policy.critic.features_extractor.permanently_frozen_components:
+            self.log("Freezing critic transformer module...", level=1)
+            self.policy.critic.features_extractor.freeze_transformer()
+        # always freeze Q-value head
+        self.log("Freezing critic Q-value head...", level=1)
+        for param in self.policy.critic.q_networks.parameters():
+            param.requires_grad = False
+
+    def unfreeze_learnable_critic(self) -> None:
+        """
+        Unfreeze learnable part of the critic
+        """
+        if "perception" not in self.policy.critic.features_extractor.permanently_frozen_components:
+            self.log("Unfreezing critic perception module...", level=1)
+            self.policy.critic.features_extractor.unfreeze_perception()
+        if "transformer" not in self.policy.critic.features_extractor.permanently_frozen_components:
+            self.log("Unfreezing critic transformer module...", level=1)
+            self.policy.critic.features_extractor.unfreeze_transformer()
+        self.log("Unfreezing critic Q-value head...", level=1)
+        for param in self.policy.critic.q_networks.parameters():
+            param.requires_grad = True
+
+
+    def warmup_critic(
+        self,
+        critic_warmup_steps: int,
+        callback: BaseCallback
+    ) -> None:
+        """
+        Warm up the critic by training for a specified number of steps with the actor frozen.
+        """
+        if critic_warmup_steps <= 0:
+            self.log("✓ No critic warmup steps specified, skipping warmup.")
+            return
+        self.log(f"\nWarming up critic for {critic_warmup_steps} steps with frozen actor")
+
+        # Freeze actor, set eval mode, and prevent SB3 from switching back to train mode during learn()
+        self.freeze_learnable_actor()
+        self.policy.actor.set_training_mode(False) # disable Dropout/BatchNorm
+        original_actor_set_mode = self.policy.actor.set_training_mode
+        self.policy.actor.set_training_mode = lambda mode: None
+        
+        # Monitor and debug before warmup
+        self.monitor_agent("BEFORE WARMUP")
+
+        # --- Critic warmup = learn with frozen actor ---
+        self.learn(
+            total_timesteps=critic_warmup_steps,
+            progress_bar=True,
+            callback=callback,
+            )
+
+        # Restore actor set_training_mode and Unfreeze actor components
+        self.unfreeze_learnable_actor()
+        self.policy.actor.set_training_mode = original_actor_set_mode
+        self.policy.actor.set_training_mode(True) # enable dropout/batchnorm
+        
+        self.log("✓ Critic warmup complete. Actor unfrozen")
+        # Monitor and debug after warmup
+        self.monitor_agent("AFTER WARMUP")

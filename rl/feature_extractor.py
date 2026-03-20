@@ -222,6 +222,10 @@ class MPiFormerExtractor(BaseFeaturesExtractor):
     ):
         super().__init__(observation_space, features_dim=bc_model.d_model)
         
+        if not deep_copy_perception and not freeze_perception:
+            raise ValueError("Sharing perception encoder without freezing can lead to unintended side effects. Set freeze_perception=True if you want to share the perception encoder.")
+        if not deep_copy_transformer and not freeze_transformer:
+            raise ValueError("Sharing transformer encoder without freezing can lead to unintended side effects. Set freeze_transformer=True if you want to share the transformer encoder.")
         self.perception_encoder = MPiFormerPerceptionEncoder(bc_model, deep_copy=deep_copy_perception)
         self.transformer_encoder = MPiFormerTransformerEncoder(bc_model, deep_copy=deep_copy_transformer)
         
@@ -229,13 +233,15 @@ class MPiFormerExtractor(BaseFeaturesExtractor):
             "pc_bounds", torch.tensor(pc_bounds, dtype=torch.float32)
         )
         
+        self.permanently_frozen_components = []
         if freeze_perception:
             self.freeze_perception()
+            self.permanently_frozen_components.append("perception")
         else:
             self.unfreeze_perception()
-            
         if freeze_transformer:
             self.freeze_transformer()
+            self.permanently_frozen_components.append("transformer")
         else:
             self.unfreeze_transformer()
 
