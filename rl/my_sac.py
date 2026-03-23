@@ -5,6 +5,7 @@ from stable_baselines3 import SAC
 from typing import Optional, Tuple
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
+from tqdm.auto import tqdm
 
 np.set_printoptions(precision=3, suppress=False)
 
@@ -451,3 +452,119 @@ class MySAC(SACDebug):
         self.log("✓ Critic warmup complete. Actor unfrozen")
         # Monitor and debug after warmup
         self.monitor_agent("AFTER WARMUP")
+
+
+    def prefill_replay_buffer(
+        self,
+        cfg: dict,
+    ) -> None:
+        """Pre-fill replay buffer with policy rollouts before learn().
+        
+        Reads configuration parameters and calls internal _prefill_replay_buffer.
+        Follows the same pattern as warmup_critic().
+        
+        Args:
+            cfg: Configuration dictionary containing:
+                - transitions_before_learn: number of transitions to prefill the buffer with (default: buffer_size)
+                - prefill_deterministic: whether to use deterministic policy/actor (default: True) 
+        """
+        prefill_transitions = int(
+            # cfg.get("transitions_before_learn", cfg.get("rollouts_before_learn", 0))
+            cfg.get("transitions_before_learn", self.buffer_size)
+        )
+        prefill_deterministic = bool(cfg.get("prefill_deterministic", True))
+        
+        if prefill_transitions <= 0:
+            self.log("✓ No replay buffer prefill requested, skipping.")
+            return
+            
+        self.log(
+            f"\nPrefilling replay buffer with {prefill_transitions} transitions "
+            f"(using deterministic actor = {prefill_deterministic})..."
+        )
+        
+        transitions_added, episodes_added, prefill_mean_r, prefill_mean_len = self._prefill_replay_buffer(
+            target_transitions=prefill_transitions,
+            force_deterministic=prefill_deterministic,
+        )
+        
+        self.log(
+            "✓ Replay prefill complete: "
+            f"\n\t{transitions_added} transitions added, "
+            f"\n\t{episodes_added} episodes,"
+            f"\n\tmean_ep_reward={prefill_mean_r:.2f},\n\tmean_ep_len={prefill_mean_len:.2f}"
+        )
+        self.log(f"Current replay buffer status: {self.replay_buffer.size()}/{self.replay_buffer.buffer_size} transitions stored.", level=1)
+
+
+    def _prefill_replay_buffer(
+        self,
+        target_transitions: int,
+        force_deterministic: bool = True,
+    ) -> Tuple[int, int, float, float]:
+        """Internal method to pre-fill replay buffer with policy rollouts.
+
+        Uses an SB3 evaluate_policy-style loop over env and stores each
+        transition with replay_buffer.add(...).
+        
+        Args:
+            target_transitions: Number of transitions to collect
+            force_deterministic: Whether to use deterministic policy for collection
+            
+        Returns:
+            Tuple of (transitions_added, episodes_added, mean_reward, mean_length)
+        """
+        if target_transitions <= 0:
+            return 0, 0.0, 0.0
+
+        env = self.get_env()
+        if env is None:
+            raise ValueError("Model has no environment attached for replay prefill.")
+
+        n_envs = env.num_envs
+        current_rewards = np.zeros(n_envs, dtype=np.float32)
+        current_lengths = np.zeros(n_envs, dtype=np.int32)
+
+        episode_rewards: list[float] = []
+        episode_lengths: list[int] = []
+        transitions_added = 0
+
+        obs = env.reset()
+        pbar = tqdm(total=target_transitions, desc="Prefilling replay buffer", unit="tr")
+        while transitions_added < target_transitions:
+            actions, _ = self.predict(obs, deterministic=force_deterministic)
+            next_obs, rewards, dones, infos = env.step(actions)
+
+            # Store one transition per env until the transition target is reached.
+            for i in range(n_envs):
+                # if i==0:
+                #     env.render()  # render the first env for visualization during prefill TODO: optional or with callback
+                if transitions_added >= target_transitions:
+                    break
+
+                obs_i = {k: np.array(v[i : i + 1]) for k, v in obs.items()}
+                next_obs_i = {k: np.array(v[i : i + 1]) for k, v in next_obs.items()}
+                action_i = np.array(actions[i : i + 1], dtype=np.float32)
+                reward_i = np.array([rewards[i]], dtype=np.float32)
+                done_i = np.array([dones[i]], dtype=np.float32)
+
+                self.replay_buffer.add(obs_i, next_obs_i, action_i, reward_i, done_i, [infos[i]])
+                transitions_added += 1
+                pbar.update(1)
+                current_rewards[i] += rewards[i]
+                current_lengths[i] += 1
+
+                if dones[i]:
+                    episode_rewards.append(float(current_rewards[i]))
+                    episode_lengths.append(int(current_lengths[i]))
+                    current_rewards[i] = 0.0
+                    current_lengths[i] = 0
+                    if episode_rewards:
+                        pbar.set_postfix({"mean_r": f"{np.mean(episode_rewards):.2f}"})
+
+            obs = next_obs
+
+        pbar.close()
+        mean_reward = float(np.mean(episode_rewards)) if episode_rewards else 0.0
+        mean_length = float(np.mean(episode_lengths)) if episode_lengths else 0.0
+        return transitions_added, len(episode_lengths), mean_reward, mean_length

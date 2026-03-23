@@ -275,15 +275,18 @@ def bootstrap_agent(
         verbose=args.verbose,
         seed=cfg["seed"],
         buffer_size=cfg["buffer_size"],
-        policy_kwargs=policy_kwargs,
-        batch_size=1,  # for fast iteration in prototyping and avoid OoD locally
         learning_starts=0,  # Start training immediately with BC policy, not random exploration
+        batch_size=1,  # for fast iteration in prototyping and avoid OoD locally
+        learning_rate=cfg.get("learning_rate", 3e-4),
+        ent_coef=0,  # 'auto_0.1' # reduce entropy as the policy is pretrained
+        gamma=cfg.get("gamma", 0.99),
+        policy_kwargs=policy_kwargs,
         train_freq=(1, "episode"), # train at the end of every episode
-        ent_coef= 0, #'auto_0.1' # reduce entropy as the policy is pretrained
     )
     vec_env = model.get_env()
     print(f"Train will run with n_envs={vec_env.num_envs if vec_env is not None else 'unknown'}")
     # TODO: HER (requires adding achieved_goal/desired_goal keys to observation space)
+    # TODO: BC buffer pre-filling (collect BC rollouts before learn() to replace random exploration phase)
 
     # Warm-start actor mean head from BC action_decoder (same Linear(512, 7) shape with net_arch={"pi": []})
     with torch.no_grad():
@@ -356,6 +359,10 @@ if __name__ == "__main__":
     model: MySAC = bootstrap_agent(env, eval_env, cfg, args, eval_callback)
     model.monitor_agent("AFTER BOOTSTRAP")
 
+
+    # Pre-fill replay buffer with BC policy rollouts
+    model.prefill_replay_buffer(cfg)
+    
     
     # Warm-up critic with fixed/frozen actor
     model.warmup_critic(cfg["critic_warmup_steps"], train_callback)

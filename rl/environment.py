@@ -61,7 +61,7 @@ class AvoidEverythingEnv(TimeLimit):
         render_mode: Literal["human", "rgb_array"] | None = None,
         render_backend: Literal["ros", "pybullet"] | None = None,
         render_fps: float | None = None,
-        max_episode_steps: int = 50,
+        max_episode_steps: int = 100,
         highlight_collisions: bool = True,
     ):
         """Initialize environment with an automatic TimeLimit wrapper.
