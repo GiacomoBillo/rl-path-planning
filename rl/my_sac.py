@@ -340,6 +340,53 @@ class SACDebug(SAC):
             action = buffer_action
 
         return action, buffer_action
+    
+
+    def log_std_status(self, context: str = "Prefill Start") -> None:
+        """
+        Log the current log_std values and corresponding standard deviations.
+        
+        Args:
+            context: Description of when this logging occurs (e.g., "Prefill Start", "Step 5")
+        """
+        if self.debug_verbose_level < 1:
+            return
+        
+        with th.no_grad():
+            log_std_values = self.policy.actor.log_std.bias
+            std_values = th.exp(log_std_values)
+            self.log(f"[{context}] log_std.bias={log_std_values.cpu().numpy()}", level=1)
+            self.log(f"[{context}] std (exp(log_std))={std_values.cpu().numpy()}", level=1)
+    
+    def log_action_sampling(self, obs: dict, actions: np.ndarray, step: int, deterministic: bool) -> None:
+        """
+        Log detailed action sampling information for debugging stochastic vs deterministic sampling.
+        Shows log_std, mean actions (before/after tanh), sampled actions, and differences.
+        
+        Args:
+            obs: Observation dict to get action distribution for
+            actions: Already sampled actions from predict()
+            step: Current step number (for logging)
+            deterministic: Whether deterministic sampling was used
+        """
+        if self.debug_verbose_level < 2:
+            return
+        
+        with th.no_grad():
+            obs_tensor, _ = self.policy.obs_to_tensor(obs)
+            mean_actions, log_std, kwargs = self.policy.actor.get_action_dist_params(obs_tensor)
+            std = th.exp(log_std)
+            mean_actions_squashed = th.tanh(mean_actions)
+            
+            self.log(f"\n[Prefill Step {step}] deterministic={deterministic}", level=2)
+            self.log(f"  log_std={log_std.cpu().numpy().squeeze()}", level=2)
+            self.log(f"  std (exp(log_std))={std.cpu().numpy().squeeze()}", level=2)
+            self.log(f"  mean_actions (before tanh)={mean_actions.cpu().numpy().squeeze()}", level=2)
+            self.log(f"  mean_actions (after tanh)={mean_actions_squashed.cpu().numpy().squeeze()}", level=2)
+            self.log(f"  sampled actions={actions.squeeze()}", level=2)
+            self.log(f"  |sampled - mean|={np.abs(actions.squeeze() - mean_actions_squashed.cpu().numpy().squeeze())}", level=2)
+
+
 
 
 class MySAC(SACDebug):
@@ -348,7 +395,37 @@ class MySAC(SACDebug):
 
     - Added functions to freeze/unfreeze learnable parts of the actor and critic
     - Added function to warm up the critic by training with frozen actor
+    - Added explicit log_std initialization (SB3 bug workaround)
     """
+
+    def initialize_log_std(self, log_std_value: float = -20.0, state_independent_start: bool = True) -> None:
+        """
+        Explicitly initialize actor's log_std parameter.
+        
+        This is a workaround for SB3 SAC bug where log_std_init in policy_kwargs is ignored
+        for standard SAC (only works with use_sde=True).
+        
+        Args:
+            log_std_value: Value to initialize log_std to (default: -20.0 for near-deterministic)
+            state_independent_start: If True, set weight=0 for constant log_std across all states.
+                             If False, only set bias (keeps state-dependent behavior).
+        """
+        with th.no_grad():
+            # set constant initial log_std.bias
+            self.policy.actor.log_std.bias.fill_(log_std_value)
+            if state_independent_start:
+                # State-independent log_std (constant across all states) at start
+                self.policy.actor.log_std.weight.fill_(0.0)  # No state dependence
+                self.log(f"✓ Initialized actor log_std (log_std.weight=0, state-independent start)", level=0)
+            else:
+                # State-dependent log_std (can vary with input features) at start
+                self.log(f"✓ Initialized actor log_std (rand init log_std.weight, state-dependent start)", level=0)
+            
+            # Verify and report
+            log_std_values = self.policy.actor.log_std.bias
+            std_values = th.exp(log_std_values)
+            self.log(f"  log_std.bias = {log_std_values.cpu().numpy()}", level=1)
+            self.log(f"  std (exp(log_std)) = {std_values.cpu().numpy()}", level=1)
 
     def freeze_learnable_actor(self) -> None:
         """
@@ -549,8 +626,18 @@ class MySAC(SACDebug):
 
         obs = env.reset()
         
+        # Log initial log_std status
+        self.log_std_status("Prefill Start")
+        
         while transitions_added < target_transitions:
-            actions, _ = self.predict(obs, deterministic=force_deterministic)
+            # Predict action with torch.no_grad() for efficiency        
+            with th.no_grad():
+                actions, _ = self.predict(obs, deterministic=force_deterministic)
+            
+            # Log detailed action sampling debug info for first few steps
+            if transitions_added < 3:
+                self.log_action_sampling(obs, actions, step=transitions_added, deterministic=force_deterministic)
+            
             next_obs, rewards, dones, infos = env.step(actions)
             
             # Store one transition per env until the transition target is reached.

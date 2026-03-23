@@ -277,7 +277,7 @@ def bootstrap_agent(
             "qf": []   # Critic no hidden layers, just Linear(d_model + action_dim, 1)
         },
         "share_features_extractor": False,  # Each (actor, critic) gets separate transformer
-        "log_std_init": -20.0,
+        "log_std_init": cfg["log_std_init"],  # does NOT work if no sde! Must initialize log_std explicitly after model creation.
     }
     model = MySAC( # use deterministic actions for debug
         "MultiInputPolicy",
@@ -289,7 +289,7 @@ def bootstrap_agent(
         buffer_size=cfg["buffer_size"],
         learning_starts=0,  # Start training immediately with BC policy, not random exploration
         batch_size=1,  # for fast iteration in prototyping and avoid OoD locally
-        ent_coef=0,  # 'auto_0.1' # reduce entropy as the policy is pretrained
+        ent_coef=cfg["entropy_coef"],  # reduce entropy as the policy is pretrained
         policy_kwargs=policy_kwargs,
         train_freq=(1, "episode"), # train at the end of every episode
     )
@@ -303,6 +303,10 @@ def bootstrap_agent(
         model.policy.actor.mu.weight.copy_(bc_model.action_decoder.weight)
         model.policy.actor.mu.bias.copy_(bc_model.action_decoder.bias)
     print("✓ Warm-started actor mu from BC action_decoder")
+    
+    # Explicit log_std initialization because SB3 only initialize it when using SDE
+    log_std_init_value = policy_kwargs.get("log_std_init", -20.0)
+    model.initialize_log_std(log_std_value=log_std_init_value, state_independent_start=True)
 
     # Cleanup to save memory: remove bc_model reference from policy_kwargs
     # SB3 stores policy_kwargs in self.policy_kwargs. We remove the heavy bc_model

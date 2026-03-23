@@ -36,13 +36,22 @@ n_eval_episodes: 100
 save_path: checkpoints/sac_cubbies
 
 # Buffer and learning configuration
-buffer_size: 10000
-critic_warmup_steps: 1000
-batch_size: 4  # Increased from 1 to reduce gradient variance
+buffer_size: 100
+critic_warmup_steps: 20
+# batch_size: 4  # Increased from 1 to reduce gradient variance
 transitions_before_learn: 100  # Prefill replay buffer with transitions before learn()
-prefill_deterministic: true  # Use deterministic actions during replay prefill
+prefill_deterministic: false  # Use deterministic actions during replay prefill
+prefill_render: true
 
 # SAC hyperparameters for stability with BC warm-start
-ent_coef: 0.01  # Low entropy to preserve BC behavior (default='auto' is too high)
+entropy_coef: "auto" # 0.01  # Low entropy to preserve BC behavior (default='auto' is too high)
 # learning_rate: 0.0001  # Lower LR for both actor and critic to avoid destabilization
 # gamma: 0.95  # Slightly lower discount factor to reduce Q-oscillation (default 0.99)
+log_std_init: -10 
+
+# NOTE: log_std_init in policy_kwargs does NOT work! must be explicitly initialized after model creation. 
+# Recommended log_std values for different exploration needs:
+#   -20: Near-deterministic (std ≈ 2e-9) - good for BC-bootstrapped policies
+#   -10: Very low noise (std ≈ 4e-5) - minimal exploration
+#   -5:  Low noise (std ≈ 0.007) - gentle exploration
+#   0:   Standard noise (std = 1.0) - standard SAC exploration
