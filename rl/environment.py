@@ -4,6 +4,7 @@ Custom Gymnasium environment for training the RL agent.
 """
 
 import random
+import importlib
 from typing import Literal
 import numpy as np
 import gymnasium as gym
@@ -27,9 +28,6 @@ from avoid_everything.type_defs import DatasetType
 
 import viz_client
 from utils.visualization import visualize_problem
-
-import pybullet as _pybullet
-
 
 BYPASS_LAZY_ROS_RENDER = True # if True, always publish the full scene on each render call instead of only on the first call per episode. 
 
@@ -493,6 +491,7 @@ class _AvoidEverythingEnv(gym.Env):
         # backend-agnostic flag: static scene (obstacles + target marker) published once per episode
         self._static_scene_published: bool = False
         # PyBullet lazy handles — initialised on first render() call
+        self._pybullet_module = None
         self._pb_client = None
         self._pb_robot_id = None
         self._pb_joint_map: dict = {}
@@ -509,6 +508,18 @@ class _AvoidEverythingEnv(gym.Env):
             viz_client.clear_ghost_robot()
             viz_client.clear_obstacles()
             viz_client.clear_ghost_end_effector()
+
+    def _get_pybullet_module(self):
+        """Lazy-load and cache PyBullet only when the pybullet backend is actually used."""
+        if self._pybullet_module is None:
+            try:
+                self._pybullet_module = importlib.import_module("pybullet")
+            except ImportError as exc:
+                raise ImportError(
+                    "PyBullet rendering was requested, but `pybullet` is not installed. "
+                    "Install it with `pip install pybullet` or switch to render_backend='ros'."
+                ) from exc
+        return self._pybullet_module
 
 
     def render(self):
@@ -568,6 +579,7 @@ class _AvoidEverythingEnv(gym.Env):
 
     def _render_pybullet(self):
         """Render via PyBullet (render_mode='human'→GUI window, 'rgb_array'→ndarray)."""
+        _pybullet = self._get_pybullet_module()
         # Lazy initialisation
         if self._pb_client is None:
             mode = _pybullet.GUI if self.render_mode == "human" else _pybullet.DIRECT
@@ -674,7 +686,9 @@ class _AvoidEverythingEnv(gym.Env):
 
         if self._pb_client is not None:
             try:
-                _pybullet.disconnect(self._pb_client)
+                pybullet_module = self._pybullet_module
+                if pybullet_module is not None:
+                    pybullet_module.disconnect(self._pb_client)
             except Exception:
                 pass
             self._pb_client = None
