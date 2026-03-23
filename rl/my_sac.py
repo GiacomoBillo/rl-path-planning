@@ -2,7 +2,7 @@ import numpy as np
 import torch as th
 from gymnasium import spaces
 from stable_baselines3 import SAC
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
 from tqdm.auto import tqdm
@@ -457,42 +457,53 @@ class MySAC(SACDebug):
     def prefill_replay_buffer(
         self,
         cfg: dict,
+        callback: Optional[Callable[[dict[str, Any], dict[str, Any]], Any]] = None,
     ) -> None:
         """Pre-fill replay buffer with policy rollouts before learn().
         
         Reads configuration parameters and calls internal _prefill_replay_buffer.
-        Follows the same pattern as warmup_critic().
+        Initializes and closes callback progress bar if present.
         
         Args:
             cfg: Configuration dictionary containing:
                 - transitions_before_learn: number of transitions to prefill the buffer with (default: buffer_size)
-                - prefill_deterministic: whether to use deterministic policy/actor (default: True) 
+                - prefill_deterministic: whether to use deterministic policy/actor (default: True)
+                - prefill_render: whether callback rendering during prefill is enabled (default: False)
+            callback: Optional callback invoked on each prefill env step.
+                Receives locals()/globals() like SB3 callbacks.
         """
         prefill_transitions = int(
-            # cfg.get("transitions_before_learn", cfg.get("rollouts_before_learn", 0))
             cfg.get("transitions_before_learn", self.buffer_size)
         )
         prefill_deterministic = bool(cfg.get("prefill_deterministic", True))
+        prefill_render = bool(cfg.get("prefill_render", False))
         
         if prefill_transitions <= 0:
             self.log("✓ No replay buffer prefill requested, skipping.")
             return
+        if prefill_render and callback is None:
+            raise ValueError("cfg['prefill_render']=True requires a prefill callback.")
             
         self.log(
             f"\nPrefilling replay buffer with {prefill_transitions} transitions "
             f"(using deterministic actor = {prefill_deterministic})..."
         )
         
-        transitions_added, episodes_added, prefill_mean_r, prefill_mean_len = self._prefill_replay_buffer(
+        transitions_added, episodes_added, mean_r, mean_len, num_collisions = self._prefill_replay_buffer(
             target_transitions=prefill_transitions,
             force_deterministic=prefill_deterministic,
+            callback=callback,
         )
+        
+        # Close callback progress bar (releases resources: file handles, threads)
+        if callback is not None and hasattr(callback, 'close_progress_bar'):
+            callback.close_progress_bar()
         
         self.log(
             "✓ Replay prefill complete: "
             f"\n\t{transitions_added} transitions added, "
             f"\n\t{episodes_added} episodes,"
-            f"\n\tmean_ep_reward={prefill_mean_r:.2f},\n\tmean_ep_len={prefill_mean_len:.2f}"
+            f"\n\tmean_ep_reward={mean_r:.2f},\n\tmean_ep_len={mean_len:.2f},\n\tcollisions={num_collisions}"
         )
         self.log(f"Current replay buffer status: {self.replay_buffer.size()}/{self.replay_buffer.buffer_size} transitions stored.", level=1)
 
@@ -501,7 +512,8 @@ class MySAC(SACDebug):
         self,
         target_transitions: int,
         force_deterministic: bool = True,
-    ) -> Tuple[int, int, float, float]:
+        callback: Optional[Callable[[dict[str, Any], dict[str, Any]], Any]] = None,
+    ) -> Tuple[int, int, float, float, int]:
         """Internal method to pre-fill replay buffer with policy rollouts.
 
         Uses an SB3 evaluate_policy-style loop over env and stores each
@@ -510,12 +522,14 @@ class MySAC(SACDebug):
         Args:
             target_transitions: Number of transitions to collect
             force_deterministic: Whether to use deterministic policy for collection
+            callback: Optional callback invoked once per env step.
+                Receives locals()/globals() like SB3 callbacks (e.g., on_step).
             
         Returns:
-            Tuple of (transitions_added, episodes_added, mean_reward, mean_length)
+            Tuple of (transitions_added, episodes_added, mean_reward, mean_length, num_collisions)
         """
         if target_transitions <= 0:
-            return 0, 0.0, 0.0
+            return 0, 0, 0.0, 0.0
 
         env = self.get_env()
         if env is None:
@@ -527,18 +541,21 @@ class MySAC(SACDebug):
 
         episode_rewards: list[float] = []
         episode_lengths: list[int] = []
+        num_collisions = 0
         transitions_added = 0
+        progress_delta = 0
+        pbar_total = target_transitions
+        pbar_unit = "tr"
 
         obs = env.reset()
-        pbar = tqdm(total=target_transitions, desc="Prefilling replay buffer", unit="tr")
+        
         while transitions_added < target_transitions:
             actions, _ = self.predict(obs, deterministic=force_deterministic)
             next_obs, rewards, dones, infos = env.step(actions)
-
+            
             # Store one transition per env until the transition target is reached.
+            progress_delta = 0
             for i in range(n_envs):
-                # if i==0:
-                #     env.render()  # render the first env for visualization during prefill TODO: optional or with callback
                 if transitions_added >= target_transitions:
                     break
 
@@ -550,7 +567,8 @@ class MySAC(SACDebug):
 
                 self.replay_buffer.add(obs_i, next_obs_i, action_i, reward_i, done_i, [infos[i]])
                 transitions_added += 1
-                pbar.update(1)
+                progress_delta += 1
+                num_collisions += int(infos[i].get("collision", False))
                 current_rewards[i] += rewards[i]
                 current_lengths[i] += 1
 
@@ -559,12 +577,29 @@ class MySAC(SACDebug):
                     episode_lengths.append(int(current_lengths[i]))
                     current_rewards[i] = 0.0
                     current_lengths[i] = 0
-                    if episode_rewards:
-                        pbar.set_postfix({"mean_r": f"{np.mean(episode_rewards):.2f}"})
+
+            # Invoke callback with only necessary data (avoid OOM from locals() with large arrays)
+            if callback is not None:
+                callback(locals(), {})
+                # callback(
+                #     {
+                #         # "env": env,
+                #         # "observations": obs,
+                #         # "actions": actions,
+                #         # "new_observations": next_obs,
+                #         "rewards": rewards,
+                #         "dones": dones,
+                #         "infos": infos,
+                #         "progress_delta": progress_delta,
+                #         "episode_rewards": episode_rewards,
+                #         "pbar_total": pbar_total,
+                #         "pbar_unit": pbar_unit,
+                #     },
+                #     {},
+                # )
 
             obs = next_obs
-
-        pbar.close()
+            
         mean_reward = float(np.mean(episode_rewards)) if episode_rewards else 0.0
         mean_length = float(np.mean(episode_lengths)) if episode_lengths else 0.0
-        return transitions_added, len(episode_lengths), mean_reward, mean_length
+        return transitions_added, len(episode_lengths), mean_reward, mean_length, num_collisions

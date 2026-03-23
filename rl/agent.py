@@ -62,10 +62,10 @@ def get_args_and_cfg() -> tuple[argparse.Namespace, dict]:
 
 
 class DebugCallback(BaseCallback):
-    """Unified callback for training and evaluation.
+    """Unified callback for training, evaluation, and prefill.
 
     Handles:
-    - Progress bar (for evaluation)
+    - Optional progress bar (created internally if enabled)
     - Step logging (reward, done, info) with formatting
     - Rendering (safely restricted to single-env to avoid clutter)
 
@@ -79,30 +79,47 @@ class DebugCallback(BaseCallback):
 
     def __init__(
         self,
-        n_eval_episodes: int = 0,
-        is_eval: bool = False,
+        description: str = "train",
         log_steps: bool = False,
         render: bool = False,
+        progress_bar: bool = False,
+        total: int = None, # total number of steps or episodes for progress bar (if None, will try to infer from locals)
         verbose: int = 0,
     ) -> None:
         super().__init__(verbose)
-        self.n_eval_episodes = n_eval_episodes
-        self.is_eval = is_eval
+        self.description = description
         self.log_steps = log_steps
         self.render_enabled = render
-
+        self.progress_bar_enabled = progress_bar
         self.pbar = None
         self.last_done_count = 0
+        self.total = total
 
-        if self.is_eval and self.n_eval_episodes > 0:
-            self.pbar = tqdm(total=self.n_eval_episodes, desc="Evaluating", unit="ep")
+    def _ensure_progress_bar(self, locals_: dict) -> None:
+        """Lazily initialize progress bar on first call if enabled and metadata available."""
+        if not self.progress_bar_enabled or self.pbar is not None:
+            return
+        
+        # Extract total and unit from locals
+        pbar_total = self.total or locals_.get("pbar_total", None)
+        pbar_unit = locals_.get("pbar_unit", "step")
+        
+        self.pbar = tqdm(total=pbar_total, desc=self.description.capitalize(), unit=pbar_unit)
+        self.last_done_count = 0
+
+    def close_progress_bar(self) -> None:
+        """Close and cleanup the progress bar."""
+        if self.pbar is not None:
+            self.pbar.close()
+            self.pbar = None
+            self.last_done_count = 0
 
     def _on_rollout_start(self):
         """Called by model.learn() at the beginning of every rollout.
         TODO: missing equivalent for evaluate_policy()
         """
         if self.log_steps:
-            print(f"[{'eval' if self.is_eval else 'train'}-rollout-start] ")
+            print(f"[{self.description}-rollout-start] ")
 
         env = self.training_env
         if self.render_enabled and env is not None:
@@ -113,24 +130,26 @@ class DebugCallback(BaseCallback):
             else:
                 # Fallback for standard, non-vectorized Gymnasium environments
                 env.render()
-        
 
     def _on_step(self) -> bool:
         """Called by model.learn() at every step."""
         return self._process_step(self.locals, self.training_env)
 
     def __call__(self, locals_: dict, globals_: dict) -> None:
-        """Called by evaluate_policy() at every step."""
-        # evaluate_policy passes 'env' in locals_
+        """Called by evaluate_policy() and prefill loop at every step."""
+        # evaluate_policy and prefill pass 'env' in locals_
         env = locals_.get("env")
         self._process_step(locals_, env)
 
     def _process_step(self, locals_: dict, env: Any) -> bool:
+        # Lazy-init progress bar if enabled
+        self._ensure_progress_bar(locals_)
+        
         # 1. Normalize variable names
         # Check keys explicitly to avoid False-y issues with boolean/numpy arrays
-        infos = locals_.get("infos", locals_.get("info", []) )
-        dones = locals_.get("dones", locals_.get("done", []) )
-        rewards = locals_.get("rewards", locals_.get("reward", []) )
+        infos = locals_.get("infos", locals_.get("info", []))
+        dones = locals_.get("dones", locals_.get("done", []))
+        rewards = locals_.get("rewards", locals_.get("reward", []))
 
         # 2. Select first env (index 0) in case of parallel envs
         info = infos[0] if (isinstance(infos, list) and len(infos) > 0) else infos
@@ -139,39 +158,32 @@ class DebugCallback(BaseCallback):
 
         # 3. Log steps
         if self.log_steps:
-            # Approximate numbers for cleaner logs
             reward_str = f"{float(reward_val):.3f}"
             info_str = self._format_info(info)
             collision = info.get("collision", None) if isinstance(info, dict) else None
-            
-            phase = "eval" if self.is_eval else "train"
-            print(f"[{phase}-step] reward={reward_str} terminated={done_val} collision={collision} info={info_str}")
-
+            print(f"[{self.description}-step] reward={reward_str} terminated={done_val} collision={collision} info={info_str}")
 
         # 4. Render
         if self.render_enabled and env is not None:
-            # Check if it's a Stable Baselines3 VecEnv
             if hasattr(env, "env_method"):
-                # Safely call render ONLY on the first environment (index 0)
                 env.env_method("render", indices=0)
             else:
-                # Fallback for standard, non-vectorized Gymnasium environments
                 env.render()
 
-        # 5. Progress Bar (Eval only)
-        if self.is_eval and self.pbar:
-            # evaluate_policy accumulates 'episode_rewards' in locals
+        # 5. Optional progress bar support
+        if self.pbar:
+            progress_delta = int(locals_.get("progress_delta", 0))
+            if progress_delta > 0:
+                self.pbar.update(progress_delta)
+
             episode_rewards = locals_.get("episode_rewards", [])
             n_done = len(episode_rewards)
             if n_done > self.last_done_count:
                 self.pbar.update(n_done - self.last_done_count)
                 self.last_done_count = n_done
-                if n_done > 0:
-                    self.pbar.set_postfix({"mean_r": f"{np.mean(episode_rewards):.2f}"})
 
-            if self.last_done_count >= self.n_eval_episodes:
-                self.pbar.close()
-                self.pbar = None
+            if episode_rewards:
+                self.pbar.set_postfix({"mean_r": f"{np.mean(episode_rewards):.2f}"})
 
         return True
 
@@ -277,9 +289,7 @@ def bootstrap_agent(
         buffer_size=cfg["buffer_size"],
         learning_starts=0,  # Start training immediately with BC policy, not random exploration
         batch_size=1,  # for fast iteration in prototyping and avoid OoD locally
-        learning_rate=cfg.get("learning_rate", 3e-4),
         ent_coef=0,  # 'auto_0.1' # reduce entropy as the policy is pretrained
-        gamma=cfg.get("gamma", 0.99),
         policy_kwargs=policy_kwargs,
         train_freq=(1, "episode"), # train at the end of every episode
     )
@@ -316,6 +326,7 @@ def bootstrap_agent(
             deterministic=True,
             callback=eval_callback,
         )
+        eval_callback.close_progress_bar()
         print(f"BC-warm-started agent: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}")
 
     return model
@@ -340,17 +351,26 @@ if __name__ == "__main__":
     env = DummyVecEnv([lambda: env])
     eval_env = DummyVecEnv([lambda: eval_env])
 
-    # callbacks to debug train and eval
+    # callbacks to debug train, eval, and prefill
     eval_callback = DebugCallback(
-            n_eval_episodes=cfg["n_eval_episodes"],
-            is_eval=True,
-            log_steps=(args.debug >= 3),
-            render=args.render,
-            verbose=args.verbose,
-        )
-    train_callback = DebugCallback(
+        description="eval",
         log_steps=(args.debug >= 3),
         render=args.render,
+        progress_bar=True,
+        total=cfg["n_eval_episodes"],
+        verbose=args.verbose,
+    )
+    train_callback = DebugCallback(
+        description="train",
+        log_steps=(args.debug >= 3),
+        render=args.render,
+        verbose=args.verbose,
+    )
+    prefill_callback = DebugCallback(
+        description="prefill-buffer",
+        log_steps=(args.debug >= 3),
+        render=(args.render and bool(cfg.get("prefill_render", False))),
+        progress_bar=True,
         verbose=args.verbose,
     )
 
@@ -361,7 +381,7 @@ if __name__ == "__main__":
 
 
     # Pre-fill replay buffer with BC policy rollouts
-    model.prefill_replay_buffer(cfg)
+    model.prefill_replay_buffer(cfg, callback=prefill_callback)
     
     
     # Warm-up critic with fixed/frozen actor
@@ -386,6 +406,7 @@ if __name__ == "__main__":
         deterministic=True,
         callback=eval_callback,
     )
+    eval_callback.close_progress_bar()
     print(f"Trained {model.__class__.__name__} agent: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}")
 
     # --- Save ---
