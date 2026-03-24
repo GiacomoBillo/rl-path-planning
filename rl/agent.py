@@ -38,10 +38,9 @@ import yaml
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
-from torch.utils.data import DataLoader, Subset
 
-from avoid_everything.data_loader import DataModule
 from avoid_everything.pretraining import PretrainingMotionPolicyTransformer
+from avoid_everything.type_defs import DatasetType
 from rl.environment import AvoidEverythingEnv
 from rl.feature_extractor import MPiFormerExtractor
 from rl.my_sac import MySAC
@@ -76,45 +75,7 @@ def get_args_and_cfg() -> tuple[argparse.Namespace, dict]:
     return args, cfg
 
 
-def get_dataloaders(cfg: dict, args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
-    """Create train and eval dataloaders from the AvoidEverything dataset."""
 
-    # --- Data ---
-    # DataModule handles all dataset construction (same pattern as run_validation_rollouts.py).
-    # StateDataset is used (not TrajectoryDataset): each sample is a single state
-    # (config, obstacles, target), which is exactly what the RL env's reset() needs.
-    dm = DataModule(
-        urdf_path=cfg["urdf_path"],
-        data_dir=cfg["data_dir"],
-        train_trajectory_key=cfg["train_trajectory_key"],
-        val_trajectory_key=cfg["val_trajectory_key"],
-        num_robot_points=cfg["num_robot_points"],
-        num_obstacle_points=cfg["num_obstacle_points"],
-        num_target_points=cfg["num_target_points"],
-        action_chunk_length=cfg["action_chunk_length"],
-        random_scale=0.0,  # No noise for RL (clean states)
-        train_batch_size=1,  # RL env processes one problem at a time
-        val_batch_size=1,
-        num_workers=cfg["num_workers"],
-    )
-    dm.setup("fit")
-
-    # Construct eval dataloader with shuffle=True so eval_env sees varied problems per episode
-    # (dm.val_dataloader()[VAL_STATE] uses shuffle=False, unsuitable for RL reset()).
-    if args.overfit is None:
-        train_dl = dm.train_dataloader()  # StateDataset, shuffle=True
-        eval_dl = DataLoader(
-            dm.data_val_state, batch_size=1, shuffle=True, num_workers=cfg["num_workers"]
-        )
-        print(f"✓ Datasets: {len(dm.data_train)} train samples, {len(dm.data_val_state)} val samples")
-    else:
-        n = args.overfit
-        overfit_dataset = Subset(dm.data_train, list(range(n)))
-        train_dl = DataLoader(overfit_dataset, batch_size=1, shuffle=True, num_workers=cfg["num_workers"])
-        eval_dl = DataLoader(overfit_dataset, batch_size=1, shuffle=True, num_workers=cfg["num_workers"])
-        print(f"⚠  Overfitting mode: using {n} training scene(s) for both train and eval")
-
-    return train_dl, eval_dl
 
 
 def bootstrap_agent(
@@ -218,17 +179,44 @@ def bootstrap_agent(
 if __name__ == "__main__":
     args, cfg = get_args_and_cfg()
 
-    # --- Data ---
-    train_dl, eval_dl = get_dataloaders(cfg, args)
-
     # --- Environments ---
+    # Create environments first (they create their own Robot instances)
     # Wrap with Monitor explicitly so SB3 doesn't auto-wrap and episode stats are tracked consistently.
     # Order: Monitor (outermost) → TimeLimit (inside AvoidEverythingEnv) → _AvoidEverythingEnv (core).
     render_mode = "human" if args.render else None
     render_backend = "ros"
     print(f"Render mode: {render_mode}")
-    env = Monitor(AvoidEverythingEnv(dataloader=train_dl, render_mode=render_mode, render_backend=render_backend))
-    eval_env = Monitor(AvoidEverythingEnv(dataloader=eval_dl, render_mode=render_mode, render_backend=render_backend))
+    
+    # Create environments without dataloaders initially
+    env = Monitor(AvoidEverythingEnv(dataloader=None, render_mode=render_mode, render_backend=render_backend))
+    eval_env = Monitor(AvoidEverythingEnv(dataloader=None, render_mode=render_mode, render_backend=render_backend))
+    
+    # --- Data ---
+    # Set up TrajectoryDataset for each environment using its internal robot.
+    # TrajectoryDataset ensures episodes start from trajectory initial states (q0),
+    # matching the expert demonstration start distribution.
+    overfit_idx = args.overfit if args.overfit is not None else None
+    if overfit_idx is not None:
+        print(f"⚠  Overfitting mode: using trajectory index {overfit_idx} for both train and eval")
+    # Configure train environment dataset
+    env.unwrapped.set_scene_generation_from_dataset(
+        data_dir=cfg["data_dir"],
+        trajectory_key=cfg["train_trajectory_key"],
+        dataset_type=DatasetType.TRAIN,
+        num_workers=cfg["num_workers"],
+        random_scale=0.0,  # No noise for RL (clean states)
+        overfit_idx=overfit_idx,
+    )
+    # Configure eval environment dataset
+    eval_env.unwrapped.set_scene_generation_from_dataset(
+        data_dir=cfg["data_dir"],
+        trajectory_key=cfg["val_trajectory_key"],
+        dataset_type=DatasetType.VAL,
+        num_workers=cfg["num_workers"],
+        random_scale=0.0,
+        overfit_idx=overfit_idx,
+    )
+    
     # wrap vec
     env = DummyVecEnv([lambda: env])
     eval_env = DummyVecEnv([lambda: eval_env])

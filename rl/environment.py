@@ -23,8 +23,10 @@ from robofin.samplers import NumpyRobotSampler
 from robofin.old.collision import FrankaCollisionSpheres
 from robofin.collision import CollisionSpheres
 from avoid_everything.geometry import TorchCuboids, TorchCylinders
-from avoid_everything.data_loader import StateDataset
+from avoid_everything.data_loader import StateDataset, TrajectoryDataset
 from avoid_everything.type_defs import DatasetType
+from torch.utils.data import Subset
+from pathlib import Path
 
 import viz_client
 from utils.visualization import visualize_problem
@@ -285,6 +287,7 @@ class _AvoidEverythingEnv(gym.Env):
         obs = self._get_obs()
         info = {} # TODO: add info if needed
         self.collision = False
+        self.steps = 0
         return obs, info
 
     def step(self, action):
@@ -310,11 +313,14 @@ class _AvoidEverythingEnv(gym.Env):
         # TODO: penalize if action is out of bounds? reward
         clipped_action = np.abs(clipped_config - upclipped_config)  # How much was the action clipped?
         self.robot_config = clipped_config
+        self.steps += 1
 
         # Check for collision and target reaching
         collision = self._check_collision()
         self.collision = collision
         target_reached, pos_err, orien_err = self._check_target_reached()
+        if target_reached:
+            print(f"Target reached! Position error: {pos_err:.4f} m, Orientation error: {orien_err:.2f} deg, Steps: {self.steps}")
 
         # Get new observation, compute reward, check termination and truncation
         obs = self._get_obs()
@@ -698,6 +704,55 @@ class _AvoidEverythingEnv(gym.Env):
 
         super().close()
 
+    def set_scene_generation_from_dataset(
+        self,
+        data_dir: str,
+        trajectory_key: str,
+        dataset_type: DatasetType,
+        num_workers: int = 0,
+        random_scale: float = 0.0,
+        overfit_idx: int = None,
+    ):
+        """Set up scene generation from a TrajectoryDataset.
+
+        Creates a TrajectoryDataset using the environment's robot instance and sets it
+        as the dataloader. This ensures RL episodes start from trajectory initial states (q0),
+        matching the expert demonstration start distribution.
+
+        Args:
+            data_dir: Path to the dataset directory
+            trajectory_key: Key for the trajectory data (e.g., "global_solutions")
+            dataset_type: Type of dataset (DatasetType.TRAIN, DatasetType.VAL, etc.)
+            num_workers: Number of workers for the DataLoader (default: 0)
+            random_scale: Standard deviation of random noise to add to joints (default: 0.0)
+            overfit_idx: If provided, only use this specific trajectory index (for overfitting mode)
+        """
+        # Create TrajectoryDataset using environment's robot instance
+        dataset = TrajectoryDataset.load_from_directory(
+            robot=self.robot,
+            directory=Path(data_dir),
+            trajectory_key=trajectory_key,
+            num_robot_points=self.num_robot_points,
+            num_obstacle_points=self.num_obstacle_points,
+            num_target_points=self.num_target_points,
+            dataset_type=dataset_type,
+            random_scale=random_scale,
+        )
+
+        # Handle overfit mode: create subset with single trajectory
+        if overfit_idx is not None:
+            dataset = Subset(dataset, [overfit_idx])
+
+        # Create DataLoader with shuffle=True for varied episode resets
+        self.dataloader = DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=num_workers,
+        )
+
+        print(f"✓ Set dataloader with {len(dataset)} trajectory start states (q0)")
+
 
 
 if __name__ == "__main__":
@@ -705,13 +760,13 @@ if __name__ == "__main__":
     # Create robot
     robot = Robot("assets/panda/panda.urdf")
     
-    # Create StateDataset (single timestep per sample, best for RL)
-    # MOTIVATION: StateDataset vs TrajectoryDataset
-    # - StateDataset: Each sample is a single state (config, obstacles, target)
-    #   > Perfect for RL because reset() samples a single scenario, then agent explores via step()
-    # - TrajectoryDataset: Each sample is a full trajectory 
-    #   > Not needed here since the RL env manages its own rollouts
-    dataset = StateDataset.load_from_directory(
+    # Create TrajectoryDataset (trajectory starts per sample, best for RL)
+    # MOTIVATION: TrajectoryDataset vs StateDataset
+    # - TrajectoryDataset: Each sample is a trajectory start state (q0)
+    #   > Perfect for RL: episodes start from the same initial distribution as expert demos
+    # - StateDataset: Each sample is any timestep from trajectories 
+    #   > Used for BC training where we learn from all timesteps, not just starts
+    dataset = TrajectoryDataset.load_from_directory(
         robot=robot,
         directory="datasets/ae_aristotle1_5mm_cubbies",
         dataset_type=DatasetType.TRAIN,
@@ -720,7 +775,6 @@ if __name__ == "__main__":
         num_obstacle_points=4096,
         num_target_points=128,
         random_scale=0.0,  # No random noise for RL (we want clean states)
-        action_chunk_length=1,  # Single step ahead supervision
     )
     print(f"✓ Dataset loaded: {len(dataset)} samples")
     # Create DataLoader with batch_size=1 (environment processes one problem at a time)
