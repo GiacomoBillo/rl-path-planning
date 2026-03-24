@@ -2,13 +2,32 @@
 RL agent implemented with Stable Baselines3 (https://stable-baselines3.readthedocs.io/en/v2.4.1/)
 
 features:
-- SAC algorithm
-- load policy from BC checkpoint from AvoidEverything (warm-start TODO)
+- SAC algorithm with warm-start from BC policy bootstrapping
+- Multi-format logging (stdout, TensorBoard, CSV, WandB)
+- Custom debug callbacks 
+- Replay buffer prefill with BC rollouts
+- Critic warm-up phase before full training
 - HER buffer (TODO)
 - vectorized env for parallel rollouts on different CPU cores (TODO)
 
+Logging:
+    The agent automatically logs training metrics to multiple outputs:
+    - stdout: Console output for real-time monitoring
+    - TensorBoard: Visualizations at ./logs/{run_name}-{timestamp}/
+    - WandB: Cloud tracking
+    
+    Configure logging in the YAML config under the 'logger' section
+    
+    Metrics logged automatically by SB3:
+    - rollout/ep_rew_mean, rollout/ep_len_mean
+    - train/actor_loss, train/critic_loss, train/ent_coef
+    - time/fps, time/total_timesteps
+
 Usage:
     python3 rl/agent.py model_configs/rl_sac_cubbies.yaml
+    
+    # View TensorBoard logs:
+    tensorboard --logdir ./logs/
 """
 
 
@@ -242,13 +261,23 @@ if __name__ == "__main__":
     model: MySAC = bootstrap_agent(env, eval_env, cfg, args, eval_callback)
     model.monitor_agent("AFTER BOOTSTRAP")
 
+    # --- Setup logging ---
+    wandb_callback = model.setup_logger(
+        logger_config=cfg.get("logger", {}),
+        hyperparameters=cfg,
+    )
+    
+    # Combine callbacks: train_callback for debugging, wandb_callback for metrics
+    train_callbacks = [train_callback]
+    if wandb_callback is not None:
+        train_callbacks.append(wandb_callback)
 
     # Pre-fill replay buffer with BC policy rollouts
     model.prefill_replay_buffer(cfg, callback=prefill_callback)
     
     
     # Warm-up critic with fixed/frozen actor
-    model.warmup_critic(cfg["critic_warmup_steps"], train_callback)
+    model.warmup_critic(cfg["critic_warmup_steps"], train_callbacks)
 
 
     # --- Train ---
@@ -256,7 +285,7 @@ if __name__ == "__main__":
     model.learn(
         total_timesteps=cfg["total_timesteps"],
         progress_bar=True,
-        callback=train_callback,
+        callback=train_callbacks,
         reset_num_timesteps=False,  # Keep counting timesteps across multiple learn() calls (e.g. critic warmup + main training)
         log_interval=1,  # Log every episode
     )

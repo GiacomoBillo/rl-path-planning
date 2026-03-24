@@ -2,10 +2,15 @@ import numpy as np
 import torch as th
 from gymnasium import spaces
 from stable_baselines3 import SAC
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple, Dict
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.logger import configure
 from tqdm.auto import tqdm
+from datetime import datetime
+import os
+import wandb
+from wandb.integration.sb3 import WandbCallback
 
 np.set_printoptions(precision=3, suppress=False)
 
@@ -426,6 +431,85 @@ class MySAC(SACDebug):
             std_values = th.exp(log_std_values)
             self.log(f"  log_std.bias = {log_std_values.cpu().numpy()}", level=1)
             self.log(f"  std (exp(log_std)) = {std_values.cpu().numpy()}", level=1)
+
+    def setup_logger(
+        self,
+        logger_config: Dict,
+        hyperparameters: Optional[Dict] = None,
+    ) -> Optional[BaseCallback]:
+        """
+        Configure multi-format logger for training metrics.
+        
+        Sets up Stable Baselines3's logger to write to multiple outputs:
+        - stdout: Console output for real-time monitoring
+        - tensorboard: TensorBoard logs for visualization
+        - wandb: Weights & Biases cloud logging
+        ...
+        
+        Args:
+            logger_config: Dictionary with logging configuration:
+                - log_dir: Base directory for logs
+                - run_name: Name for this run (timestamp will be appended)
+                - formats: List like ["stdout", "tensorboard", "wandb"]
+                - wandb_project: WandB project name (required if "wandb" in formats)
+                - wandb_entity: WandB username/team (optional)
+            hyperparameters: Dictionary of hyperparameters to log to WandB (optional)
+        
+        Returns:
+            WandbCallback if "wandb" in formats, None otherwise.
+            Add this callback to model.learn(callback=...).
+        """
+        log_dir = logger_config.get("log_dir", "./logs")
+        run_name = logger_config.get("run_name")
+        formats = logger_config.get("formats", ["stdout", "tensorboard", "wandb"])
+        
+        # Create timestamped run directory
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if run_name:
+            run_dir_name = f"{run_name}-{timestamp}"
+        else:
+            run_dir_name = timestamp
+        
+        full_log_dir = os.path.join(log_dir, run_dir_name)
+        os.makedirs(full_log_dir, exist_ok=True)
+        
+        # Filter out wandb from SB3 formats (we handle it separately)
+        sb3_formats = [f for f in formats if f != "wandb"]
+        
+        # Configure SB3 logger with standard formats
+        if sb3_formats:
+            new_logger = configure(full_log_dir, sb3_formats)
+            self.set_logger(new_logger)
+            self.log(f"✓ Logger configured: {full_log_dir}", level=0)
+            self.log(f"  Formats: {', '.join(sb3_formats)}", level=1)
+        
+        # Setup WandB if in formats list
+        wandb_callback = None
+        if "wandb" in formats:
+            wandb_project = logger_config.get("wandb_project")
+            if not wandb_project:
+                raise ValueError("wandb_project is required when 'wandb' in formats")
+            
+            # Initialize WandB run (following official API pattern)
+            wandb_run_name = f"{run_name}-{timestamp}" if run_name else timestamp
+            
+            wandb.init(
+                project=wandb_project,
+                # entity=logger_config.get("wandb_entity"),
+                name=wandb_run_name,
+                config=hyperparameters or {},
+                sync_tensorboard=True,  # Auto-upload SB3's tensorboard metrics
+                reinit=True,  # Allow multiple runs in same process
+            )
+            
+            # Create WandbCallback (only takes model_save_path and verbose)
+            wandb_callback = WandbCallback(
+                model_save_path=None,  # Don't auto-save to wandb
+                verbose=self.verbose,
+            )
+            self.log(f"✓ WandB enabled: project={wandb_project}, run={wandb_run_name}", level=0)
+        
+        return wandb_callback
 
     def freeze_learnable_actor(self) -> None:
         """

@@ -32,12 +32,12 @@ bc_checkpoint_parameters:
 freeze_bc_encoder: true  # Freeze BC encoder during initial RL training; call extractor.unfreeze() to fine-tune end-to-end
 seed: 42
 total_timesteps: 1000
-n_eval_episodes: 100
+n_eval_episodes: 10
 save_path: checkpoints/sac_cubbies
 
 # Buffer and learning configuration
-buffer_size: 100
-critic_warmup_steps: 20
+buffer_size: 1000
+critic_warmup_steps: 100
 # batch_size: 4  # Increased from 1 to reduce gradient variance
 transitions_before_learn: 100  # Prefill replay buffer with transitions before learn()
 prefill_deterministic: false  # Use deterministic actions during replay prefill
@@ -55,3 +55,18 @@ log_std_init: -10
 #   -10: Very low noise (std ≈ 4e-5) - minimal exploration
 #   -5:  Low noise (std ≈ 0.007) - gentle exploration
 #   0:   Standard noise (std = 1.0) - standard SAC exploration
+
+# Logging configuration
+# Configures multi-format logging for training metrics.
+# - log_dir: Base directory for all log files
+# - run_name: Base name for this run (timestamp will be auto-appended)
+# - formats: List of output formats. Options: "stdout", "tensorboard", "wandb"
+#   * Remove "wandb" from list to disable cloud logging
+# - wandb_project: WandB project name (required if "wandb" in formats)
+# - wandb_entity: WandB username/team (optional, uses default from `wandb login`)
+logger:
+  log_dir: ./log
+  run_name: sac-cubbies  
+  formats: ["stdout", "tensorboard"] #, "wandb"]
+  wandb_project: rl-avoid-everything  
+  wandb_entity: null  
