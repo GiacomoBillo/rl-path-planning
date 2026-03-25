@@ -436,7 +436,7 @@ class MySAC(SACDebug):
         self,
         logger_config: Dict,
         hyperparameters: Optional[Dict] = None,
-    ) -> Optional[BaseCallback]:
+    ) -> Tuple[str, Optional[BaseCallback]]:
         """
         Configure multi-format logger for training metrics.
         
@@ -456,21 +456,23 @@ class MySAC(SACDebug):
             hyperparameters: Dictionary of hyperparameters to log to WandB (optional)
         
         Returns:
-            WandbCallback if "wandb" in formats, None otherwise.
-            Add this callback to model.learn(callback=...).
+            Tuple of (run_name, wandb_callback):
+            - run_name: name + timestamp
+            - wandb_callback: WandbCallback if "wandb" in formats, None otherwise
+            Add the callback to model.learn(callback=...).
         """
         log_dir = logger_config.get("log_dir", "./logs")
         run_name = logger_config.get("run_name")
-        formats = logger_config.get("formats", ["stdout", "tensorboard", "wandb"])
+        formats = logger_config.get("formats", ["stdout", "log", "tensorboard", "wandb"])
         
         # Create timestamped run directory
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         if run_name:
-            run_dir_name = f"{run_name}-{timestamp}"
+            run_name = f"{run_name}-{timestamp}"
         else:
-            run_dir_name = timestamp
+            run_name = timestamp
         
-        full_log_dir = os.path.join(log_dir, run_dir_name)
+        full_log_dir = os.path.join(log_dir, run_name)
         os.makedirs(full_log_dir, exist_ok=True)
         
         # Filter out wandb from SB3 formats (we handle it separately)
@@ -480,8 +482,7 @@ class MySAC(SACDebug):
         if sb3_formats:
             new_logger = configure(full_log_dir, sb3_formats)
             self.set_logger(new_logger)
-            self.log(f"✓ Logger configured: {full_log_dir}", level=0)
-            self.log(f"  Formats: {', '.join(sb3_formats)}", level=1)
+            self.log(f"  Logging to: {', '.join(sb3_formats)}", level=1)
         
         # Setup WandB if in formats list
         wandb_callback = None
@@ -491,12 +492,10 @@ class MySAC(SACDebug):
                 raise ValueError("wandb_project is required when 'wandb' in formats")
             
             # Initialize WandB run (following official API pattern)
-            wandb_run_name = f"{run_name}-{timestamp}" if run_name else timestamp
-            
             wandb.init(
                 project=wandb_project,
                 # entity=logger_config.get("wandb_entity"),
-                name=wandb_run_name,
+                name=run_name,
                 config=hyperparameters or {},
                 sync_tensorboard=True,  # Auto-upload SB3's tensorboard metrics
                 reinit=True,  # Allow multiple runs in same process
@@ -507,9 +506,9 @@ class MySAC(SACDebug):
                 model_save_path=None,  # Don't auto-save to wandb
                 verbose=self.verbose,
             )
-            self.log(f"✓ WandB enabled: project={wandb_project}, run={wandb_run_name}", level=0)
+            self.log(f"✓ WandB enabled: project={wandb_project}, run={run_name}", level=0)
         
-        return wandb_callback
+        return run_name, wandb_callback
 
     def freeze_learnable_actor(self) -> None:
         """

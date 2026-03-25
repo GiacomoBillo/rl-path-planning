@@ -31,15 +31,15 @@ bc_checkpoint_parameters:
 # SAC / RL
 freeze_bc_encoder: true  # Freeze BC encoder during initial RL training; call extractor.unfreeze() to fine-tune end-to-end
 seed: 42
-total_timesteps: 1000
+total_timesteps: 10000
 n_eval_episodes: 10
 save_path: checkpoints/sac_cubbies
 
 # Buffer and learning configuration
 buffer_size: 1000
-critic_warmup_steps: 100
-# batch_size: 4  # Increased from 1 to reduce gradient variance
-transitions_before_learn: 100  # Prefill replay buffer with transitions before learn()
+critic_warmup_steps: 1000
+batch_size: 4  # Increased from 1 to reduce gradient variance
+transitions_before_learn: 1000  # Prefill replay buffer with transitions before learn()
 prefill_deterministic: false  # Use deterministic actions during replay prefill
 prefill_render: true
 
@@ -47,7 +47,7 @@ prefill_render: true
 entropy_coef: "auto" # 0.01  # Low entropy to preserve BC behavior (default='auto' is too high)
 # learning_rate: 0.0001  # Lower LR for both actor and critic to avoid destabilization
 # gamma: 0.95  # Slightly lower discount factor to reduce Q-oscillation (default 0.99)
-log_std_init: -10 
+log_std_init: -5 
 
 # NOTE: log_std_init in policy_kwargs does NOT work! must be explicitly initialized after model creation. 
 # Recommended log_std values for different exploration needs:
@@ -65,8 +65,8 @@ log_std_init: -10
 # - wandb_project: WandB project name (required if "wandb" in formats)
 # - wandb_entity: WandB username/team (optional, uses default from `wandb login`)
 logger:
-  log_dir: ./log
-  run_name: sac-cubbies  
+  log_dir: ./logs
+  run_name: sac_cubbies  
   formats: ["stdout", "tensorboard"] #, "wandb"]
   wandb_project: rl-avoid-everything  
   wandb_entity: null  

@@ -32,6 +32,7 @@ Usage:
 
 
 import argparse
+import os
 
 import torch
 import yaml
@@ -127,7 +128,7 @@ def bootstrap_agent(
         seed=cfg["seed"],
         buffer_size=cfg["buffer_size"],
         learning_starts=0,  # Start training immediately with BC policy, not random exploration
-        batch_size=1,  # for fast iteration in prototyping and avoid OoD locally
+        batch_size=cfg["batch_size"],  
         ent_coef=cfg["entropy_coef"],  # reduce entropy as the policy is pretrained
         policy_kwargs=policy_kwargs,
         train_freq=(1, "episode"), # train at the end of every episode
@@ -250,7 +251,7 @@ if __name__ == "__main__":
     model.monitor_agent("AFTER BOOTSTRAP")
 
     # --- Setup logging ---
-    wandb_callback = model.setup_logger(
+    run_name, wandb_callback = model.setup_logger(
         logger_config=cfg.get("logger", {}),
         hyperparameters=cfg,
     )
@@ -266,6 +267,10 @@ if __name__ == "__main__":
     
     # Warm-up critic with fixed/frozen actor
     model.warmup_critic(cfg["critic_warmup_steps"], train_callbacks)
+    # save warmuped-up model
+    save_path = os.path.join(cfg["save_path"], run_name + "_warmup")
+    model.save(save_path)
+    print(f"✓ Warmed-up model saved to: {save_path}")
 
 
     # --- Train ---
@@ -292,5 +297,6 @@ if __name__ == "__main__":
     print(f"Trained {model.__class__.__name__} agent: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}")
 
     # --- Save ---
-    model.save(cfg["save_path"])
-    print(f"✓ Model saved to: {cfg['save_path']}")
+    save_path = os.path.join(cfg["save_path"], run_name)
+    model.save(save_path)
+    print(f"✓ Model saved to: {save_path}")

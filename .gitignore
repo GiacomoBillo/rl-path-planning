@@ -7,6 +7,6 @@ checkpoints/*
 .pylint.d/
 *.egg-info
 build
-log
+logs
 install
 blender*
