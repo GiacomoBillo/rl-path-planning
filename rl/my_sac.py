@@ -607,7 +607,8 @@ class MySAC(SACDebug):
             total_timesteps=critic_warmup_steps,
             progress_bar=True,
             callback=callback,
-            log_interval=1
+            log_interval=1,
+            tb_log_name="critic_warmup"  # separate TB logs for warmup phase
             )
 
         # Restore actor set_training_mode and Unfreeze actor components

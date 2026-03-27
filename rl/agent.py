@@ -36,6 +36,7 @@ import os
 import shutil
 import sys
 from datetime import datetime
+import traceback
 
 import torch
 import yaml
@@ -50,6 +51,26 @@ from rl.environment import AvoidEverythingEnv
 from rl.feature_extractor import MPiFormerExtractor
 from rl.my_sac import MySAC
 from rl.callbacks import DebugCallback
+
+
+class Tee:
+    """
+    Write to both a file and the original stream (like Unix tee command).
+    Used to redirect stdout/stderr to a log file while maintaining console output.
+    """
+    def __init__(self, file_handle, original_stream):
+        self.file = file_handle
+        self.stream = original_stream
+    
+    def write(self, message):
+        self.stream.write(message)
+        self.stream.flush()
+        self.file.write(message)
+        self.file.flush()
+    
+    def flush(self):
+        self.stream.flush()
+        self.file.flush()
 
 
 def get_args_and_cfg() -> tuple[argparse.Namespace, dict, str]:
@@ -206,10 +227,7 @@ def bootstrap_agent(
     return model
 
 
-
-if __name__ == "__main__":
-    args, cfg, run_name = get_args_and_cfg()
-
+def main(args: argparse.Namespace, cfg: dict, run_name: str) -> None:
     # --- Environments ---
     # Create environments first (they create their own Robot instances)
     # Wrap with Monitor explicitly so SB3 doesn't auto-wrap and episode stats are tracked consistently.
@@ -306,7 +324,7 @@ if __name__ == "__main__":
     print(f"✓ Warmed-up model saved to: {save_path}")
 
 
-    # --- Train ---
+    # --- Train RL fine-tuning ---
     print("\nTraining SAC agent...")
     model.learn(
         total_timesteps=cfg["total_timesteps"],
@@ -314,6 +332,7 @@ if __name__ == "__main__":
         callback=train_callbacks,
         reset_num_timesteps=False,  # Keep counting timesteps across multiple learn() calls (e.g. critic warmup + main training)
         log_interval=1,  # Log every episode
+        tb_log_name="rl_finetuning",  # TensorBoard subdirectory for this training phase
     )
     model.monitor_agent("AFTER TRAINING")
 
@@ -333,3 +352,40 @@ if __name__ == "__main__":
     save_path = os.path.join(cfg["save_path"], run_name)
     model.save(save_path)
     print(f"✓ Model saved to: {save_path}")
+
+
+if __name__ == "__main__":
+    args, cfg, run_name = get_args_and_cfg()
+    
+    # Setup stdout/stderr logging to file
+    run_dir = os.path.join(cfg["logger"]["log_dir"], run_name)
+    log_file_path = os.path.join(run_dir, "output.log")
+    log_file = open(log_file_path, "w")  # Full buffering (default) for better performance
+   
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+   
+    try:
+        sys.stdout = Tee(log_file, original_stdout)
+        sys.stderr = Tee(log_file, original_stderr)
+        print(f"✓ Output logging to: {log_file_path}")
+  
+        main(args, cfg, run_name)
+
+    except Exception as e:
+        # Log the error details while Tee is still active (captures to file!)
+        print(f"\n{'='*70}")
+        print(f"FATAL ERROR: Training crashed")
+        print(f"Exception: {type(e).__name__}: {e}")
+        print(f"{'='*70}\n")
+        traceback.print_exc()  # Full traceback saved to both console and file
+        raise  # Re-raise to maintain proper error propagation
+  
+    finally:
+        # Restore original streams and close log file
+        # Flush ensures buffered data is written even if we crashed
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.flush()  # Critical: save any buffered data before close
+        log_file.close()
+        print(f"✓ Log file closed: {log_file_path}")
