@@ -436,6 +436,7 @@ class MySAC(SACDebug):
         self,
         logger_config: Dict,
         hyperparameters: Optional[Dict] = None,
+        run_name: Optional[str] = None,
     ) -> Tuple[str, Optional[BaseCallback]]:
         """
         Configure multi-format logger for training metrics.
@@ -449,11 +450,14 @@ class MySAC(SACDebug):
         Args:
             logger_config: Dictionary with logging configuration:
                 - log_dir: Base directory for logs
-                - run_name: Name for this run (timestamp will be appended)
+                - run_name: Name for this run (timestamp will be appended if run_name param not provided)
                 - formats: List like ["stdout", "tensorboard", "wandb"]
                 - wandb_project: WandB project name (required if "wandb" in formats)
                 - wandb_entity: WandB username/team (optional)
             hyperparameters: Dictionary of hyperparameters to log to WandB (optional)
+            run_name: Pre-generated run name with timestamp (optional). If provided, uses this 
+                instead of generating a new timestamp. Useful when the log directory was already 
+                created earlier (e.g., in get_args_and_cfg()).
         
         Returns:
             Tuple of (run_name, wandb_callback):
@@ -462,15 +466,16 @@ class MySAC(SACDebug):
             Add the callback to model.learn(callback=...).
         """
         log_dir = logger_config.get("log_dir", "./logs")
-        run_name = logger_config.get("run_name")
         formats = logger_config.get("formats", ["stdout", "log", "tensorboard", "wandb"])
         
-        # Create timestamped run directory
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        if run_name:
-            run_name = f"{run_name}-{timestamp}"
-        else:
-            run_name = timestamp
+        # Use provided run_name or generate new one with timestamp
+        if run_name is None:
+            base_run_name = logger_config.get("run_name")
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            if base_run_name:
+                run_name = f"{base_run_name}-{timestamp}"
+            else:
+                run_name = timestamp
         
         full_log_dir = os.path.join(log_dir, run_name)
         os.makedirs(full_log_dir, exist_ok=True)
@@ -602,6 +607,7 @@ class MySAC(SACDebug):
             total_timesteps=critic_warmup_steps,
             progress_bar=True,
             callback=callback,
+            log_interval=1
             )
 
         # Restore actor set_training_mode and Unfreeze actor components

@@ -33,12 +33,16 @@ Usage:
 
 import argparse
 import os
+import shutil
+import sys
+from datetime import datetime
 
 import torch
 import yaml
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.utils import get_linear_fn
 
 from avoid_everything.pretraining import PretrainingMotionPolicyTransformer
 from avoid_everything.type_defs import DatasetType
@@ -48,7 +52,7 @@ from rl.my_sac import MySAC
 from rl.callbacks import DebugCallback
 
 
-def get_args_and_cfg() -> tuple[argparse.Namespace, dict]:
+def get_args_and_cfg() -> tuple[argparse.Namespace, dict, str]:
     parser = argparse.ArgumentParser()
     parser.add_argument("cfg_path", help="Path to the RL config YAML file")
     parser.add_argument("--eval_bc", action="store_true", help="Whether to evaluate the pretrained BC policy before training")
@@ -73,9 +77,35 @@ def get_args_and_cfg() -> tuple[argparse.Namespace, dict]:
     with open(args.cfg_path) as f:
         cfg = yaml.safe_load(f)
 
-    return args, cfg
-
-
+    # Create run directory and save command, args, and config for reproducibility
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_name = cfg["logger"]["run_name"] + "_" + timestamp
+    run_dir = os.path.join(cfg["logger"]["log_dir"], run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    # Copy original config file to preserve comments and formatting
+    config_dest = os.path.join(run_dir, "config.yaml")
+    shutil.copy2(args.cfg_path, config_dest)
+    print(f"✓ Config copied to: {config_dest}")
+    
+    # Save command to text file for reproducibility
+    command = " ".join(sys.argv)
+    command_file = os.path.join(run_dir, "command.txt")
+    with open(command_file, "w") as f:
+        f.write(command + "\n")
+    print(f"✓ Command saved to: {command_file}")
+    
+    # Alternative: Save command + args to YAML (currently disabled)
+    # run_info = {
+    #     "command": command,
+    #     "args": vars(args),
+    #     "timestamp": timestamp,
+    # }
+    # run_info_path = os.path.join(run_dir, "run_info.yaml")
+    # with open(run_info_path, "w") as f:
+    #     yaml.dump(run_info, f, default_flow_style=False)
+        
+    return args, cfg, run_name
 
 
 
@@ -128,15 +158,15 @@ def bootstrap_agent(
         seed=cfg["seed"],
         buffer_size=cfg["buffer_size"],
         learning_starts=0,  # Start training immediately with BC policy, not random exploration
-        batch_size=cfg["batch_size"],  
+        batch_size=cfg["batch_size"],
         ent_coef=cfg["entropy_coef"],  # reduce entropy as the policy is pretrained
         policy_kwargs=policy_kwargs,
-        train_freq=(1, "episode"), # train at the end of every episode
-    )
+        train_freq= (1,"step"), #tuple(cfg["train_freq"]) if isinstance(cfg["train_freq"], list) else cfg["train_freq"]
+        learning_rate=get_linear_fn(3e-4, 0, 1)
+        )
     vec_env = model.get_env()
     print(f"Train will run with n_envs={vec_env.num_envs if vec_env is not None else 'unknown'}")
     # TODO: HER (requires adding achieved_goal/desired_goal keys to observation space)
-    # TODO: BC buffer pre-filling (collect BC rollouts before learn() to replace random exploration phase)
 
     # Warm-start actor mean head from BC action_decoder (same Linear(512, 7) shape with net_arch={"pi": []})
     with torch.no_grad():
@@ -178,7 +208,7 @@ def bootstrap_agent(
 
 
 if __name__ == "__main__":
-    args, cfg = get_args_and_cfg()
+    args, cfg, run_name = get_args_and_cfg()
 
     # --- Environments ---
     # Create environments first (they create their own Robot instances)
@@ -189,8 +219,8 @@ if __name__ == "__main__":
     print(f"Render mode: {render_mode}")
     
     # Create environments without dataloaders initially
-    env = Monitor(AvoidEverythingEnv(dataloader=None, render_mode=render_mode, render_backend=render_backend))
-    eval_env = Monitor(AvoidEverythingEnv(dataloader=None, render_mode=render_mode, render_backend=render_backend))
+    env = Monitor(AvoidEverythingEnv(render_mode=render_mode, render_backend=render_backend))
+    eval_env = Monitor(AvoidEverythingEnv(render_mode=render_mode, render_backend=render_backend))
     
     # --- Data ---
     # Set up TrajectoryDataset for each environment using its internal robot.
@@ -251,9 +281,10 @@ if __name__ == "__main__":
     model.monitor_agent("AFTER BOOTSTRAP")
 
     # --- Setup logging ---
-    run_name, wandb_callback = model.setup_logger(
+    returned_run_name, wandb_callback = model.setup_logger(
         logger_config=cfg.get("logger", {}),
         hyperparameters=cfg,
+        run_name=run_name,
     )
     
     # Combine callbacks: train_callback for debugging, wandb_callback for metrics
@@ -262,11 +293,13 @@ if __name__ == "__main__":
         train_callbacks.append(wandb_callback)
 
     # Pre-fill replay buffer with BC policy rollouts
-    model.prefill_replay_buffer(cfg, callback=prefill_callback)
+    model.prefill_replay_buffer(cfg, 
+                                callback=prefill_callback)
     
     
     # Warm-up critic with fixed/frozen actor
-    model.warmup_critic(cfg["critic_warmup_steps"], train_callbacks)
+    model.warmup_critic(cfg["critic_warmup_steps"], 
+                        train_callbacks)
     # save warmuped-up model
     save_path = os.path.join(cfg["save_path"], run_name + "_warmup")
     model.save(save_path)
