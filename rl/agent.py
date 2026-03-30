@@ -79,7 +79,7 @@ class Tee:
         return False
 
 
-def get_args_and_cfg() -> tuple[argparse.Namespace, dict, str]:
+def get_args_and_cfg() -> tuple[argparse.Namespace, dict]:
     parser = argparse.ArgumentParser()
     parser.add_argument("cfg_path", help="Path to the RL config YAML file")
     parser.add_argument("--eval_bc", action="store_true", help="Whether to evaluate the pretrained BC policy before training")
@@ -326,22 +326,15 @@ def main(args: argparse.Namespace, cfg: dict, run: dict) -> None:
                                 callback=prefill_callback)
     
     # --- Calculate phase boundaries for phase-aware LR schedules ---
-    warmup_steps = cfg["critic_warmup_steps"]
-    finetuning_steps = cfg["total_timesteps"]
-    total_steps = warmup_steps + finetuning_steps
     
     # --- Update LRs for critic warmup phase ---
-    if "critic_warmup_lr" not in cfg:
-        raise KeyError("Missing 'critic_warmup_lr' in config. Please specify learning rate for critic warmup phase.")
-    
+    warmup_steps = cfg["critic_warmup_steps"]
     warmup_lr_schedule = build_lr_schedule(
         cfg["critic_warmup_lr"],
         phase_start_step=0,
         phase_total_steps=warmup_steps,
-        total_training_steps=total_steps
     )
     print(f"✓ Critic warmup LR config: {cfg['critic_warmup_lr']}")
-    print(f"  Phase: steps 0-{warmup_steps} of {total_steps} total")
     model.update_learning_rates(critic_schedule=warmup_lr_schedule)
     
     # --- Warm-up critic with fixed/frozen actor ---
@@ -353,38 +346,28 @@ def main(args: argparse.Namespace, cfg: dict, run: dict) -> None:
     print(f"✓ Warmed-up model saved to: {save_path}")
 
     # --- Update LRs for RL finetuning phase ---
-    if "finetuning_actor_lr" not in cfg:
-        raise KeyError("Missing 'finetuning_actor_lr' in config. Please specify learning rate for actor finetuning phase.")
-    if "finetuning_critic_lr" not in cfg:
-        raise KeyError("Missing 'finetuning_critic_lr' in config. Please specify learning rate for critic finetuning phase.")
-    
-    
-    # Build phase-aware finetuning schedules
     current_step = model.num_timesteps
+    finetuning_steps = cfg["total_timesteps"]
     actor_lr_schedule = build_lr_schedule(
         cfg["finetuning_actor_lr"],
         phase_start_step=current_step,
         phase_total_steps=finetuning_steps,
-        total_training_steps=total_steps
     )
     critic_lr_schedule = build_lr_schedule(
         cfg["finetuning_critic_lr"],
         phase_start_step=current_step,
         phase_total_steps=finetuning_steps,
-        total_training_steps=total_steps
     )
     
     print(f"✓ Finetuning actor LR config: {cfg['finetuning_actor_lr']}")
     print(f"✓ Finetuning critic LR config: {cfg['finetuning_critic_lr']}")
-    print(f"  Phase: steps {current_step}-{total_steps}")
-    
     model.update_learning_rates(
         actor_schedule=actor_lr_schedule,
         critic_schedule=critic_lr_schedule
     )
 
     # --- Train RL fine-tuning ---
-    print("\nTraining SAC agent...")
+    print(f"\nRL finetuning for {finetuning_steps} steps")
     model.learn(
         total_timesteps=cfg["total_timesteps"],
         progress_bar=True,

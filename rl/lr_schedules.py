@@ -9,44 +9,23 @@ allowing each training phase (warmup, finetuning) to have independent LR progres
 """
 
 from typing import Union, Callable, Dict, Any
-from stable_baselines3.common.utils import get_linear_fn, get_schedule_fn
+from stable_baselines3.common.utils import get_schedule_fn
 
 
 class PhaseAwareLinearSchedule:
     """
-    Linear learning rate schedule that tracks phase-local progress.
+    Learning rate schedule that progresses linearly within a specific training phase.
     
-    Unlike SB3's get_linear_fn which uses global progress across all training,
-    this schedule computes progress relative to a specific phase (warmup or finetuning).
-    
-    This allows each phase to have independent LR progression from start_lr to end_lr,
-    even when phases are run sequentially in the same training session.
+    Unlike standard linear schedules that use global training progress, this schedule
+    tracks progress relative to a specific phase (e.g., warmup or finetuning). This
+    ensures that when switching phases, the LR starts from start_lr regardless of
+    how many steps have already been completed.
     
     Args:
-        start_lr: Learning rate at the start of this phase
-        end_lr: Learning rate at the end of this phase
-        phase_start_step: Global step count when this phase begins
+        start_lr: Learning rate at the beginning of the phase
+        end_lr: Learning rate at the end of the phase
+        phase_start_step: Global step number when this phase begins
         phase_total_steps: Total number of steps in this phase
-        total_training_steps: Total steps across all phases (needed to convert progress_remaining to step count)
-    
-    Example:
-        >>> # Warmup phase: steps 0-1000 of 6000 total
-        >>> warmup_schedule = PhaseAwareLinearSchedule(
-        ...     start_lr=3e-4, end_lr=1e-5,
-        ...     phase_start_step=0, phase_total_steps=1000, total_training_steps=6000
-        ... )
-        >>> # At warmup start (global step 0): progress_remaining=1.0
-        >>> warmup_schedule(1.0)  # Returns 3e-4 (start_lr)
-        >>> # At warmup end (global step 1000): progress_remaining=0.833
-        >>> warmup_schedule(0.833)  # Returns 1e-5 (end_lr)
-        >>>
-        >>> # Finetuning phase: steps 1000-6000
-        >>> finetune_schedule = PhaseAwareLinearSchedule(
-        ...     start_lr=1e-4, end_lr=1e-5,
-        ...     phase_start_step=1000, phase_total_steps=5000, total_training_steps=6000
-        ... )
-        >>> # At finetuning start (global step 1000): progress_remaining=0.833
-        >>> finetune_schedule(0.833)  # Returns 1e-4 (start_lr) - phase progress is 1.0!
     """
     def __init__(
         self,
@@ -54,157 +33,102 @@ class PhaseAwareLinearSchedule:
         end_lr: float,
         phase_start_step: int,
         phase_total_steps: int,
-        total_training_steps: int
     ):
         self.start_lr = float(start_lr)
         self.end_lr = float(end_lr)
         self.phase_start_step = int(phase_start_step)
         self.phase_total_steps = int(phase_total_steps)
-        self.total_training_steps = int(total_training_steps)
         
         if self.phase_total_steps <= 0:
             raise ValueError(f"phase_total_steps must be positive, got {phase_total_steps}")
-        if self.total_training_steps <= 0:
-            raise ValueError(f"total_training_steps must be positive, got {total_training_steps}")
     
-    def __call__(self, progress_remaining: float) -> float:
+    def __call__(self, current_step: int) -> float:
         """
-        Compute learning rate based on phase-local progress.
+        Compute the learning rate for the current training step.
         
         Args:
-            progress_remaining: Global progress remaining (1.0 at start, 0.0 at end)
-                               Computed by SB3 as: 1 - (current_step / total_training_steps)
+            current_step: Current global training step
         
         Returns:
-            Learning rate interpolated based on phase-local progress
+            Learning rate for the current step within this phase
         """
-        # Convert global progress_remaining to current global step
-        # progress_remaining = 1 - (current_step / total_steps)
-        # => current_step = (1 - progress_remaining) * total_steps
-        current_global_step = (1.0 - progress_remaining) * self.total_training_steps
+        # Calculate step within this phase
+        phase_step = current_step - self.phase_start_step
         
-        # Compute phase-local step (relative to phase start)
-        phase_local_step = current_global_step - self.phase_start_step
+        # Clamp to phase boundaries (handle edge cases at phase transitions)
+        phase_step = max(0, min(phase_step, self.phase_total_steps))
         
-        # Clamp to phase bounds
-        phase_local_step = max(0.0, min(phase_local_step, self.phase_total_steps))
+        # Calculate progress within this phase (0.0 to 1.0)
+        phase_progress = phase_step / self.phase_total_steps
         
-        # Compute phase-local progress (1.0 at phase start, 0.0 at phase end)
-        phase_progress_remaining = 1.0 - (phase_local_step / self.phase_total_steps)
+        # Convert to progress_remaining format (1.0 to 0.0)
+        phase_progress_remaining = 1.0 - phase_progress
         
-        # Linear interpolation from start_lr to end_lr based on phase progress
+        # Linear interpolation from start_lr to end_lr
         lr = self.end_lr + (self.start_lr - self.end_lr) * phase_progress_remaining
         
         return lr
 
 
 def build_lr_schedule(
-    config: Union[Dict[str, Any], float],
+    config: Dict[str, Any],
     phase_start_step: int = 0,
     phase_total_steps: int = None,
-    total_training_steps: int = None,
-) -> Callable[[float], float]:
+) -> Union[float, Callable[[int], float]]:
     """
     Build a learning rate schedule from configuration.
     
-    Can create either global schedules (using SB3's built-in functions) or
-    phase-aware linear schedules that track progress independently per training phase.
+    Supports two types of schedules:
+    - constant: Fixed learning rate throughout training
+    - linear: Linear decay from start_lr to end_lr over the phase
     
     Args:
-        config: Either a float (for constant LR) or a dict with:
-            - type: "constant" or "linear"
-            - start_lr: Starting learning rate (required)
-            - end_lr: Ending learning rate (required for "linear")
-        phase_start_step: Global step when this phase begins (for phase-aware schedules)
-        phase_total_steps: Total steps in this phase (for phase-aware schedules)
-        total_training_steps: Total steps across all phases (for phase-aware schedules)
+        config: Dictionary with schedule configuration
+            For constant schedules:
+                {
+                    'type': 'constant',
+                    'start_lr': 3e-4
+                }
+            For linear schedules:
+                {
+                    'type': 'linear',
+                    'start_lr': 1e-4,
+                    'end_lr': 1e-5
+                }
+        phase_start_step: Global step number when this phase begins (required for linear)
+        phase_total_steps: Total steps in this phase (required for linear)
     
     Returns:
-        A callable schedule function: progress_remaining -> learning_rate
-        
-    Note:
-        - For constant schedules, always uses SB3's get_schedule_fn (phase parameters ignored)
-        - For linear schedules, uses PhaseAwareLinearSchedule if phase parameters provided,
-          otherwise uses SB3's get_linear_fn
+        Either a float (constant LR) or a callable schedule function
     
-    Examples:
-        # Constant learning rate (phase-independent)
-        >>> schedule = build_lr_schedule(3e-4)
-        >>> schedule(0.5)
-        0.0003
-        
-        # Phase-aware linear decay for warmup (steps 0-1000 of 6000 total)
-        >>> schedule = build_lr_schedule(
-        ...     {"type": "linear", "start_lr": 3e-4, "end_lr": 1e-5},
-        ...     phase_start_step=0,
-        ...     phase_total_steps=1000,
-        ...     total_training_steps=6000
-        ... )
-        >>> schedule(1.0)  # At global step 0
-        3e-4
-        
-        # Phase-aware linear decay for finetuning (steps 1000-6000)
-        >>> schedule = build_lr_schedule(
-        ...     {"type": "linear", "start_lr": 1e-4, "end_lr": 1e-5},
-        ...     phase_start_step=1000,
-        ...     phase_total_steps=5000,
-        ...     total_training_steps=6000
-        ... )
-        >>> schedule(0.833)  # At global step 1000, returns 1e-4 (phase start_lr)
-        1e-4
+    Raises:
+        KeyError: If required configuration keys are missing
+        ValueError: If schedule type is invalid or required phase parameters are missing
     """
-    # Determine if we should use phase-aware schedules (only for linear)
-    use_phase_aware = (
-        phase_total_steps is not None and 
-        total_training_steps is not None
-    )
+    schedule_type = config['type']
     
-    # Handle simple float input (constant LR)
-    if isinstance(config, (float, int)):
-        return get_schedule_fn(float(config))
+    if schedule_type == 'constant':
+        # Constant LR - just return the float value
+        return config['start_lr']
     
-    # Validate config dict
-    if not isinstance(config, dict):
-        raise ValueError(f"LR config must be a dict or float, got {type(config)}")
-    
-    schedule_type = config.get("type", "constant")
-    start_lr = config.get("start_lr")
-    
-    if start_lr is None:
-        raise ValueError("LR config must specify 'start_lr'")
-    
-    if schedule_type == "constant":
-        # Constant schedules don't need phase awareness
-        return get_schedule_fn(float(start_lr))
-    
-    elif schedule_type == "linear":
-        end_lr = config.get("end_lr")
-        if end_lr is None:
-            raise ValueError("Linear LR schedule requires 'end_lr'")
+    elif schedule_type == 'linear':
+        # Phase-aware linear decay
+        start_lr = config['start_lr']
+        end_lr = config['end_lr']
         
-        if use_phase_aware:
-            # Use phase-aware linear schedule for per-phase progression
-            return PhaseAwareLinearSchedule(
-                start_lr=float(start_lr),
-                end_lr=float(end_lr),
-                phase_start_step=phase_start_step,
-                phase_total_steps=phase_total_steps,
-                total_training_steps=total_training_steps
-            )
-        else:
-            # Use SB3's global linear schedule
-            end_fraction = config.get("end_fraction", 1.0)
-            return get_linear_fn(
-                start=float(start_lr),
-                end=float(end_lr),
-                end_fraction=float(end_fraction)
-            )
+        # Validate required parameters for linear schedules
+        if phase_total_steps is None:
+            raise ValueError("phase_total_steps is required for linear schedules")
+        
+        return PhaseAwareLinearSchedule(
+            start_lr=start_lr,
+            end_lr=end_lr,
+            phase_start_step=phase_start_step,
+            phase_total_steps=phase_total_steps,
+        )
     
     else:
-        raise ValueError(
-            f"Unknown LR schedule type '{schedule_type}'. "
-            f"Supported types: 'constant', 'linear'"
-        )
+        raise ValueError(f"Unknown schedule type: {schedule_type}")
 
 
 
