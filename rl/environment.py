@@ -344,10 +344,6 @@ class _AvoidEverythingEnv(gym.Env):
                 "episode_num_steps": self.episode_num_steps,
                 "episode_return": self.episode_return,
                 }
-        if target_reached:
-            print(f"Target reached! Position error: {pos_err:.4f} m, Orientation error: {orien_err:.2f} deg, Num collisions: {self.episode__num_collisions}, Return: {self.episode_return:.2f}, Num steps: {self.episode_num_steps}")
-        if self.episode_num_steps >= self.max_episode_steps:
-            print(f"Episode truncated after reaching max steps. Position error: {pos_err:.4f} m, Orientation error: {orien_err:.2f} deg, Num collisions: {self.episode__num_collisions}, Return: {self.episode_return:.2f}, Num steps: {self.episode_num_steps}")
 
         return obs, reward, terminated, truncated, info
 

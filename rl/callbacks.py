@@ -100,14 +100,26 @@ class DebugCallback(BaseCallback):
         done_val = dones[0] if (isinstance(dones, (list, np.ndarray)) and len(dones) > 0) else dones
         reward_val = rewards[0] if (isinstance(rewards, (list, np.ndarray)) and len(rewards) > 0) else rewards
 
-        # 3. Log steps
+        # 3. Log steps (only first env to avoid clutter)
         if self.log_steps:
             reward_str = f"{float(reward_val):.3f}"
             info_str = self._format_info(info)
             collision = info.get("collision", None) if isinstance(info, dict) else None
             print(f"[{self.description}-step] reward={reward_str} terminated={done_val} collision={collision} info={info_str}")
 
-        # 4. Render
+        # 4. Log episode summary when any episode ends
+        # Handle both single and vectorized environments
+        if isinstance(infos, list) and isinstance(dones, (list, np.ndarray)):
+            # Vectorized environment: check each env
+            for i, (done_val, info) in enumerate(zip(dones, infos)):
+                if done_val and isinstance(info, dict):
+                    self._log_episode_summary(info, i)
+        else:
+            # Single environment
+            if done_val and isinstance(info, dict):
+                self._log_episode_summary(info)
+
+        # 5. Render
         if self.render_enabled and env is not None:
             if hasattr(env, "env_method"):
                 env.env_method("render", indices=0)
@@ -140,3 +152,39 @@ class DebugCallback(BaseCallback):
         elif isinstance(info, list):
             return [self._format_info(x) for x in info]
         return info
+
+    def _log_episode_summary(self, info: dict, env_idx: int = None) -> None:
+        """Log episode summary when an episode completes.
+        
+        Args:
+            info: Info dict from environment containing episode statistics
+            env_idx: Optional environment index for multi-env setups
+        """
+        # Extract episode statistics from info dict
+        episode_return = info.get("episode_return", 0.0)
+        episode_steps = info.get("episode_num_steps", 0)
+        episode_collisions = info.get("episode_num_collisions", 0)
+        position_error = info.get("position_error", 0.0)
+        orientation_error = info.get("orientation_error", 0.0)
+        target_reached = info.get("target_reached", False)
+        truncated = info.get("TimeLimit.truncated", False)
+        
+        # Determine termination reason
+        if target_reached:
+            termination_msg = "Target reached!"
+        elif truncated:
+            termination_msg = "Episode truncated (max steps)"
+        else:
+            termination_msg = "Episode ended"
+        
+        # Format prefix with optional environment index
+        prefix = f"[{self.description}-episode"
+        if env_idx is not None:
+            prefix += f"-env{env_idx}"
+        prefix += "]"
+        
+        # Print episode summary
+        print(f"{prefix} {termination_msg} "
+              f"return={episode_return:.2f} steps={episode_steps} "
+              f"collisions={episode_collisions} "
+              f"pos_err={position_error:.4f}m orient_err={orientation_error:.2f}deg")
