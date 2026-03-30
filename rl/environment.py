@@ -63,6 +63,7 @@ class AvoidEverythingEnv(TimeLimit):
         render_fps: float | None = None,
         max_episode_steps: int = 100,
         highlight_collisions: bool = True,
+        normalize_rewards: bool = True,
     ):
         """Initialize environment with an automatic TimeLimit wrapper.
 
@@ -81,6 +82,7 @@ class AvoidEverythingEnv(TimeLimit):
             render_fps: target frame rate for rendering (None = as fast as possible)
             max_episode_steps: maximum number of steps per episode before truncation (default 50)
             highlight_collisions: whether to highlight the robot in red when in collision (only applies to render_backend='ros')
+            normalize_rewards: whether to scale rewards to be in [-1, 1] (default True)
         """
         # instantiate the base env
         env = _AvoidEverythingEnv(
@@ -161,6 +163,7 @@ class _AvoidEverythingEnv(gym.Env):
         render_backend: Literal["ros", "pybullet"] | None = None,
         render_fps: float | None = None,
         highlight_collisions: bool = True,
+        normalize_rewards: bool = True,
     ):
         """Initialize environment.
         Args:
@@ -178,6 +181,7 @@ class _AvoidEverythingEnv(gym.Env):
                 "ros" for render_mode="human", "pybullet" for render_mode="rgb_array".
                 render_backend="ros" is incompatible with render_mode="rgb_array".
             highlight_collisions: whether to highlight the robot in red when in collision (only applies to render_backend='ros')
+            normalize_rewards: whether to scale rewards to be in [-1, 1] (default True)
         """
         super().__init__()
 
@@ -247,6 +251,7 @@ class _AvoidEverythingEnv(gym.Env):
 
         # Action space: normalized joint deltas [-1, 1] for main DOF
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.robot.MAIN_DOF,), dtype=np.float32,)
+        self.normalize_rewards = normalize_rewards
 
         # Render setup
         self._render_setup(render_mode, render_backend, render_fps)
@@ -287,7 +292,9 @@ class _AvoidEverythingEnv(gym.Env):
         obs = self._get_obs()
         info = {} # TODO: add info if needed
         self.collision = False
-        self.steps = 0
+        self.episode_num_steps = 0
+        self.episode__num_collisions = 0
+        self.episode_return = 0  # cumulative reward
         return obs, info
 
     def step(self, action):
@@ -313,22 +320,34 @@ class _AvoidEverythingEnv(gym.Env):
         # TODO: penalize if action is out of bounds? reward
         clipped_action = np.abs(clipped_config - upclipped_config)  # How much was the action clipped?
         self.robot_config = clipped_config
-        self.steps += 1
+        self.episode_num_steps += 1
 
         # Check for collision and target reaching
         collision = self._check_collision()
         self.collision = collision
+        self.episode__num_collisions += int(collision)
         target_reached, pos_err, orien_err = self._check_target_reached()
-        if target_reached:
-            print(f"Target reached! Position error: {pos_err:.4f} m, Orientation error: {orien_err:.2f} deg, Steps: {self.steps}")
-
+        
         # Get new observation, compute reward, check termination and truncation
         obs = self._get_obs()
         reward = self._compute_reward(collision, target_reached)
+        self.episode_return += reward
         # terminated = collision or target_reached # episode ends if we collide or reach target
         terminated = target_reached # episodes ends only if we reach the target, not on collision (agent can learn to recover from collisions)
         truncated = False # truncation applyed via TimeLimit wrapper, not handled here
-        info = {"collision": collision, "target_reached": target_reached, "position_error": pos_err, "orientation_error": orien_err, "action_clipped": np.any(clipped_action > 0)}
+        info = {"collision": collision,
+                "target_reached": target_reached, 
+                "position_error": pos_err, 
+                "orientation_error": orien_err, 
+                "action_clipped": np.any(clipped_action > 0),
+                "episode_num_collisions": self.episode__num_collisions,
+                "episode_num_steps": self.episode_num_steps,
+                "episode_return": self.episode_return,
+                }
+        if target_reached:
+            print(f"Target reached! Position error: {pos_err:.4f} m, Orientation error: {orien_err:.2f} deg, Num collisions: {self.episode__num_collisions}, Return: {self.episode_return:.2f}, Num steps: {self.episode_num_steps}")
+        if self.episode_num_steps >= self.max_episode_steps:
+            print(f"Episode truncated after reaching max steps. Position error: {pos_err:.4f} m, Orientation error: {orien_err:.2f} deg, Num collisions: {self.episode__num_collisions}, Return: {self.episode_return:.2f}, Num steps: {self.episode_num_steps}")
 
         return obs, reward, terminated, truncated, info
 
@@ -471,6 +490,8 @@ class _AvoidEverythingEnv(gym.Env):
         """Compute reward"""
         # simple sparse reward for now, TODO: design better reward function
         reward = -100 if collision else 100 if target_reached else -0.1  
+        if self.normalize_rewards:
+            return reward/100  # scale reward to be in [-1, 1]
         return reward
 
     def _render_setup(
