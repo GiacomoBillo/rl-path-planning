@@ -8,7 +8,6 @@ numpy==1.24.4
 ipython==8.37.0
 lightning==2.2.4
 h5py==3.14.0
-wandb==0.20.1
 pybullet==3.2.7
 GitPython==3.1.44
 ikfast-pybind==0.1.2
@@ -45,3 +44,5 @@ ipywidgets==8.1.8
 # Reinforcement learning
 gymnasium==1.0.0
 stable_baselines3[extra]==2.4.1
+wandb==0.22.3
+python-dotenv==1.2.2

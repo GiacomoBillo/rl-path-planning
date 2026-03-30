@@ -11,6 +11,10 @@ from datetime import datetime
 import os
 import wandb
 from wandb.integration.sb3 import WandbCallback
+from dotenv import load_dotenv
+
+# Load .env file if it exists
+load_dotenv()
 
 np.set_printoptions(precision=3, suppress=False)
 
@@ -496,14 +500,19 @@ class MySAC(SACDebug):
             if not wandb_project:
                 raise ValueError("wandb_project is required when 'wandb' in formats")
             
+            # Login to WandB using API key from .env if available
+            wandb_api_key = os.getenv("WANDB_API_KEY")
+            if wandb_api_key:
+                wandb.login(key=wandb_api_key)
+            
             # Initialize WandB run (following official API pattern)
             wandb.init(
                 project=wandb_project,
-                # entity=logger_config.get("wandb_entity"),
                 name=run_name,
+                dir=full_log_dir,  # Tell WandB where logs are
                 config=hyperparameters or {},
-                sync_tensorboard=True,  # Auto-upload SB3's tensorboard metrics
-                reinit=True,  # Allow multiple runs in same process
+                sync_tensorboard=True,  # Auto-upload SB3's tensorboard metrics from this dir
+                reinit="finish_previous",  # Allow multiple runs in same process
             )
             
             # Create WandbCallback (only takes model_save_path and verbose)
@@ -755,25 +764,8 @@ class MySAC(SACDebug):
                     current_rewards[i] = 0.0
                     current_lengths[i] = 0
 
-            # Invoke callback with only necessary data (avoid OOM from locals() with large arrays)
             if callback is not None:
                 callback(locals(), {})
-                # callback(
-                #     {
-                #         # "env": env,
-                #         # "observations": obs,
-                #         # "actions": actions,
-                #         # "new_observations": next_obs,
-                #         "rewards": rewards,
-                #         "dones": dones,
-                #         "infos": infos,
-                #         "progress_delta": progress_delta,
-                #         "episode_rewards": episode_rewards,
-                #         "pbar_total": pbar_total,
-                #         "pbar_unit": pbar_unit,
-                #     },
-                #     {},
-                # )
 
             obs = next_obs
             

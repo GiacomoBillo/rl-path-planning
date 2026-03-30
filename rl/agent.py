@@ -40,10 +40,12 @@ import traceback
 
 import torch
 import yaml
+from dotenv import load_dotenv
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.utils import get_linear_fn
+import wandb
 
 from avoid_everything.pretraining import PretrainingMotionPolicyTransformer
 from avoid_everything.type_defs import DatasetType
@@ -72,6 +74,9 @@ class Tee:
         self.stream.flush()
         self.file.flush()
 
+    def isatty(self):
+        return False
+
 
 def get_args_and_cfg() -> tuple[argparse.Namespace, dict, str]:
     parser = argparse.ArgumentParser()
@@ -97,13 +102,18 @@ def get_args_and_cfg() -> tuple[argparse.Namespace, dict, str]:
 
     with open(args.cfg_path) as f:
         cfg = yaml.safe_load(f)
+   
+    return args, cfg
 
+
+def setup_run_directory(args: argparse.Namespace, cfg: dict) -> dict:
     # Create run directory and save command, args, and config for reproducibility
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_name = cfg["logger"]["run_name"] + "_" + timestamp
-    run_dir = os.path.join(cfg["logger"]["log_dir"], run_name)
+    run_name = cfg["logger"].get("run_name", "run")  # default to "run" if not specified
+    run_id = run_name + "_" + timestamp
+    run_dir = os.path.join(cfg["logger"]["log_dir"], run_id)
     os.makedirs(run_dir, exist_ok=True)
-    
+
     # Copy original config file to preserve comments and formatting
     config_dest = os.path.join(run_dir, "config.yaml")
     shutil.copy2(args.cfg_path, config_dest)
@@ -125,8 +135,13 @@ def get_args_and_cfg() -> tuple[argparse.Namespace, dict, str]:
     # run_info_path = os.path.join(run_dir, "run_info.yaml")
     # with open(run_info_path, "w") as f:
     #     yaml.dump(run_info, f, default_flow_style=False)
-        
-    return args, cfg, run_name
+    run_info = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "run_name": run_name,
+        "run_dir": run_dir,
+    }
+    return run_info
 
 
 
@@ -136,6 +151,7 @@ def bootstrap_agent(
         cfg: dict,
         args: argparse.Namespace,
         eval_callback: DebugCallback,
+        run: dict,
 ) -> MySAC:
     # --- Load BC checkpoint (must happen before SAC model creation for warm-start) ---
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -173,6 +189,7 @@ def bootstrap_agent(
     model = MySAC( # use deterministic actions for debug
         "MultiInputPolicy",
         env,
+        tensorboard_log=run["run_dir"],  # Enable TensorBoard logging
         force_deterministic=True,
         debug_verbose=args.debug,
         verbose=args.verbose,
@@ -183,8 +200,8 @@ def bootstrap_agent(
         ent_coef=cfg["entropy_coef"],  # reduce entropy as the policy is pretrained
         policy_kwargs=policy_kwargs,
         train_freq= (1,"step"), #tuple(cfg["train_freq"]) if isinstance(cfg["train_freq"], list) else cfg["train_freq"]
-        learning_rate=get_linear_fn(3e-4, 0, 1)
-        )
+        learning_rate=get_linear_fn(3e-4, 0, 1),
+    )
     vec_env = model.get_env()
     print(f"Train will run with n_envs={vec_env.num_envs if vec_env is not None else 'unknown'}")
     # TODO: HER (requires adding achieved_goal/desired_goal keys to observation space)
@@ -227,7 +244,7 @@ def bootstrap_agent(
     return model
 
 
-def main(args: argparse.Namespace, cfg: dict, run_name: str) -> None:
+def main(args: argparse.Namespace, cfg: dict, run: dict) -> None:
     # --- Environments ---
     # Create environments first (they create their own Robot instances)
     # Wrap with Monitor explicitly so SB3 doesn't auto-wrap and episode stats are tracked consistently.
@@ -295,31 +312,25 @@ def main(args: argparse.Namespace, cfg: dict, run_name: str) -> None:
 
 
     # --- Bootstrap RL agent from BC pretrained policy ---
-    model: MySAC = bootstrap_agent(env, eval_env, cfg, args, eval_callback)
+    model: MySAC = bootstrap_agent(env, eval_env, cfg, args, eval_callback, run)
     model.monitor_agent("AFTER BOOTSTRAP")
 
-    # --- Setup logging ---
-    returned_run_name, wandb_callback = model.setup_logger(
-        logger_config=cfg.get("logger", {}),
-        hyperparameters=cfg,
-        run_name=run_name,
-    )
     
     # Combine callbacks: train_callback for debugging, wandb_callback for metrics
     train_callbacks = [train_callback]
-    if wandb_callback is not None:
-        train_callbacks.append(wandb_callback)
+    # if wandb_callback is not None:
+    #     train_callbacks.append(wandb_callback)
 
     # Pre-fill replay buffer with BC policy rollouts
-    model.prefill_replay_buffer(cfg, 
+    model.prefill_replay_buffer(cfg,
                                 callback=prefill_callback)
     
     
     # Warm-up critic with fixed/frozen actor
-    model.warmup_critic(cfg["critic_warmup_steps"], 
+    model.warmup_critic(cfg["critic_warmup_steps"],
                         train_callbacks)
     # save warmuped-up model
-    save_path = os.path.join(cfg["save_path"], run_name + "_warmup")
+    save_path = os.path.join(cfg["save_path"], run["run_name"] + "_warmup_" + run["timestamp"])
     model.save(save_path)
     print(f"✓ Warmed-up model saved to: {save_path}")
 
@@ -349,28 +360,55 @@ def main(args: argparse.Namespace, cfg: dict, run_name: str) -> None:
     print(f"Trained {model.__class__.__name__} agent: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}")
 
     # --- Save ---
-    save_path = os.path.join(cfg["save_path"], run_name)
+    save_path = os.path.join(cfg["save_path"], run["run_id"])
     model.save(save_path)
     print(f"✓ Model saved to: {save_path}")
 
 
 if __name__ == "__main__":
-    args, cfg, run_name = get_args_and_cfg()
+    args, cfg = get_args_and_cfg()
+    run = setup_run_directory(args, cfg)
     
-    # Setup stdout/stderr logging to file
-    run_dir = os.path.join(cfg["logger"]["log_dir"], run_name)
-    log_file_path = os.path.join(run_dir, "output.log")
-    log_file = open(log_file_path, "w")  # Full buffering (default) for better performance
-   
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-   
+    # Initialize WandB if enabled in config
+    logger_config = cfg.get("logger", {})
+    formats = logger_config.get("formats", [])
+    
+    if "wandb" in formats:
+        # Load .env for API key and entity
+        load_dotenv()
+        
+        # Login with API key if available
+        wandb_api_key = os.getenv("WANDB_API_KEY")
+        if wandb_api_key:
+            wandb.login(key=wandb_api_key)
+        
+        # Get project and entity from config or .env
+        wandb_project = logger_config.get("wandb_project")
+        if not wandb_project:
+            print("WARNING: wandb_project not found in config, skipping WandB initialization")
+        else:
+            wandb_entity = logger_config.get("wandb_entity") or os.getenv("WANDB_ENTITY")
+            
+            wandb.tensorboard.patch(root_logdir=run["run_dir"]) # for several events subdirectories
+            # Initialize WandB run
+            wandb_run = wandb.init(
+                project=wandb_project,
+                entity=wandb_entity,
+                id=run["run_id"],
+                # dir=run["run_dir"],  # log WandB in logs directory
+                name=run["run_id"], # Use run_id as the WandB run name
+                config=cfg,
+                sync_tensorboard=True,
+                reinit="finish_previous",
+            )
+            print(f"✓ WandB initialized: project={wandb_project}, entity={wandb_entity}, run_id={wandb_run.id}")
+    
     try:
-        sys.stdout = Tee(log_file, original_stdout)
-        sys.stderr = Tee(log_file, original_stderr)
-        print(f"✓ Output logging to: {log_file_path}")
+        # sys.stdout = Tee(log_file, original_stdout)
+        # sys.stderr = Tee(log_file, original_stderr)
+        # print(f"✓ Output logging to: {log_file_path}")
   
-        main(args, cfg, run_name)
+        main(args, cfg, run)
 
     except Exception as e:
         # Log the error details while Tee is still active (captures to file!)
@@ -382,10 +420,6 @@ if __name__ == "__main__":
         raise  # Re-raise to maintain proper error propagation
   
     finally:
-        # Restore original streams and close log file
-        # Flush ensures buffered data is written even if we crashed
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        log_file.flush()  # Critical: save any buffered data before close
-        log_file.close()
-        print(f"✓ Log file closed: {log_file_path}")
+        # Finish WandB run if it was initialized
+        if wandb_run is not None:
+            wandb.finish()
