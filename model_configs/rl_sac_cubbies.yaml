@@ -46,8 +46,6 @@ prefill_render: true
 
 # SAC hyperparameters for stability with BC warm-start
 entropy_coef: "0.001" # 0.01  # Low entropy to preserve BC behavior (default='auto' is too high)
-# learning_rate: 0.0001  # Lower LR for both actor and critic to avoid destabilization
-# gamma: 0.95  # Slightly lower discount factor to reduce Q-oscillation (default 0.99)
 log_std_init: -10 
 
 # NOTE: log_std_init in policy_kwargs does NOT work! must be explicitly initialized after model creation. 
@@ -57,7 +55,29 @@ log_std_init: -10
 #   -5:  Low noise (std ≈ 0.007) - gentle exploration
 #   0:   Standard noise (std = 1.0) - standard SAC exploration
 
-# Logging configuration
+# --- Learning rate schedules for different training phases ---
+# Supports two schedule types:
+#   - constant: Fixed learning rate throughout the phase
+#   - linear: Linear decay from start_lr to end_lr
+# 
+# Critic warmup phase (actor frozen, critic trains on BC rollouts):
+critic_warmup_lr:
+  type: "linear"       # "constant" or "linear"
+  start_lr: 3.0e-4       # Learning rate during warmup
+  end_lr: 0       # Only used if type is "linear"
+
+# RL finetuning phase (both actor and critic train):
+finetuning_actor_lr:
+  type: "linear"         # "constant" or "linear"
+  start_lr: 1.0e-5       # Initial learning rate
+  end_lr: 0         # Final learning rate (for linear decay)
+
+finetuning_critic_lr:
+  type: "constant"       # "constant" or "linear"
+  start_lr: 3.0e-5       # Learning rate during finetuning
+  # end_lr: 1.0e-5       # Only used if type is "linear"
+
+# --- Logging configuration ---
 # Configures multi-format logging for training metrics.
 # - log_dir: Base directory for all log files
 # - run_name: Base name for this run (timestamp will be auto-appended)

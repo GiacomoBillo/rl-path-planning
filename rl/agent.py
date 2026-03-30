@@ -7,6 +7,7 @@ features:
 - Custom debug callbacks 
 - Replay buffer prefill with BC rollouts
 - Critic warm-up phase before full training
+- Configurable learning rate schedules for warmup and finetuning phases
 - HER buffer (TODO)
 - vectorized env for parallel rollouts on different CPU cores (TODO)
 
@@ -44,7 +45,6 @@ from dotenv import load_dotenv
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.utils import get_linear_fn
 import wandb
 
 from avoid_everything.pretraining import PretrainingMotionPolicyTransformer
@@ -53,6 +53,7 @@ from rl.environment import AvoidEverythingEnv
 from rl.feature_extractor import MPiFormerExtractor
 from rl.my_sac import MySAC
 from rl.callbacks import DebugCallback
+from rl.lr_schedules import build_lr_schedule
 
 
 class Tee:
@@ -200,7 +201,6 @@ def bootstrap_agent(
         ent_coef=cfg["entropy_coef"],  # reduce entropy as the policy is pretrained
         policy_kwargs=policy_kwargs,
         train_freq= (1,"step"), #tuple(cfg["train_freq"]) if isinstance(cfg["train_freq"], list) else cfg["train_freq"]
-        learning_rate=get_linear_fn(3e-4, 0, 1),
     )
     vec_env = model.get_env()
     print(f"Train will run with n_envs={vec_env.num_envs if vec_env is not None else 'unknown'}")
@@ -325,8 +325,26 @@ def main(args: argparse.Namespace, cfg: dict, run: dict) -> None:
     model.prefill_replay_buffer(cfg,
                                 callback=prefill_callback)
     
+    # --- Calculate phase boundaries for phase-aware LR schedules ---
+    warmup_steps = cfg["critic_warmup_steps"]
+    finetuning_steps = cfg["total_timesteps"]
+    total_steps = warmup_steps + finetuning_steps
     
-    # Warm-up critic with fixed/frozen actor
+    # --- Update LRs for critic warmup phase ---
+    if "critic_warmup_lr" not in cfg:
+        raise KeyError("Missing 'critic_warmup_lr' in config. Please specify learning rate for critic warmup phase.")
+    
+    warmup_lr_schedule = build_lr_schedule(
+        cfg["critic_warmup_lr"],
+        phase_start_step=0,
+        phase_total_steps=warmup_steps,
+        total_training_steps=total_steps
+    )
+    print(f"✓ Critic warmup LR config: {cfg['critic_warmup_lr']}")
+    print(f"  Phase: steps 0-{warmup_steps} of {total_steps} total")
+    model.update_learning_rates(critic_schedule=warmup_lr_schedule)
+    
+    # --- Warm-up critic with fixed/frozen actor ---
     model.warmup_critic(cfg["critic_warmup_steps"],
                         train_callbacks)
     # save warmuped-up model
@@ -334,6 +352,36 @@ def main(args: argparse.Namespace, cfg: dict, run: dict) -> None:
     model.save(save_path)
     print(f"✓ Warmed-up model saved to: {save_path}")
 
+    # --- Update LRs for RL finetuning phase ---
+    if "finetuning_actor_lr" not in cfg:
+        raise KeyError("Missing 'finetuning_actor_lr' in config. Please specify learning rate for actor finetuning phase.")
+    if "finetuning_critic_lr" not in cfg:
+        raise KeyError("Missing 'finetuning_critic_lr' in config. Please specify learning rate for critic finetuning phase.")
+    
+    
+    # Build phase-aware finetuning schedules
+    current_step = model.num_timesteps
+    actor_lr_schedule = build_lr_schedule(
+        cfg["finetuning_actor_lr"],
+        phase_start_step=current_step,
+        phase_total_steps=finetuning_steps,
+        total_training_steps=total_steps
+    )
+    critic_lr_schedule = build_lr_schedule(
+        cfg["finetuning_critic_lr"],
+        phase_start_step=current_step,
+        phase_total_steps=finetuning_steps,
+        total_training_steps=total_steps
+    )
+    
+    print(f"✓ Finetuning actor LR config: {cfg['finetuning_actor_lr']}")
+    print(f"✓ Finetuning critic LR config: {cfg['finetuning_critic_lr']}")
+    print(f"  Phase: steps {current_step}-{total_steps}")
+    
+    model.update_learning_rates(
+        actor_schedule=actor_lr_schedule,
+        critic_schedule=critic_lr_schedule
+    )
 
     # --- Train RL fine-tuning ---
     print("\nTraining SAC agent...")

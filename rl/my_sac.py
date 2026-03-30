@@ -2,10 +2,11 @@ import numpy as np
 import torch as th
 from gymnasium import spaces
 from stable_baselines3 import SAC
-from typing import Any, Callable, Optional, Tuple, Dict
+from typing import Any, Callable, Optional, Tuple, Dict, Union
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import configure
+from stable_baselines3.common.utils import get_schedule_fn, update_learning_rate
 from tqdm.auto import tqdm
 from datetime import datetime
 import os
@@ -589,19 +590,69 @@ class MySAC(SACDebug):
             param.requires_grad = True
 
 
+    def update_learning_rates(
+        self,
+        actor_schedule: Optional[Union[float, Callable[[float], float]]] = None,
+        critic_schedule: Optional[Union[float, Callable[[float], float]]] = None,
+    ) -> None:
+        """
+        Update the learning rate schedules for actor and critic optimizers.
+        
+        This allows changing the learning rate schedule between different training phases
+        (e.g., different LR for warmup vs finetuning).
+        
+        Args:
+            actor_schedule: New learning rate schedule for actor (None = keep current)
+            critic_schedule: New learning rate schedule for critic (None = keep current)
+        
+        Note:
+            - Schedules can be floats (constant LR) or callables (dynamic LR)
+            - The schedule callable receives progress_remaining (1.0 -> 0.0) and returns LR
+            - Use build_lr_schedule() from rl.lr_schedules to create schedules from config
+        """
+        if actor_schedule is not None:
+            actor_schedule_fn = get_schedule_fn(actor_schedule)
+            current_lr = actor_schedule_fn(self._current_progress_remaining)
+            update_learning_rate(self.actor.optimizer, current_lr)
+            self.log(f"✓ Updated actor learning rate schedule (current LR: {current_lr:.2e})", level=0)
+        
+        if critic_schedule is not None:
+            critic_schedule_fn = get_schedule_fn(critic_schedule)
+            current_lr = critic_schedule_fn(self._current_progress_remaining)
+            update_learning_rate(self.critic.optimizer, current_lr)
+            self.log(f"✓ Updated critic learning rate schedule (current LR: {current_lr:.2e})", level=0)
+
+    def _get_current_lr(self) -> Dict[str, float]:
+        """
+        Get current learning rates for actor and critic optimizers.
+        
+        Returns:
+            Dictionary with keys 'actor' and 'critic' containing current LR values
+        """
+        actor_lr = self.actor.optimizer.param_groups[0]['lr']
+        critic_lr = self.critic.optimizer.param_groups[0]['lr']
+        return {"actor": actor_lr, "critic": critic_lr}
+
     def warmup_critic(
         self,
         critic_warmup_steps: int,
-        callback: BaseCallback
+        callback: BaseCallback,
     ) -> None:
         """
         Warm up the critic by training for a specified number of steps with the actor frozen.
+        
+        Args:
+            critic_warmup_steps: Number of training steps for critic warmup
+            callback: Callback for monitoring warmup progress
+            
+        Note:
+            Set the critic learning rate before calling this method using update_learning_rates()
         """
         if critic_warmup_steps <= 0:
             self.log("✓ No critic warmup steps specified, skipping warmup.")
             return
         self.log(f"\nWarming up critic for {critic_warmup_steps} steps with frozen actor")
-
+        
         # Freeze actor, set eval mode, and prevent SB3 from switching back to train mode during learn()
         self.freeze_learnable_actor()
         self.policy.actor.set_training_mode(False) # disable Dropout/BatchNorm
