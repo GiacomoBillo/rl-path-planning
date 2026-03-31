@@ -3,6 +3,7 @@ import torch as th
 from gymnasium import spaces
 from stable_baselines3 import SAC
 from typing import Any, Callable, Optional, Tuple, Dict, Union
+from typing_extensions import override
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import configure
@@ -283,6 +284,7 @@ class SACDebug(SAC):
 
 
     # to overwrite off_policy_algorithm.py:OffPolicyAlgorithm._sample_action
+    @override
     def _sample_action(
         self,
         learning_starts: int,
@@ -408,6 +410,7 @@ class MySAC(SACDebug):
     - Added explicit log_std initialization (SB3 bug workaround)
     - Added support for separate actor/critic learning rate schedules
     - Added per-step logging for train/* metrics (logs at every gradient step)
+    - Added episode-level custom metrics logging (target_reached, num_steps, num_collisions, final errors, truncated)
     """
     
     def __init__(self, *args, **kwargs):
@@ -417,6 +420,7 @@ class MySAC(SACDebug):
         self._actor_lr_schedule = None
         self._critic_lr_schedule = None
 
+    @override
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         """
         Override SAC.train() to log train/* metrics at every gradient step.
@@ -438,6 +442,63 @@ class MySAC(SACDebug):
         # This writes actor_loss, critic_loss, lr etc. to TensorBoard/WandB
         # at the current timestep, instead of waiting for episode end
         self.logger.dump(step=self.num_timesteps)
+
+
+    @override
+    def _dump_logs(self) -> None:
+        """
+        Override to add raw per-episode metrics from environment info.
+
+        Extracts task-specific metrics from ep_info_buffer (populated by Monitor wrapper).
+        Assumes strict compliance: all keys MUST be present in the info dict, or a 
+        KeyError will be raised (fail-fast design).
+        
+        Extracts task-specific metrics from the LATEST completed episode (not averaged):
+        use a mew prefix "task/" to distinguish from standard SB3 "rollout/" metrics.
+        - task/target_reached: Whether target was reached (bool: 0 or 1)
+        - task/num_steps: Number of steps taken in episode (int)
+        - task/num_collisions: Number of collisions in episode (int)
+        - task/return: Episode return (float)
+        - task/position_error: Position error at episode end (meters)
+        - task/orientation_error: Orientation error at episode end (radians)
+        - task/timeout: Whether episode was truncated due to max steps (bool: 0 or 1)
+        
+        These are RAW per-episode values (not moving averages like ep_rew_mean).
+        You can apply smoothing in WandB if needed, but you can't un-smooth averaged data.
+
+        Strategy: 
+        - record new custom (episode-level) metrics
+        - then call super()._dump_logs() which adds standard metrics and dumps everything in a single call.
+        """
+        # Add our custom episode-level metrics to logger buffer
+        # Extract ONLY the latest episode (not averaged over buffer)
+        if len(self.ep_info_buffer) > 0:
+            latest_episode = self.ep_info_buffer[-1]  # Most recent completed episode
+            
+            # Task success (binary: 0 or 1)
+            self.logger.record("task/target_reached", float(latest_episode["target_reached"]))
+            
+            # Number of steps in episode
+            self.logger.record("task/num_steps", latest_episode["episode_num_steps"])
+
+            # Number of collisions in episode
+            self.logger.record("task/num_collisions", latest_episode["episode_num_collisions"])
+            
+            # Episode return (individual, not 100-ep moving average like ep_rew_mean)
+            self.logger.record("task/return", latest_episode["episode_return"])
+            
+            # Final position error at episode end (meters)
+            self.logger.record("task/position_error", latest_episode["position_error"])
+            
+            # Final orientation error at episode end (radians)
+            self.logger.record("task/orientation_error", latest_episode["orientation_error"])
+            
+            # Terminated due to max steps (truncated)
+            self.logger.record("task/timeout", float(latest_episode["TimeLimit.truncated"]))
+        
+        # Call parent to add standard metrics (ep_rew_mean, ep_len_mean, fps, etc.)
+        # and dump ALL metrics (ours + parent's) in a single call
+        super()._dump_logs()
 
     def update_learning_rates(
         self,
@@ -480,6 +541,7 @@ class MySAC(SACDebug):
             update_learning_rate(self.critic.optimizer, current_lr)
             self.log(f"✓ Updated critic learning rate schedule (current LR: {current_lr:.2e})", level=0)
 
+    @override
     def _update_learning_rate(self, optimizers: Union[list, th.optim.Optimizer]) -> None:
         """
         Override SB3's _update_learning_rate to support separate actor/critic schedules.

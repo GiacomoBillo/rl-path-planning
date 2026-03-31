@@ -254,8 +254,13 @@ def main(args: argparse.Namespace, cfg: dict, run: dict) -> None:
     print(f"Render mode: {render_mode}")
     
     # Create environments without dataloaders initially
-    env = Monitor(AvoidEverythingEnv(render_mode=render_mode, render_backend=render_backend))
-    eval_env = Monitor(AvoidEverythingEnv(render_mode=render_mode, render_backend=render_backend))
+    # Monitor with info_keywords to capture episode-level metrics from final step
+    info_keywords = ("target_reached", "collision", "position_error", "orientation_error", 
+                     "episode_num_collisions", "episode_num_steps", "episode_return", "TimeLimit.truncated")
+    env = Monitor(AvoidEverythingEnv(render_mode=render_mode, render_backend=render_backend),
+                  info_keywords=info_keywords)
+    eval_env = Monitor(AvoidEverythingEnv(render_mode=render_mode, render_backend=render_backend),
+                       info_keywords=info_keywords)
     
     # --- Data ---
     # Set up TrajectoryDataset for each environment using its internal robot.
