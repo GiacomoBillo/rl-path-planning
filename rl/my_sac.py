@@ -407,6 +407,7 @@ class MySAC(SACDebug):
     - Added function to warm up the critic by training with frozen actor
     - Added explicit log_std initialization (SB3 bug workaround)
     - Added support for separate actor/critic learning rate schedules
+    - Added per-step logging for train/* metrics (logs at every gradient step)
     """
     
     def __init__(self, *args, **kwargs):
@@ -415,6 +416,28 @@ class MySAC(SACDebug):
         # (SB3 only has self.lr_schedule for all optimizers)
         self._actor_lr_schedule = None
         self._critic_lr_schedule = None
+
+    def train(self, gradient_steps: int, batch_size: int = 64) -> None:
+        """
+        Override SAC.train() to log train/* metrics at every gradient step.
+        
+        By default, SB3 only dumps logs when episodes end (controlled by log_interval).
+        train/* metrics are recorded at every gradient step, which overwrite the value 
+        keeping only the last one until the data is dumped at the end of the
+        This override forces a dump after each train() call to capture all training
+        dynamics, ensuring no data loss.
+        
+        Args:
+            gradient_steps: Number of gradient steps to perform
+            batch_size: Minibatch size for each gradient update
+        """
+        # Call parent's train method (does all the actual training)
+        super().train(gradient_steps, batch_size)
+        
+        # Force dump to log train/* metrics immediately
+        # This writes actor_loss, critic_loss, lr etc. to TensorBoard/WandB
+        # at the current timestep, instead of waiting for episode end
+        self.logger.dump(step=self.num_timesteps)
 
     def update_learning_rates(
         self,
