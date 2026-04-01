@@ -102,6 +102,13 @@ class AvoidEverythingEnv(TimeLimit):
         )
         # apply time limit wrapper
         super().__init__(env, max_episode_steps=max_episode_steps)
+    
+    def step(self, action):
+        """Override step to add TimeLimit.truncated key for SB3 Monitor compatibility."""
+        observation, reward, terminated, truncated, info = super().step(action)
+        # Add TimeLimit.truncated key that SB3's Monitor expects (Gymnasium 1.0+ doesn't add this automatically)
+        info["TimeLimit.truncated"] = truncated and not terminated
+        return observation, reward, terminated, truncated, info
 
 
 @nb.jit(nopython=True)
