@@ -81,13 +81,16 @@ finetuning_critic_lr:
 # Configures multi-format logging for training metrics.
 # - log_dir: Base directory for all log files
 # - run_name: Base name for this run (timestamp will be auto-appended)
-# - formats: List of output formats. Options: "stdout", "tensorboard", "wandb"
+# - formats: List of output formats. 
+#       default: "tensorboard", "wandb"
+#       other options: "stdout", "csv", "log"
+#       Note: MySAC logs training metrics at high frequency (every gradient step), so "stdout" is not recommended to avoid console spam.
 #   * Remove "wandb" from list to disable cloud logging
 # - wandb_project: WandB project name (required if "wandb" in formats)
 # - wandb_entity: WandB username/team (optional, uses default from `wandb login`)
 logger:
   log_dir: ./logs
   run_name: sac_cubbies
-  formats: ["stdout", "tensorboard", "wandb"]
+  formats: ["tensorboard", "wandb"]
   wandb_project: rl-avoid-everything
   wandb_entity: null  # default entity

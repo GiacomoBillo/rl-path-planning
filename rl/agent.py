@@ -227,6 +227,11 @@ def bootstrap_agent(
         torch.cuda.empty_cache()
     print("✓ Freed original BC model memory")
 
+    # Set loggers
+    model.setup_logger(
+        logger_config=cfg["logger"],
+        run_dir=run["run_dir"],
+    )
 
     # --- Evaluate BC-warm-started policy (pre-training baseline) ---
     if args.eval_bc:
