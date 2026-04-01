@@ -293,8 +293,9 @@ class _AvoidEverythingEnv(gym.Env):
         info = {} # TODO: add info if needed
         self.collision = False
         self.episode_num_steps = 0
-        self.episode__num_collisions = 0
-        self.episode_return = 0  # cumulative reward
+        self.episode_num_collisions = 0
+        self.episode_return = 0.0  # cumulative reward
+        self.episode_limit_violation_sum = 0.0  # cumulative amount of config clipping due to joint limits
         return obs, info
 
     def step(self, action):
@@ -317,15 +318,19 @@ class _AvoidEverythingEnv(gym.Env):
         upclipped_config = self.robot_config + action
         # Clip action to make robot config in valid bounds
         clipped_config = np.clip(upclipped_config, -1.0, 1.0)
-        # TODO: penalize if action is out of bounds? reward
-        clipped_action = np.abs(clipped_config - upclipped_config)  # How much was the action clipped?
         self.robot_config = clipped_config
         self.episode_num_steps += 1
+
+        # joint limit violation
+        limit_violations = np.abs(clipped_config - upclipped_config)  # How much was the action clipped?
+        # Accumulate the total magnitude of violations for this episode
+        self.episode_limit_violation_sum += np.sum(limit_violations)
+        # TODO: penalize if action push joint config out of bounds? reward
 
         # Check for collision and target reaching
         collision = self._check_collision()
         self.collision = collision
-        self.episode__num_collisions += int(collision)
+        self.episode_num_collisions += int(collision)
         target_reached, pos_err, orien_err = self._check_target_reached()
         
         # Get new observation, compute reward, check termination and truncation
@@ -335,14 +340,18 @@ class _AvoidEverythingEnv(gym.Env):
         # terminated = collision or target_reached # episode ends if we collide or reach target
         terminated = target_reached # episodes ends only if we reach the target, not on collision (agent can learn to recover from collisions)
         truncated = False # truncation applyed via TimeLimit wrapper, not handled here
-        info = {"collision": collision,
+        info = {
+                # single step metrics
+                "collision": collision,
                 "target_reached": target_reached, 
                 "position_error": pos_err, 
                 "orientation_error": orien_err, 
-                "action_clipped": np.any(clipped_action > 0),
-                "episode_num_collisions": self.episode__num_collisions,
+                "limit_violations": limit_violations,
+                # episode metrics
+                "episode_num_collisions": self.episode_num_collisions,
                 "episode_num_steps": self.episode_num_steps,
                 "episode_return": self.episode_return,
+                "episode_limit_violation_sum": self.episode_limit_violation_sum,
                 }
 
         return obs, reward, terminated, truncated, info

@@ -256,7 +256,8 @@ def main(args: argparse.Namespace, cfg: dict, run: dict) -> None:
     # Create environments without dataloaders initially
     # Monitor with info_keywords to capture episode-level metrics from final step
     info_keywords = ("target_reached", "collision", "position_error", "orientation_error", 
-                     "episode_num_collisions", "episode_num_steps", "episode_return", "TimeLimit.truncated")
+                     "episode_num_collisions", "episode_num_steps", "episode_return", "TimeLimit.truncated",
+                     "episode_limit_violation_sum")
     env = Monitor(AvoidEverythingEnv(render_mode=render_mode, render_backend=render_backend),
                   info_keywords=info_keywords)
     eval_env = Monitor(AvoidEverythingEnv(render_mode=render_mode, render_backend=render_backend),

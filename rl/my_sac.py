@@ -462,6 +462,7 @@ class MySAC(SACDebug):
         - task/position_error: Position error at episode end (meters)
         - task/orientation_error: Orientation error at episode end (radians)
         - task/timeout: Whether episode was truncated due to max steps (bool: 0 or 1)
+        - task/limit_violation_sum: Magnitude of joint configuration clipping due to joint limits, cumulated in episode (float)
         
         These are RAW per-episode values (not moving averages like ep_rew_mean).
         You can apply smoothing in WandB if needed, but you can't un-smooth averaged data.
@@ -495,6 +496,9 @@ class MySAC(SACDebug):
             
             # Terminated due to max steps (truncated)
             self.logger.record("task/timeout", float(latest_episode["TimeLimit.truncated"]))
+
+            # Joint limit violation
+            self.logger.record("task/limit_violation_sum", latest_episode["episode_limit_violation_sum"])
         
         # Call parent to add standard metrics (ep_rew_mean, ep_len_mean, fps, etc.)
         # and dump ALL metrics (ours + parent's) in a single call
