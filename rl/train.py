@@ -45,6 +45,7 @@ from rl.common import (
     load_checkpoint_with_metadata,
     setup_wandb,
     save_checkpoint_with_metadata,
+    get_save_path,
 )
 from rl.lr_schedules import build_lr_schedule
 
@@ -92,15 +93,15 @@ def get_args_and_cfg():
 
 def main(args, cfg):
     """Main training workflow."""
-    # Setup run directory with 'finetuning' phase
-    run_info = setup_run_directory(args.cfg_path, cfg, phase="finetuning")
+    # Setup run directory with 'finetune' phase
+    run_info = setup_run_directory(args.cfg_path, cfg, phase="finetune")
     print(f"\n=== RL Finetuning ===")
     print(f"Run ID: {run_info['run_id']}")
     print(f"Run directory: {run_info['run_dir']}")
     print(f"Loading checkpoint: {args.checkpoint}\n")
 
     # Initialize WandB if enabled
-    wandb_run = setup_wandb(cfg, run_info, phase="finetuning", tags=["rl-finetuning"])
+    wandb_run = setup_wandb(cfg, run_info, tags=["rl-finetuning"])
 
     try:
         # --- Create Environments ---
@@ -179,7 +180,7 @@ def main(args, cfg):
 
         # Create training callback
         train_callback = DebugCallback(
-            description="finetuning",
+            description=run_info["phase"],
             log_steps=(args.debug >= 3),
             render=args.render,
             verbose=args.verbose,
@@ -192,7 +193,6 @@ def main(args, cfg):
             callback=[train_callback],
             reset_num_timesteps=False,  # Continue counting from loaded checkpoint
             log_interval=1,  # Log every episode
-            tb_log_name="rl_finetuning",
         )
         print(f"✓ RL finetuning completed ({finetuning_steps} steps)\n")
 
@@ -229,18 +229,15 @@ def main(args, cfg):
 
         # --- Save Trained Checkpoint ---
         print("\n=== Saving trained checkpoint ===")
-        save_dir = cfg["save_path"]
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f"{run_info['run_name']}_{run_info['timestamp']}")
+        save_path = get_save_path(cfg, run_info)
 
         # Save with metadata
         training_metadata = {
-            "phase": "finetuning",
-            "run_id": run_info["run_id"],
-            "timestamp": run_info["timestamp"],
+            **run_info,
             "total_steps": model.num_timesteps,
             "finetuning_steps": finetuning_steps,
             "loaded_from_checkpoint": args.checkpoint,
+            "saved_checkpoint_path": save_path+".zip",
         }
 
         save_checkpoint_with_metadata(model, save_path, training_metadata)

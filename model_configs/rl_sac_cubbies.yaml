@@ -33,7 +33,7 @@ freeze_bc_encoder: true  # Freeze BC encoder during initial RL training; call ex
 seed: 42
 total_timesteps: 1000
 n_eval_episodes: 10
-save_path: checkpoints/sac_cubbies
+save_dir: ./checkpoints  # Base directory for checkpoints (structure: save_dir/experiment_group/timestamp_phase.zip)
 
 # Buffer and learning configuration
 buffer_size: 1000
@@ -79,8 +79,11 @@ finetuning_critic_lr:
 
 # --- Logging configuration ---
 # Configures multi-format logging for training metrics.
-# - log_dir: Base directory for all log files
-# - run_name: Base name for this run (timestamp will be auto-appended)
+# - log_dir: Base directory for all log files (structure: log_dir/experiment_group/timestamp_phase/)
+# - experiment_group: Required. Experiment identifier used for:
+#     - WandB group (to organize related runs)
+#     - Local directory organization (all runs grouped together)
+#     Example: "sac_overfit_cubby"
 # - formats: List of output formats. 
 #       default: "tensorboard", "wandb"
 #       other options: "stdout", "csv", "log"
@@ -90,7 +93,7 @@ finetuning_critic_lr:
 # - wandb_entity: WandB username/team (optional, uses default from `wandb login`)
 logger:
   log_dir: ./logs
-  run_name: sac_cubbies
+  experiment_group: sac_cubbies  # Required: experiment identifier
   formats: ["tensorboard", "wandb"]
   wandb_project: rl-avoid-everything
   wandb_entity: null  # default entity

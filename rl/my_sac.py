@@ -757,6 +757,7 @@ class MySAC(SACDebug):
         self,
         critic_warmup_steps: int,
         callback: BaseCallback,
+        tb_log_name: Optional[str] = None,
     ) -> None:
         """
         Warm up the critic by training for a specified number of steps with the actor frozen.
@@ -764,6 +765,7 @@ class MySAC(SACDebug):
         Args:
             critic_warmup_steps: Number of training steps for critic warmup
             callback: Callback for monitoring warmup progress
+            tb_log_name: Optional TensorBoard log name (default: None uses SB3 default)
             
         Note:
             Set the critic learning rate before calling this method using update_learning_rates()
@@ -783,13 +785,18 @@ class MySAC(SACDebug):
         self.monitor_agent("BEFORE WARMUP")
 
         # --- Critic warmup = learn with frozen actor ---
-        self.learn(
-            total_timesteps=critic_warmup_steps,
-            progress_bar=True,
-            callback=callback,
-            log_interval=1,
-            tb_log_name="critic_warmup"  # separate TB logs for warmup phase
-            )
+        learn_kwargs = {
+            "total_timesteps": critic_warmup_steps,
+            "progress_bar": True,
+            "callback": callback,
+            "log_interval": 1,
+        }
+        
+        # Only pass tb_log_name if explicitly provided
+        if tb_log_name is not None:
+            learn_kwargs["tb_log_name"] = tb_log_name
+            
+        self.learn(**learn_kwargs)
 
         # Restore actor set_training_mode and Unfreeze actor components
         self.unfreeze_learnable_actor()

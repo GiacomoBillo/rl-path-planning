@@ -41,27 +41,44 @@ def setup_run_directory(cfg_path: str, cfg: dict, phase: str = "") -> dict:
     """
     Create run directory and save command, args, and config for reproducibility.
     
+    Uses experiment_group for unified organization across WandB and filesystem.
+    Directory structure: logs/{experiment_group}/{timestamp}_{phase}/
+    
     Args:
         cfg_path: Path to the config YAML file
         cfg: Loaded config dictionary
-        phase: Optional phase name (e.g., 'warmup', 'train', 'eval') to append to run_name
+        phase: Phase name (e.g., 'warmup', 'finetune', 'eval')
         
     Returns:
         Dictionary with run metadata:
-        - run_id: Unique identifier for this run
-        - run_name: Base name for the run
-        - timestamp: Timestamp string
+        - group: Experiment group name
+        - phase: Phase name
+        - timestamp: Short timestamp string (MMDD_HHMM)
+        - run_name: Name for this specific run ({timestamp}_{phase})
+        - run_id: Globally unique ID ({group}_{timestamp}_{phase})
         - run_dir: Path to the run directory
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_name = cfg["logger"].get("run_name", "run")
+    # Short timestamp format: MMDD_HHMM
+    timestamp = datetime.now().strftime("%m%d_%H%M")
     
-    # Append phase to run_name if provided
+    # Get experiment group from config (required)
+    experiment_group = cfg["logger"].get("experiment_group")
+    if not experiment_group:
+        raise ValueError("Config must specify logger.experiment_group")
+    
+    # Build run name: {timestamp}_{phase}
     if phase:
-        run_name = f"{run_name}_{phase}"
+        run_name = f"{timestamp}_{phase}"
+    else:
+        run_name = timestamp
     
-    run_id = f"{run_name}_{timestamp}"
-    run_dir = os.path.join(cfg["logger"]["log_dir"], run_id)
+    # Build globally unique run_id: {group}_{timestamp}_{phase}
+    run_id = f"{experiment_group}_{run_name}"
+    
+    # Create directory: logs/{group}/{timestamp}_{phase}/
+    log_dir = cfg["logger"]["log_dir"]
+    group_dir = os.path.join(log_dir, experiment_group)
+    run_dir = os.path.join(group_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
 
     # Copy original config file to preserve comments and formatting
@@ -77,9 +94,11 @@ def setup_run_directory(cfg_path: str, cfg: dict, phase: str = "") -> dict:
     print(f"✓ Command saved to: {command_file}")
     
     run_info = {
-        "run_id": run_id,
+        "group": experiment_group,
+        "phase": phase,
         "timestamp": timestamp,
         "run_name": run_name,
+        "run_id": run_id,
         "run_dir": run_dir,
     }
     return run_info
@@ -252,14 +271,16 @@ def bootstrap_sac_from_bc(
     return model
 
 
-def setup_wandb(cfg: dict, run_info: dict, phase: str = "", tags: list = None) -> Optional[wandb.sdk.wandb_run.Run]:
+def setup_wandb(cfg: dict, run_info: dict, tags: list = None) -> Optional[wandb.sdk.wandb_run.Run]:
     """
     Initialize WandB logging if enabled in config.
+    
+    Uses experiment_group as WandB group for organizing related runs.
+    Uses phase as job_type automatically.
     
     Args:
         cfg: Configuration dictionary
         run_info: Run metadata from setup_run_directory()
-        phase: Phase name (e.g., 'warmup', 'train', 'eval') for tagging
         tags: Additional tags for the run
         
     Returns:
@@ -290,25 +311,66 @@ def setup_wandb(cfg: dict, run_info: dict, phase: str = "", tags: list = None) -
     # Patch TensorBoard for automatic syncing
     wandb.tensorboard.patch(root_logdir=run_info["run_dir"])
     
+    # Use phase as job_type
+    job_type = run_info.get("phase", "")
+    
     # Prepare tags
-    run_tags = [phase] if phase else []
+    run_tags = []
+    if job_type:
+        run_tags.append(job_type)
     if tags:
         run_tags.extend(tags)
     
     # Initialize WandB run
+    # group: experiment_group for organizing related runs
+    # job_type: phase (warmup, finetune, eval)
+    # name: {timestamp}_{phase} for this specific run
+    # id: globally unique {group}_{timestamp}_{phase}
     wandb_run = wandb.init(
         project=wandb_project,
         entity=wandb_entity,
-        id=run_info["run_id"],
-        name=run_info["run_id"],
+        group=run_info["group"],          # Experiment group
+        job_type=job_type or None,        # Phase: warmup, train, eval, full
+        id=run_info["run_id"],             # Globally unique ID
+        name=run_info["run_name"],         # Display name
         config=cfg,
         sync_tensorboard=True,
         reinit="finish_previous",
         tags=run_tags,
     )
-    print(f"✓ WandB initialized: project={wandb_project}, entity={wandb_entity}, run_id={wandb_run.id}, tags={run_tags}")
+    print(f"✓ WandB initialized:")
+    print(f"    project={wandb_project}, entity={wandb_entity}")
+    print(f"    group={run_info['group']}, job_type={job_type}")
+    print(f"    run_name={run_info['run_name']}, run_id={wandb_run.id}")
+    print(f"    tags={run_tags}")
     
     return wandb_run
+
+
+def get_save_path(cfg: dict, run_info: dict) -> str:
+    """
+    Get checkpoint save path based on experiment group and run info.
+    
+    Creates directory structure: {save_dir}/{group}/{timestamp}_{phase}
+    
+    Args:
+        cfg: Configuration dictionary
+        run_info: Run metadata from setup_run_directory()
+        
+    Returns:
+        Full path for checkpoint (without .zip extension)
+    """
+    save_dir = cfg.get("save_dir", "./checkpoints")
+    group = run_info["group"]
+    run_name = run_info["run_name"]
+    
+    # Create group directory
+    group_dir = os.path.join(save_dir, group)
+    os.makedirs(group_dir, exist_ok=True)
+    
+    # Return full checkpoint path: checkpoints/{group}/{timestamp}_{phase}
+    save_path = os.path.join(group_dir, run_name)
+    return save_path
 
 
 def save_checkpoint_with_metadata(

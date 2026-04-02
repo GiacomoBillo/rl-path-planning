@@ -47,6 +47,7 @@ from rl.common import (
     bootstrap_sac_from_bc,
     setup_wandb,
     save_checkpoint_with_metadata,
+    get_save_path,
 )
 from rl.lr_schedules import build_lr_schedule
 
@@ -95,8 +96,8 @@ def main(args, cfg):
     print(f"Run ID: {run_info['run_id']}")
     print(f"Run directory: {run_info['run_dir']}\n")
 
-    # Initialize WandB if enabled
-    wandb_run = setup_wandb(cfg, run_info, phase="warmup", tags=["critic-warmup"])
+    # Initialize WandB if enabled (job_type auto-derived from phase)
+    wandb_run = setup_wandb(cfg, run_info, tags=["critic-warmup"])
 
     try:
         # --- Create Environments ---
@@ -200,7 +201,7 @@ def main(args, cfg):
 
         # Create training callback
         train_callback = DebugCallback(
-            description="warmup",
+            description=run_info["phase"],
             log_steps=(args.debug >= 3),
             render=args.render,
             verbose=args.verbose,
@@ -214,19 +215,15 @@ def main(args, cfg):
 
         # --- Save Warmed Checkpoint ---
         print("\n=== Saving warmed checkpoint ===")
-        save_dir = cfg["save_path"]
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f"{run_info['run_name']}_{run_info['timestamp']}")
+        save_path = get_save_path(cfg, run_info)
 
         # Save with metadata
         metadata = {
-            "phase": "warmup",
-            "run_id": run_info["run_id"],
-            "timestamp": run_info["timestamp"],
-            "run_dir": run_info["run_dir"],
+            **run_info,
             "total_steps": model.num_timesteps,
             "warmup_steps": warmup_steps,
-            "checkpoint_path": save_path+".zip",
+            "loaded_from_checkpoint": cfg["bc_checkpoint_path"],
+            "saved_checkpoint_path": save_path+".zip",
         }
 
         save_checkpoint_with_metadata(model, save_path, metadata)
