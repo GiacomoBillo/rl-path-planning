@@ -22,6 +22,10 @@ import shutil
 import sys
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
+import zipfile
+import json
+import base64
+import pickle
 
 import torch
 import yaml
@@ -158,7 +162,7 @@ def create_env(
     return env
 
 
-def load_bc_checkpoint(cfg: dict) -> PretrainingMotionPolicyTransformer:
+def load_bc_checkpoint(cfg: dict, verbose=True) -> PretrainingMotionPolicyTransformer:
     """
     Load pretrained BC policy from checkpoint.
     
@@ -176,7 +180,8 @@ def load_bc_checkpoint(cfg: dict) -> PretrainingMotionPolicyTransformer:
         action_chunk_length=cfg["action_chunk_length"],
         **cfg["bc_checkpoint_parameters"],
     ).to(device)
-    print(f"✓ BC checkpoint loaded from: {cfg['bc_checkpoint_path']}")
+    if verbose:
+        print(f"✓ BC checkpoint loaded from: {cfg['bc_checkpoint_path']}")
     return bc_model
 
 
@@ -399,6 +404,7 @@ def save_checkpoint_with_metadata(
 
 def load_checkpoint_with_metadata(
     checkpoint_path: str,
+    cfg: dict,
     env: Optional[DummyVecEnv] = None,
     load_replay_buffer: bool = False,
 ) -> Tuple[MySAC, Optional[Dict[str, Any]]]:
@@ -409,6 +415,7 @@ def load_checkpoint_with_metadata(
         checkpoint_path: Path to checkpoint (with or without .zip extension)
         env: Optional environment (if None, loads without environment)
         load_replay_buffer: Whether to load replay buffer from checkpoint
+        cfg: config dict (used to load BC model, old checkpoint, for creating the structure of the network)
         
     Returns:
         Tuple of (loaded model, metadata dict or None)
@@ -417,9 +424,34 @@ def load_checkpoint_with_metadata(
     if checkpoint_path.endswith(".zip"):
         checkpoint_path = checkpoint_path[:-4]
     
-    # Load model
-    custom_objects = {"learning_rate": 0.0}  # Placeholder, will be updated by LR schedule
     
+    # Load BC model and prepare policy_kwargs with bc_model injected
+    bc_model = load_bc_checkpoint(cfg, verbose=False)
+    
+    # Load existing policy_kwargs from checkpoint and inject bc_model    
+    with zipfile.ZipFile(checkpoint_path + ".zip", 'r') as archive:
+        data_bytes = archive.read('data')
+        data = json.loads(data_bytes)
+        
+        # Get policy_kwargs (it's serialized)
+        pk_json = data.get('policy_kwargs', {})
+        if ':serialized:' in pk_json:
+            serialized = base64.b64decode(pk_json[':serialized:'])
+            policy_kwargs = pickle.loads(serialized)
+        else:
+            policy_kwargs = pk_json
+    
+    # Inject bc_model into features_extractor_kwargs
+    if 'features_extractor_kwargs' not in policy_kwargs:
+        policy_kwargs['features_extractor_kwargs'] = {}
+    policy_kwargs['features_extractor_kwargs']['bc_model'] = bc_model
+    
+    # Pass the complete policy_kwargs in custom_objects to override the saved one
+    custom_objects = {
+        "policy_kwargs": policy_kwargs,
+    }
+    
+    # Load model
     if env is not None:
         model = MySAC.load(
             checkpoint_path,
@@ -432,6 +464,13 @@ def load_checkpoint_with_metadata(
             checkpoint_path,
             custom_objects=custom_objects,
         )
+    
+    # Cleanup BC model after loading (same as bootstrap_sac_from_bc)
+    if "bc_model" in model.policy_kwargs.get("features_extractor_kwargs", {}):
+        del model.policy_kwargs["features_extractor_kwargs"]["bc_model"]
+    del bc_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     print(f"✓ Model loaded from: {checkpoint_path}.zip")
     print(f"Model on device: {model.device}")

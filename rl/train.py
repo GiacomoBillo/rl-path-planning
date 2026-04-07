@@ -130,6 +130,7 @@ def main(args, cfg):
             args.checkpoint,
             env=env,
             load_replay_buffer=True,
+            cfg=cfg,  # Pass config for BC model loading if needed
         )
         print(f"✓ Checkpoint loaded")
 
