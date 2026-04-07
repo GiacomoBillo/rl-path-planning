@@ -26,7 +26,7 @@ class SACDebug(SAC):
     """
     Custom SAC class for debugging, with options for deterministic rollout and verbose logging
     """
-    def __init__(self, *args, force_deterministic=True, debug_verbose=1, **kwargs):
+    def __init__(self, *args, force_deterministic=False, debug_verbose=1, **kwargs):
         super().__init__(*args, **kwargs)
         self.force_deterministic = force_deterministic
         self.debug_verbose_level = debug_verbose
@@ -961,7 +961,7 @@ class MySAC(SACDebug):
         Args:
             cfg: Configuration dictionary containing:
                 - transitions_before_learn: number of transitions to prefill the buffer with (default: buffer_size)
-                - prefill_deterministic: whether to use deterministic policy/actor (default: True)
+                - prefill_deterministic: whether to use deterministic policy/actor (default: False)
                 - prefill_render: whether callback rendering during prefill is enabled (default: False)
             callback: Optional callback invoked on each prefill env step.
                 Receives locals()/globals() like SB3 callbacks.
@@ -969,7 +969,7 @@ class MySAC(SACDebug):
         prefill_transitions = int(
             cfg.get("transitions_before_learn", self.buffer_size)
         )
-        prefill_deterministic = bool(cfg.get("prefill_deterministic", True))
+        prefill_deterministic = bool(cfg.get("prefill_deterministic", self.force_deterministic))
         prefill_render = bool(cfg.get("prefill_render", False))
         
         if prefill_transitions <= 0:
@@ -1005,7 +1005,7 @@ class MySAC(SACDebug):
     def _prefill_replay_buffer(
         self,
         target_transitions: int,
-        force_deterministic: bool = True,
+        force_deterministic: bool = False,
         callback: Optional[Callable[[dict[str, Any], dict[str, Any]], Any]] = None,
     ) -> Tuple[int, int, float, float, int]:
         """Internal method to pre-fill replay buffer with policy rollouts.

@@ -235,7 +235,6 @@ def bootstrap_sac_from_bc(
         "MultiInputPolicy",
         env,
         tensorboard_log=run_dir,
-        force_deterministic=True,
         debug_verbose=debug,
         verbose=verbose,
         seed=cfg["seed"],
