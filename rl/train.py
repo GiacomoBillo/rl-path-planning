@@ -64,6 +64,7 @@ def get_args_and_cfg():
     parser.add_argument(
         "--eval_after",
         action="store_true",
+        default=True,
         help="Evaluate the trained policy after finetuning"
     )
     parser.add_argument(
@@ -150,6 +151,20 @@ def main(args, cfg):
 
         model.monitor_agent("AFTER LOADING CHECKPOINT")
 
+
+        # --- Pre-fill Replay Buffer ---
+        print("\n=== Pre-filling replay buffer ===")
+        prefill_callback = DebugCallback(
+            description="prefill-buffer",
+            log_steps=(args.debug >= 3),
+            render=(args.render and cfg.get("prefill_render", False)),
+            progress_bar=True,
+            verbose=args.verbose,
+        )
+        model.prefill_replay_buffer(cfg, callback=prefill_callback)
+        print(f"✓ Replay buffer prefilled with {model.replay_buffer.size()} transitions\n")
+
+
         # --- Set Up RL Finetuning Learning Rates ---
         print("\n=== Setting up RL finetuning learning rates ===")
         current_step = model.num_timesteps
@@ -224,8 +239,8 @@ def main(args, cfg):
             # Log to WandB
             if wandb_run is not None:
                 wandb.log({
-                    "eval_trained/mean_reward": mean_reward,
-                    "eval_trained/std_reward": std_reward,
+                    "eval/mean_reward": mean_reward,
+                    "eval/std_reward": std_reward,
                 })
 
         # --- Save Trained Checkpoint ---
