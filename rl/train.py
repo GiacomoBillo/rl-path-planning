@@ -32,11 +32,13 @@ import traceback
 
 import yaml
 import wandb
-from stable_baselines3.common.callbacks import EvalCallback
-from stable_baselines3.common.evaluation import evaluate_policy
 
 from avoid_everything.type_defs import DatasetType
-from rl.callbacks import DebugCallback
+from rl.callbacks import (
+    DebugCallback,
+    PeriodicEvalMetricsCallback,
+    evaluate_policy_with_metrics,
+)
 from rl.common import (
     setup_run_directory,
     create_env,
@@ -214,15 +216,14 @@ def main(args, cfg):
             if effective_eval_freq != args.eval_freq:
                 print(f"✓ Periodic eval frequency scaled for VecEnv: {effective_eval_freq} calls")
 
-            periodic_eval_callback = EvalCallback(
+            periodic_eval_callback = PeriodicEvalMetricsCallback(
                 eval_env=eval_env,
-                best_model_save_path=None,
-                log_path=run_info["run_dir"],
                 eval_freq=effective_eval_freq,
                 n_eval_episodes=cfg["n_eval_episodes"],
                 deterministic=True,
-                render=False,
                 verbose=args.verbose,
+                logger_prefix="eval",
+                print_prefix="Periodic evaluation",
             )
             print(
                 f"✓ Periodic eval enabled: every {args.eval_freq} training steps "
@@ -248,7 +249,7 @@ def main(args, cfg):
         # --- Optional: Evaluate Trained Policy ---
         if args.eval_after:
             print("\n=== Evaluating trained policy ===")
-            eval_callback = DebugCallback(
+            eval_debug_callback = DebugCallback(
                 description="eval-trained",
                 log_steps=(args.debug >= 3),
                 render=args.render,
@@ -257,21 +258,26 @@ def main(args, cfg):
                 verbose=args.verbose,
             )
 
-            mean_reward, std_reward = evaluate_policy(
-                model,
-                eval_env,
+            eval_metrics = evaluate_policy_with_metrics(
+                model=model,
+                eval_env=eval_env,
                 n_eval_episodes=cfg["n_eval_episodes"],
                 deterministic=True,
-                callback=eval_callback,
+                debug_callback=eval_debug_callback,
             )
-            eval_callback.close_progress_bar()
-            print(f"Trained policy: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}\n")
+            eval_debug_callback.close_progress_bar()
+            print("\nEvaluation results:")
+            for key, value in eval_metrics.items():
+                print(f"  {key}: {value:.4f}")
+
+            for key, value in eval_metrics.items():
+                model.logger.record(f"eval/{key}", value)
+            model.logger.dump(step=model.num_timesteps)
 
             # Log to WandB
             if wandb_run is not None:
                 wandb.log({
-                    "eval/mean_reward": mean_reward,
-                    "eval/std_reward": std_reward,
+                    f"eval/{key}": value for key, value in eval_metrics.items()
                 })
 
         # --- Save Trained Checkpoint ---
@@ -285,6 +291,8 @@ def main(args, cfg):
             "finetuning_steps": finetuning_steps,
             "loaded_from_checkpoint": args.checkpoint,
             "saved_checkpoint_path": save_path+".zip",
+            "periodic_eval_freq": args.eval_freq,
+            "effective_eval_freq": effective_eval_freq if periodic_eval_callback else None,
         }
 
         save_checkpoint_with_metadata(model, save_path, training_metadata)

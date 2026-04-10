@@ -28,16 +28,14 @@ Output:
 """
 
 import argparse
-import copy
 import sys
 import traceback
 
 import yaml
 import wandb
-from stable_baselines3.common.evaluation import evaluate_policy
 
 from avoid_everything.type_defs import DatasetType
-from rl.callbacks import DebugCallback
+from rl.callbacks import DebugCallback, evaluate_policy_with_metrics
 from rl.common import (
     setup_run_directory,
     create_env,
@@ -149,10 +147,15 @@ def main(args, cfg):
             for key, val in checkpoint_metadata.items():
                 print(f"    {key}: {val}")
 
+        model.setup_logger(
+            logger_config=cfg["logger"],
+            run_dir=run_info["run_dir"],
+        )
+
         # --- Run Evaluation ---
         print(f"\n=== Running evaluation ({cfg['n_eval_episodes']} episodes) ===")
         
-        eval_callback = DebugCallback(
+        eval_debug_callback = DebugCallback(
             description="eval",
             log_steps=(args.debug >= 3),
             render=args.render,
@@ -161,14 +164,18 @@ def main(args, cfg):
             verbose=args.verbose,
         )
 
-        mean_reward, std_reward = evaluate_policy(
-            model,
-            eval_env,
+        eval_metrics = evaluate_policy_with_metrics(
+            model=model,
+            eval_env=eval_env,
             n_eval_episodes=cfg["n_eval_episodes"],
             deterministic=args.deterministic,
-            callback=eval_callback,
+            debug_callback=eval_debug_callback,
         )
-        eval_callback.close_progress_bar()
+        eval_debug_callback.close_progress_bar()
+
+        for key, value in eval_metrics.items():
+            model.logger.record(f"eval/{key}", value)
+        model.logger.dump(step=model.num_timesteps)
 
         # --- Print Results ---
         print(f"\n{'='*70}")
@@ -176,19 +183,21 @@ def main(args, cfg):
         print(f"{'='*70}")
         print(f"Checkpoint: {args.checkpoint}")
         print(f"Episodes: {cfg['n_eval_episodes']}")
-        print(f"Mean Reward: {mean_reward:.4f}")
-        print(f"Std Reward: {std_reward:.4f}")
+        print(f"Mean Reward: {eval_metrics['mean_reward']:.4f}")
+        print(f"Std Reward: {eval_metrics['std_reward']:.4f}")
+        print(f"Mean Episode Length: {eval_metrics['mean_ep_length']:.4f}")
+        print(f"Std Episode Length: {eval_metrics['std_ep_length']:.4f}")
+        print(f"Target Reached Rate: {eval_metrics['target_reached_rate']:.4f}")
+        print(f"Mean Num Collisions: {eval_metrics['mean_num_collisions']:.4f}")
+        print(f"Mean Position Error: {eval_metrics['mean_position_error']:.4f}")
+        print(f"Mean Orientation Error: {eval_metrics['mean_orientation_error']:.4f}")
         print(f"{'='*70}\n")
 
         # --- Log to WandB ---
         if wandb_run is not None:
             wandb.log({
-                "eval/mean_reward": mean_reward,
-                "eval/std_reward": std_reward,
-                "eval/n_episodes": cfg["n_eval_episodes"],
-                "eval/checkpoint": args.checkpoint,
+                f"eval/{key}": value for key, value in eval_metrics.items()
             })
-
         print("=== Evaluation completed successfully ===\n")
 
     except Exception as e:

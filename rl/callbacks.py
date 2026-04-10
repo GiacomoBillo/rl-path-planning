@@ -1,7 +1,8 @@
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.evaluation import evaluate_policy
 from tqdm import tqdm
 import numpy as np
-from typing import Any
+from typing import Any, Optional
 
 
 
@@ -188,3 +189,142 @@ class DebugCallback(BaseCallback):
               f"return={episode_return:.2f} steps={episode_steps} "
               f"collisions={episode_collisions} "
               f"pos_err={position_error:.4f}m orient_err={orientation_error:.2f}deg")
+
+
+class EvalMetricsCallback:
+    """Callback for evaluate_policy that aggregates task metrics at episode end."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.episodes = 0
+        self.target_reached = []
+        self.num_collisions = []
+        self.position_errors = []
+        self.orientation_errors = []
+
+    def __call__(self, locals_: dict, globals_: dict) -> None:
+        infos = locals_.get("infos", locals_.get("info", []))
+        dones = locals_.get("dones", locals_.get("done", []))
+
+        if isinstance(infos, list) and isinstance(dones, (list, np.ndarray)):
+            for done, info in zip(dones, infos):
+                if done and isinstance(info, dict):
+                    self._consume_info(info)
+            return
+
+        if dones and isinstance(infos, dict):
+            self._consume_info(infos)
+
+    def _consume_info(self, info: dict) -> None:
+        self.episodes += 1
+        self.target_reached.append(float(info.get("target_reached", False)))
+        self.num_collisions.append(float(info.get("episode_num_collisions", 0)))
+        self.position_errors.append(float(info.get("position_error", 0.0)))
+        self.orientation_errors.append(float(info.get("orientation_error", 0.0)))
+
+    def summary(self) -> dict:
+        if self.episodes == 0:
+            return {
+                "episodes": 0,
+                "target_reached_rate": 0.0,
+                "mean_num_collisions": 0.0,
+                "mean_position_error": 0.0,
+                "mean_orientation_error": 0.0,
+            }
+
+        return {
+            "episodes": self.episodes,
+            "target_reached_rate": float(np.mean(self.target_reached)),
+            "mean_num_collisions": float(np.mean(self.num_collisions)),
+            "mean_position_error": float(np.mean(self.position_errors)),
+            "mean_orientation_error": float(np.mean(self.orientation_errors)),
+        }
+
+
+def evaluate_policy_with_metrics(
+    model: Any,
+    eval_env: Any,
+    n_eval_episodes: int,
+    deterministic: bool = True,
+    debug_callback: Optional[Any] = None,
+) -> dict:
+    """Run evaluate_policy once and return reward/length plus aggregated task metrics."""
+    metrics_callback = EvalMetricsCallback()
+    metrics_callback.reset()
+
+    if debug_callback is None:
+        callback = metrics_callback
+    else:
+        def callback(locals_: dict, globals_: dict) -> None:
+            debug_callback(locals_, globals_)
+            metrics_callback(locals_, globals_)
+
+    episode_rewards, episode_lengths = evaluate_policy(
+        model,
+        eval_env,
+        n_eval_episodes=n_eval_episodes,
+        deterministic=deterministic,
+        callback=callback,
+        return_episode_rewards=True,
+    )
+
+    summary = metrics_callback.summary()
+    summary.update({
+        "mean_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
+        "std_reward": float(np.std(episode_rewards)) if episode_rewards else 0.0,
+        "mean_ep_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
+        "std_ep_length": float(np.std(episode_lengths)) if episode_lengths else 0.0,
+    })
+    return summary
+
+
+class PeriodicEvalMetricsCallback(BaseCallback):
+    """Run one evaluation pass and log aggregated task metrics."""
+
+    def __init__(
+        self,
+        eval_env: Any,
+        eval_freq: int,
+        n_eval_episodes: int,
+        deterministic: bool = True,
+        verbose: int = 0,
+        logger_prefix: str = "eval",
+        print_prefix: str = "Periodic evaluation",
+    ) -> None:
+        super().__init__(verbose=verbose)
+        self.eval_env = eval_env
+        self.eval_freq = eval_freq
+        self.n_eval_episodes = n_eval_episodes
+        self.deterministic = deterministic
+        self.logger_prefix = logger_prefix
+        self.print_prefix = print_prefix
+
+    def _on_step(self) -> bool:
+        if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
+            return True
+
+        metrics = evaluate_policy_with_metrics(
+            model=self.model,
+            eval_env=self.eval_env,
+            n_eval_episodes=self.n_eval_episodes,
+            deterministic=self.deterministic,
+        )
+
+        print(f"\n=== {self.print_prefix} @ step {self.num_timesteps} ===")
+        print(
+            f"mean_reward={metrics['mean_reward']:.2f} +/- {metrics['std_reward']:.2f}, "
+            f"mean_len={metrics['mean_ep_length']:.2f} +/- {metrics['std_ep_length']:.2f}"
+        )
+        print(
+            f"target_reached_rate={metrics['target_reached_rate']:.3f}, "
+            f"mean_collisions={metrics['mean_num_collisions']:.3f}, "
+            f"mean_pos_err={metrics['mean_position_error']:.4f}m, "
+            f"mean_orient_err={metrics['mean_orientation_error']:.2f}deg"
+        )
+
+        for key, value in metrics.items():
+            self.logger.record(f"{self.logger_prefix}/{key}", value)
+        self.logger.dump(step=self.num_timesteps)
+        return True
