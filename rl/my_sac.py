@@ -420,6 +420,9 @@ class MySAC(SACDebug):
         # (SB3 only has self.lr_schedule for all optimizers)
         self._actor_lr_schedule = None
         self._critic_lr_schedule = None
+        self._original_ent_coef_optimizer = None
+        self._original_ent_coef_tensor = None
+        self._had_ent_coef_tensor = False
 
     @override
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
@@ -884,6 +887,28 @@ class MySAC(SACDebug):
         for param in self.policy.critic.q_networks.parameters():
             param.requires_grad = True
 
+    def freeze_ent_coef(self) -> None:
+        # if ent_coef is not learnable return
+        if self.ent_coef_optimizer is None or self.log_ent_coef is None:
+            return
+        self._original_ent_coef_optimizer = self.ent_coef_optimizer
+        self._had_ent_coef_tensor = hasattr(self, "ent_coef_tensor")
+        self._original_ent_coef_tensor = getattr(self, "ent_coef_tensor", None)
+        self.ent_coef_optimizer = None
+        self.ent_coef_tensor = th.exp(self.log_ent_coef.detach())
+        self.log("Freezing adaptive entropy coefficient (ent_coef_optimizer set to None)", level=1)
+
+    def unfreeze_ent_coef(self) -> None:
+        # if ent_coef is not learnable return
+        if self._original_ent_coef_optimizer is None:
+            return
+        self.ent_coef_optimizer = self._original_ent_coef_optimizer
+        if self._had_ent_coef_tensor:
+            self.ent_coef_tensor = self._original_ent_coef_tensor
+        elif hasattr(self, "ent_coef_tensor"):
+            del self.ent_coef_tensor
+        self.log("Unfreezing adaptive entropy coefficient (ent_coef_optimizer restored)", level=1)
+
 
     def _get_current_lr(self) -> Dict[str, float]:
         """
@@ -923,6 +948,7 @@ class MySAC(SACDebug):
         self.policy.actor.set_training_mode(False) # disable Dropout/BatchNorm
         original_actor_set_mode = self.policy.actor.set_training_mode
         self.policy.actor.set_training_mode = lambda mode: None
+        self.freeze_ent_coef()
         
         # Monitor and debug before warmup
         self.monitor_agent("BEFORE WARMUP")
@@ -940,6 +966,7 @@ class MySAC(SACDebug):
             learn_kwargs["tb_log_name"] = tb_log_name
             
         self.learn(**learn_kwargs)
+        self.unfreeze_ent_coef()
 
         # Restore actor set_training_mode and Unfreeze actor components
         self.unfreeze_learnable_actor()
