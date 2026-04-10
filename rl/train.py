@@ -126,7 +126,7 @@ def main(args, cfg):
         eval_env = create_env(
             cfg,
             render=args.render,
-            dataset_type=DatasetType.VAL,
+            dataset_type=DatasetType.TRAIN,
             overfit_idx=overfit_idx,
         )
         print("✓ Environments created")
