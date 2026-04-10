@@ -139,7 +139,11 @@ def create_env(
     )
     
     env = Monitor(
-        AvoidEverythingEnv(render_mode=render_mode, render_backend=render_backend),
+        AvoidEverythingEnv(
+            render_mode=render_mode, 
+            render_backend=render_backend,
+            terminate_ep_on_collision=cfg.get("terminate_ep_on_collision", True)
+        ),
         info_keywords=info_keywords
     )
     

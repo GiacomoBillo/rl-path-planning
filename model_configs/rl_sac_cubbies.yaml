@@ -11,6 +11,9 @@ urdf_path: /workspace/assets/panda/panda.urdf
 num_robot_points: 2048
 action_chunk_length: 1
 
+# Environment
+terminate_ep_on_collision: true  # Whether to end the episode immediately upon collision (default: true)
+
 # BC checkpoint (pre-trained AvoidEverything policy, for warm-start)
 # bc_checkpoint_parameters are baked into the checkpoint — they must match the architecture used during training and cannot be changed independently.
 # no need to change them because we are just loading the checkpoint, changing them could break the loading

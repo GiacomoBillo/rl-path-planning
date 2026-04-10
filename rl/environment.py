@@ -64,6 +64,7 @@ class AvoidEverythingEnv(TimeLimit):
         max_episode_steps: int = 100,
         highlight_collisions: bool = True,
         normalize_rewards: bool = True,
+        terminate_ep_on_collision: bool = True,
     ):
         """Initialize environment with an automatic TimeLimit wrapper.
 
@@ -83,6 +84,7 @@ class AvoidEverythingEnv(TimeLimit):
             max_episode_steps: maximum number of steps per episode before truncation (default 50)
             highlight_collisions: whether to highlight the robot in red when in collision (only applies to render_backend='ros')
             normalize_rewards: whether to scale rewards to be in [-1, 1] (default True)
+            terminate_ep_on_collision: whether collisions terminate the episode (default True)
         """
         # instantiate the base env
         env = _AvoidEverythingEnv(
@@ -99,6 +101,8 @@ class AvoidEverythingEnv(TimeLimit):
             render_backend=render_backend,
             render_fps=render_fps,
             highlight_collisions=highlight_collisions,
+            normalize_rewards=normalize_rewards,
+            terminate_ep_on_collision=terminate_ep_on_collision,
         )
         # apply time limit wrapper
         super().__init__(env, max_episode_steps=max_episode_steps)
@@ -171,6 +175,7 @@ class _AvoidEverythingEnv(gym.Env):
         render_fps: float | None = None,
         highlight_collisions: bool = True,
         normalize_rewards: bool = True,
+        terminate_ep_on_collision: bool = True,
     ):
         """Initialize environment.
         Args:
@@ -189,6 +194,7 @@ class _AvoidEverythingEnv(gym.Env):
                 render_backend="ros" is incompatible with render_mode="rgb_array".
             highlight_collisions: whether to highlight the robot in red when in collision (only applies to render_backend='ros')
             normalize_rewards: whether to scale rewards to be in [-1, 1] (default True)
+            terminate_ep_on_collision: whether collisions terminate the episode (default True)
         """
         super().__init__()
 
@@ -259,6 +265,7 @@ class _AvoidEverythingEnv(gym.Env):
         # Action space: normalized joint deltas [-1, 1] for main DOF
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.robot.MAIN_DOF,), dtype=np.float32,)
         self.normalize_rewards = normalize_rewards
+        self.terminate_ep_on_collision = terminate_ep_on_collision
 
         # Render setup
         self._render_setup(render_mode, render_backend, render_fps)
@@ -314,7 +321,7 @@ class _AvoidEverythingEnv(gym.Env):
         Returns:
             obs (dict): dict with keys "point_cloud", "point_cloud_labels", "configuration"
             reward (float): scalar reward for this step
-            terminated (bool): whether episode is done 
+            terminated (bool): whether episode is done
             truncated (bool): whether episode is truncated
             info (dict): dict with additional info
         """
@@ -344,8 +351,7 @@ class _AvoidEverythingEnv(gym.Env):
         obs = self._get_obs()
         reward = self._compute_reward(collision, target_reached)
         self.episode_return += reward
-        # terminated = collision or target_reached # episode ends if we collide or reach target
-        terminated = target_reached # episodes ends only if we reach the target, not on collision (agent can learn to recover from collisions)
+        terminated = self._check_terminated_ep(collision, target_reached)
         truncated = False # truncation applyed via TimeLimit wrapper, not handled here
         info = {
                 # single step metrics
@@ -362,6 +368,14 @@ class _AvoidEverythingEnv(gym.Env):
                 }
 
         return obs, reward, terminated, truncated, info
+
+    def _check_terminated_ep(self, collision: bool, target_reached: bool) -> bool:
+        """Return whether the current episode should terminate."""
+        if target_reached:
+            return True
+        if self.terminate_ep_on_collision and collision:
+            return True
+        return False
 
     def _get_obs(self):
         """Construct point cloud observation."""
