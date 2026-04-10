@@ -780,12 +780,15 @@ class MySAC(SACDebug):
         
         # Filter out wandb from SB3 formats (we handle it separately)
         sb3_formats = [f for f in formats if f != "wandb"]
-        
+
+        # Ensure SB3 logger is always initialized, even if formats only contains "wandb".
+        if not sb3_formats:
+            sb3_formats = ["stdout"]
+
         # Configure SB3 logger with formats
-        if sb3_formats:
-            new_logger = configure(run_dir, sb3_formats)
-            self.set_logger(new_logger)
-            self.log(f"  Logging to: {', '.join(sb3_formats)}", level=1)
+        new_logger = configure(run_dir, sb3_formats)
+        self.set_logger(new_logger)
+        self.log(f"  Logging to: {', '.join(sb3_formats)}", level=1)
         
         # # Setup WandB if in formats list
         # wandb_callback = None
