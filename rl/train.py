@@ -10,17 +10,14 @@ This script handles the second phase of RL training:
 The warmed checkpoint should be created by warmup.py first.
 
 Usage:
-    # Basic training from warmed checkpoint
-    python rl/train.py model_configs/rl_sac_cubbies.yaml --checkpoint checkpoints/sac_cubbies_warmup_2026-04-01_12-30-00
+    # RL finetuning from checkpoint
+    python rl/train.py [config_path] --checkpoint [checkpoint_path]
     
-    # Continue training from a partially trained checkpoint
-    python rl/train.py model_configs/rl_sac_cubbies.yaml --checkpoint checkpoints/sac_cubbies_train_2026-04-01_13-00-00
-    
-    # With rendering
-    python rl/train.py model_configs/rl_sac_cubbies.yaml --checkpoint ... --render
-    
-    # Overfit mode for debugging
-    python rl/train.py model_configs/rl_sac_cubbies.yaml --checkpoint ... --overfit 1
+    Optional arguments:
+    --eval_after            Evaluate the trained policy after finetuning (default: True)
+    --overfit N             Overfit on training scene with idx N for debugging (default: 1 if flag is used)
+    --render                Render the environment during training
+    --eval_freq N           Periodic evaluation frequency in training steps (default: 1000, <=0 disables periodic eval)
 
 Output:
     - Trained checkpoint saved to: {save_path}/{run_name}_finetuning_{timestamp}.zip
@@ -35,6 +32,7 @@ import traceback
 
 import yaml
 import wandb
+from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 
 from avoid_everything.type_defs import DatasetType
@@ -83,6 +81,12 @@ def get_args_and_cfg():
         type=int,
         default=1,
         help="Debug level: 0=None, 1=Summary, 2=Component, 3=Detailed"
+    )
+    parser.add_argument(
+        "--eval_freq",
+        type=int,
+        default=1000,
+        help="Periodic evaluation frequency in training steps (default: 1000, <=0 disables periodic eval)"
     )
     args = parser.parse_args()
 
@@ -202,11 +206,38 @@ def main(args, cfg):
             verbose=args.verbose,
         )
 
+        periodic_eval_callback = None
+        effective_eval_freq = 0
+        if args.eval_freq > 0:
+            n_envs = env.num_envs if hasattr(env, "num_envs") else 1
+            effective_eval_freq = max(args.eval_freq // max(n_envs, 1), 1)
+            if effective_eval_freq != args.eval_freq:
+                print(f"✓ Periodic eval frequency scaled for VecEnv: {effective_eval_freq} calls")
+
+            periodic_eval_callback = EvalCallback(
+                eval_env=eval_env,
+                best_model_save_path=None,
+                log_path=run_info["run_dir"],
+                eval_freq=effective_eval_freq,
+                n_eval_episodes=cfg["n_eval_episodes"],
+                deterministic=True,
+                render=False,
+                verbose=args.verbose,
+            )
+            print(
+                f"✓ Periodic eval enabled: every {args.eval_freq} training steps "
+                f"({cfg['n_eval_episodes']} episodes)"
+            )
+
+        callbacks = [train_callback]
+        if periodic_eval_callback is not None:
+            callbacks.append(periodic_eval_callback)
+
         # Run training
         model.learn(
             total_timesteps=finetuning_steps,
             progress_bar=True,
-            callback=[train_callback],
+            callback=callbacks,
             reset_num_timesteps=False,  # Continue counting from loaded checkpoint
             log_interval=1,  # Log every episode
         )
