@@ -34,42 +34,37 @@ bc_checkpoint_parameters:
 # SAC / RL
 freeze_bc_encoder: true  # Freeze BC encoder during initial RL training; call extractor.unfreeze() to fine-tune end-to-end
 seed: 42
-total_timesteps: 1000
 n_eval_episodes: 10
 save_dir: ./checkpoints  # Base directory for checkpoints (structure: save_dir/experiment_group/timestamp_phase.zip)
-
-# Buffer and learning configuration
 buffer_size: 1000
-critic_warmup_steps: 1000
 batch_size: 16  # Increased from 1 to reduce gradient variance
-train_freq: 1 # (1, "step")  # Update the model every ... (n, "step") or (n, "episode")
+train_freq: [1, "step"] # int | Tuple[int, str] , Update the model every ... (n, "step") or (n, "episode")
+
+# Prefill buffer with current policy rollouts
 transitions_before_learn: 200  # Prefill replay buffer with transitions before learn()
 prefill_deterministic: false  # Use deterministic actions during replay prefill
 prefill_render: true
 
-# SAC hyperparameters for stability with BC warm-start
+# SAC hyperparameters for stochasticity
 entropy_coef: "0.001" # 0.01  # Low entropy to preserve BC behavior (default='auto' is too high)
 log_std_init: -10 
+target_entropy: -30  # Target entropy for 'auto' entropy coefficient tuning 
 
-# NOTE: log_std_init in policy_kwargs does NOT work! must be explicitly initialized after model creation. 
-# Recommended log_std values for different exploration needs:
-#   -20: Near-deterministic (std ≈ 2e-9) - good for BC-bootstrapped policies
-#   -10: Very low noise (std ≈ 4e-5) - minimal exploration
-#   -5:  Low noise (std ≈ 0.007) - gentle exploration
-#   0:   Standard noise (std = 1.0) - standard SAC exploration
 
 # --- Learning rate schedules for different training phases ---
 # Supports two schedule types:
 #   - constant: Fixed learning rate throughout the phase
 #   - linear: Linear decay from start_lr to end_lr
-# 
+
 # Critic warmup phase (actor frozen, critic trains on BC rollouts):
+critic_warmup_steps: 1000
 critic_warmup_lr:
   type: "linear"       # "constant" or "linear"
   start_lr: 3.0e-4       # Learning rate during warmup
   end_lr: 0       # Only used if type is "linear"
 
 # RL finetuning phase (both actor and critic train):
+total_timesteps: 1000
 finetuning_actor_lr:
   type: "linear"         # "constant" or "linear"
   start_lr: 1.0e-5       # Initial learning rate
@@ -79,6 +74,7 @@ finetuning_critic_lr:
   type: "constant"       # "constant" or "linear"
   start_lr: 3.0e-5       # Learning rate during finetuning
   # end_lr: 1.0e-5       # Only used if type is "linear"
+
 
 # --- Logging configuration ---
 # Configures multi-format logging for training metrics.

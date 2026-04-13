@@ -239,6 +239,9 @@ def bootstrap_sac_from_bc(
         "share_features_extractor": False,  # Each (actor, critic) gets separate transformer
         "log_std_init": cfg["log_std_init"],
     }
+
+    raw_freq = cfg["train_freq"]
+    parsed_train_freq = tuple(raw_freq) if isinstance(raw_freq, list) else raw_freq
     
     model = MySAC(
         "MultiInputPolicy",
@@ -251,8 +254,9 @@ def bootstrap_sac_from_bc(
         learning_starts=0,  # Start training immediately with BC policy
         batch_size=cfg["batch_size"],
         ent_coef=cfg["entropy_coef"],
+        target_entropy=cfg["target_entropy"],
         policy_kwargs=policy_kwargs,
-        train_freq=(1, "step"),
+        train_freq=parsed_train_freq,
     )
     
     vec_env = model.get_env()
