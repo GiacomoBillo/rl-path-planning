@@ -191,6 +191,11 @@ def main(args, cfg):
 
         print(f"✓ Finetuning actor LR config: {cfg['finetuning_actor_lr']}")
         print(f"✓ Finetuning critic LR config: {cfg['finetuning_critic_lr']}")
+        print(f"Target entropy: {model.target_entropy}")
+        raw_freq = cfg["train_freq"]
+        parsed_train_freq = tuple(raw_freq) if isinstance(raw_freq, list) else raw_freq
+        model.train_freq = parsed_train_freq  # Update train_freq for finetuning phase
+        model._convert_train_freq()
 
         model.update_learning_rates(
             actor_schedule=actor_lr_schedule,
