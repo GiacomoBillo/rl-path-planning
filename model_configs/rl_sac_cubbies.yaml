@@ -12,7 +12,16 @@ num_robot_points: 2048
 action_chunk_length: 1
 
 # Environment
-terminate_ep_on_collision: true  # Whether to end the episode immediately upon collision (default: true)
+env:
+  terminate_ep_on_collision: true  # Whether to end the episode immediately upon collision
+  # Seed is configured once at top-level `seed` (below), not inside `env`.
+  vec_env_type: "subproc"            # "dummy" | "subproc"
+  n_envs: 6                        # Default env count when role-specific values are omitted
+  # train_n_envs: 1
+  # eval_n_envs: 1
+  # subproc_start_method: null       # null = SB3 default ("forkserver"/"spawn" depending on platform)
+  num_workers: 0                   # DataLoader workers per env process
+  subproc_dataset_num_workers: 0   # Conservative default to avoid nested multiprocessing
 
 # BC checkpoint (pre-trained AvoidEverything policy, for warm-start)
 # bc_checkpoint_parameters are baked into the checkpoint — they must match the architecture used during training and cannot be changed independently.
@@ -33,7 +42,7 @@ bc_checkpoint_parameters:
 
 # SAC / RL
 freeze_bc_encoder: true  # Freeze BC encoder during initial RL training; call extractor.unfreeze() to fine-tune end-to-end
-seed: 42
+seed: 42  # Single seed source for both SB3 model and VecEnv seeding
 n_eval_episodes: 10
 save_dir: ./checkpoints  # Base directory for checkpoints (structure: save_dir/experiment_group/timestamp_phase.zip)
 buffer_size: 1000

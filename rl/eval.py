@@ -130,6 +130,8 @@ def main(args, cfg):
             render=args.render,
             dataset_type=DatasetType.TRAIN,
             overfit_idx=overfit_idx,
+            env_role="eval",
+            env_cfg=cfg["env"],
         )
         print("✓ Evaluation environment created")
 
