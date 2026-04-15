@@ -135,7 +135,8 @@ def create_env(
     info_keywords = (
         "target_reached", "collision", "position_error", "orientation_error",
         "episode_num_collisions", "episode_num_steps", "episode_return",
-        "TimeLimit.truncated", "episode_limit_violation_sum"
+        "TimeLimit.truncated", "episode_limit_violation_sum",
+        "episode_action_abs_mean",
     )
     
     env = Monitor(

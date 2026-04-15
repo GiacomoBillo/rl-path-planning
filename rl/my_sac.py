@@ -606,6 +606,8 @@ class MySAC(SACDebug):
         - task/orientation_error: Orientation error at episode end (radians)
         - task/timeout: Whether episode was truncated due to max steps (bool: 0 or 1)
         - task/limit_violation_sum: Magnitude of joint configuration clipping due to joint limits, cumulated in episode (float)
+        - task/action_abs_mean_j*: Episode mean abs(delta q) per joint
+        - task/action_abs_mean: Episode mean abs(delta q), averaged across joints
         
         These are RAW per-episode values (not moving averages like ep_rew_mean).
         You can apply smoothing in WandB if needed, but you can't un-smooth averaged data.
@@ -642,6 +644,12 @@ class MySAC(SACDebug):
 
             # Joint limit violation
             self.logger.record("task/limit_violation_sum", latest_episode["episode_limit_violation_sum"])
+
+            # Episode action magnitude (abs(delta q))
+            action_abs_mean = np.asarray(latest_episode["episode_action_abs_mean"], dtype=np.float32)
+            for joint_idx, joint_value in enumerate(action_abs_mean):
+                self.logger.record(f"task/action_abs_mean_j{joint_idx}", float(joint_value))
+            self.logger.record("task/action_abs_mean", float(np.mean(action_abs_mean)))
         
         # Call parent to add standard metrics (ep_rew_mean, ep_len_mean, fps, etc.)
         # and dump ALL metrics (ours + parent's) in a single call

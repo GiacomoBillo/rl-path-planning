@@ -310,6 +310,7 @@ class _AvoidEverythingEnv(gym.Env):
         self.episode_num_collisions = 0
         self.episode_return = 0.0  # cumulative reward
         self.episode_limit_violation_sum = 0.0  # cumulative amount of config clipping due to joint limits
+        self.episode_action_abs_sum = np.zeros(self.robot.MAIN_DOF, dtype=np.float32)  # cumulative abs(delta q) per joint
         return obs, info
 
     def step(self, action):
@@ -334,6 +335,11 @@ class _AvoidEverythingEnv(gym.Env):
         clipped_config = np.clip(upclipped_config, -1.0, 1.0)
         self.robot_config = clipped_config
         self.episode_num_steps += 1
+
+        # Action magnitude tracking (per-joint abs(delta q))
+        action_abs = np.abs(action)
+        self.episode_action_abs_sum += action_abs
+        episode_action_abs_mean = self.episode_action_abs_sum / self.episode_num_steps
 
         # joint limit violation
         limit_violations = np.abs(clipped_config - upclipped_config)  # How much was the action clipped?
@@ -365,6 +371,8 @@ class _AvoidEverythingEnv(gym.Env):
                 "episode_num_steps": self.episode_num_steps,
                 "episode_return": self.episode_return,
                 "episode_limit_violation_sum": self.episode_limit_violation_sum,
+                "episode_action_abs_sum": self.episode_action_abs_sum,
+                "episode_action_abs_mean": episode_action_abs_mean,
                 }
 
         return obs, reward, terminated, truncated, info

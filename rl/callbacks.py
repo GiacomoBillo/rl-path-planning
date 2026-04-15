@@ -203,6 +203,7 @@ class EvalMetricsCallback:
         self.num_collisions = []
         self.position_errors = []
         self.orientation_errors = []
+        self.action_abs_means = []
 
     def __call__(self, locals_: dict, globals_: dict) -> None:
         infos = locals_.get("infos", locals_.get("info", []))
@@ -223,6 +224,9 @@ class EvalMetricsCallback:
         self.num_collisions.append(float(info.get("episode_num_collisions", 0)))
         self.position_errors.append(float(info.get("position_error", 0.0)))
         self.orientation_errors.append(float(info.get("orientation_error", 0.0)))
+        action_abs_mean = np.asarray(info.get("episode_action_abs_mean", []), dtype=np.float32)
+        if action_abs_mean.size > 0:
+            self.action_abs_means.append(action_abs_mean)
 
     def summary(self) -> dict:
         if self.episodes == 0:
@@ -232,15 +236,23 @@ class EvalMetricsCallback:
                 "mean_num_collisions": 0.0,
                 "mean_position_error": 0.0,
                 "mean_orientation_error": 0.0,
+                "ep_action_abs_mean": 0.0,
             }
 
-        return {
+        summary = {
             "episodes": self.episodes,
             "target_reached_rate": float(np.mean(self.target_reached)),
             "mean_num_collisions": float(np.mean(self.num_collisions)),
             "mean_position_error": float(np.mean(self.position_errors)),
             "mean_orientation_error": float(np.mean(self.orientation_errors)),
         }
+        if self.action_abs_means:
+            mean_per_joint = np.stack(self.action_abs_means).mean(axis=0)
+            summary["ep_action_abs_mean"] = float(np.mean(mean_per_joint))
+            for joint_idx, joint_value in enumerate(mean_per_joint):
+                summary[f"ep_action_abs_j{joint_idx}"] = float(joint_value)
+
+        return summary
 
 
 def evaluate_policy_with_metrics(
@@ -321,7 +333,8 @@ class PeriodicEvalMetricsCallback(BaseCallback):
             f"target_reached_rate={metrics['target_reached_rate']:.3f}, "
             f"mean_collisions={metrics['mean_num_collisions']:.3f}, "
             f"mean_pos_err={metrics['mean_position_error']:.4f}m, "
-            f"mean_orient_err={metrics['mean_orientation_error']:.2f}deg"
+            f"mean_orient_err={metrics['mean_orientation_error']:.2f}deg, "
+            f"mean_action_abs={metrics['ep_action_abs_mean']:.4f}"
         )
 
         for key, value in metrics.items():

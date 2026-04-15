@@ -36,10 +36,9 @@ import traceback
 
 import yaml
 import wandb
-from stable_baselines3.common.evaluation import evaluate_policy
 
 from avoid_everything.type_defs import DatasetType
-from rl.callbacks import DebugCallback
+from rl.callbacks import DebugCallback, evaluate_policy_with_metrics
 from rl.common import (
     setup_run_directory,
     create_env,
@@ -155,22 +154,20 @@ def main(args, cfg):
                 verbose=args.verbose,
             )
 
-            mean_reward, std_reward = evaluate_policy(
-                model,
-                eval_env,
+            eval_metrics = evaluate_policy_with_metrics(
+                model=model,
+                eval_env=eval_env,
                 n_eval_episodes=cfg["n_eval_episodes"],
                 deterministic=True,
-                callback=eval_callback,
+                debug_callback=eval_callback,
             )
             eval_callback.close_progress_bar()
-            print(f"BC-warm-started policy: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}\n")
+            print("BC-warm-started policy: ")
+            for key, value in eval_metrics.items():
+                print(f"  {key}: {value:.4f}")
+                model.logger.record(f"eval_bc/{key}", value)
+            model.logger.dump(step=model.num_timesteps)
 
-            # Log to WandB
-            if wandb_run is not None:
-                wandb.log({
-                    "eval_bc/mean_reward": mean_reward,
-                    "eval_bc/std_reward": std_reward,
-                })
 
         # --- Pre-fill Replay Buffer ---
         print("\n=== Pre-filling replay buffer ===")

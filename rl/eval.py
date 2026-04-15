@@ -191,6 +191,7 @@ def main(args, cfg):
         print(f"Mean Num Collisions: {eval_metrics['mean_num_collisions']:.4f}")
         print(f"Mean Position Error: {eval_metrics['mean_position_error']:.4f}")
         print(f"Mean Orientation Error: {eval_metrics['mean_orientation_error']:.4f}")
+        print(f"Mean Action Abs (|delta q|): {eval_metrics['mean_episode_action_abs']:.4f}")
         print(f"{'='*70}\n")
 
         # --- Log to WandB ---
