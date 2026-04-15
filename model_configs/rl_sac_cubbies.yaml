@@ -96,3 +96,4 @@ logger:
   formats: ["tensorboard", "wandb"]
   wandb_project: rl-avoid-everything
   wandb_entity: null  # default entity
+  wandb_tags: [] # tags for WandB run (phase is automatically included as tag)

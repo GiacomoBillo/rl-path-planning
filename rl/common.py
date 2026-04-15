@@ -328,7 +328,7 @@ def setup_wandb(cfg: dict, run_info: dict, tags: list = None) -> Optional[wandb.
     job_type = run_info.get("phase", "")
     
     # Prepare tags
-    run_tags = []
+    run_tags = list(logger_config.get("wandb_tags", []))
     if job_type:
         run_tags.append(job_type)
     if tags:
