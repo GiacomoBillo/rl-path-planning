@@ -13,6 +13,12 @@ action_chunk_length: 1
 
 # Environment
 terminate_ep_on_collision: true  # Whether to end the episode immediately upon collision (default: true)
+# reward = magnitude * (goal_weight * goal + collision_weight * collision + goal_distance_weight * exp(-position_error/position_threshold) * exp(-orientation_error/orientation_threshold))
+reward: 
+  total_magnitude: 1.0
+  goal_weight: 1.0
+  collision_weight: -1.0      # must be <= 0
+  goal_distance_weight: 0.01   # set >0 to add dense distance penalty, if =0 is disabled
 
 # BC checkpoint (pre-trained AvoidEverything policy, for warm-start)
 # bc_checkpoint_parameters are baked into the checkpoint — they must match the architecture used during training and cannot be changed independently.

@@ -5,7 +5,7 @@ Custom Gymnasium environment for training the RL agent.
 
 import random
 import importlib
-from typing import Literal
+from typing import Literal, Any
 import numpy as np
 import gymnasium as gym
 import numba as nb
@@ -34,6 +34,34 @@ from utils.visualization import visualize_problem
 BYPASS_LAZY_ROS_RENDER = True # if True, always publish the full scene on each render call instead of only on the first call per episode. 
 
 
+
+def build_reward_config(reward_config: dict[str, Any] | None) -> dict[str, float]:
+    reward_config = reward_config or {}
+    if not isinstance(reward_config, dict):
+        raise ValueError("reward_config must be a dict when provided.")
+
+    total_magnitude = float(reward_config.get("total_magnitude", 1.0))
+    goal_weight = float(reward_config.get("goal_weight", 1.0))
+    collision_weight = float(reward_config.get("collision_weight", -1.0))
+    goal_distance_weight = float(reward_config.get("goal_distance_weight", 0.0))
+
+    if total_magnitude <= 0:
+        raise ValueError("reward.total_magnitude must be > 0.")
+    if goal_weight < 0:
+        raise ValueError("reward.goal_weight must be >= 0.")
+    if collision_weight > 0:
+        raise ValueError("reward.collision_weight must be <= 0.")
+    if goal_distance_weight < 0:
+        raise ValueError("reward.goal_distance_weight must be >= 0.")
+
+    return {
+        "total_magnitude": total_magnitude,
+        "goal_weight": goal_weight,
+        "collision_weight": collision_weight,
+        "goal_distance_weight": goal_distance_weight,
+    }
+
+
 class AvoidEverythingEnv(TimeLimit):
     """
     Public environment: wraps `_AvoidEverythingEnv` with Gymnasium's `TimeLimit`.
@@ -56,15 +84,15 @@ class AvoidEverythingEnv(TimeLimit):
         num_target_points: int = 128,
         collision_mode: Literal["franka", "spheres", "torch"] = "franka",
         scene_buffer: float = 0.0,
-        position_threshold: float = 0.01,
-        orientation_threshold: float = 15.0,
+        position_threshold: float = 0.01, # meters
+        orientation_threshold: float = 15.0, # degrees
         render_mode: Literal["human", "rgb_array"] | None = None,
         render_backend: Literal["ros", "pybullet"] | None = None,
         render_fps: float | None = None,
         max_episode_steps: int = 100,
         highlight_collisions: bool = True,
-        normalize_rewards: bool = True,
         terminate_ep_on_collision: bool = True,
+        reward_config: dict | None = None,
     ):
         """Initialize environment with an automatic TimeLimit wrapper.
 
@@ -83,8 +111,8 @@ class AvoidEverythingEnv(TimeLimit):
             render_fps: target frame rate for rendering (None = as fast as possible)
             max_episode_steps: maximum number of steps per episode before truncation (default 50)
             highlight_collisions: whether to highlight the robot in red when in collision (only applies to render_backend='ros')
-            normalize_rewards: whether to scale rewards to be in [-1, 1] (default True)
             terminate_ep_on_collision: whether collisions terminate the episode (default True)
+            reward_config: optional reward configuration block.
         """
         # instantiate the base env
         env = _AvoidEverythingEnv(
@@ -101,8 +129,8 @@ class AvoidEverythingEnv(TimeLimit):
             render_backend=render_backend,
             render_fps=render_fps,
             highlight_collisions=highlight_collisions,
-            normalize_rewards=normalize_rewards,
             terminate_ep_on_collision=terminate_ep_on_collision,
+            reward_config=reward_config,
         )
         # apply time limit wrapper
         super().__init__(env, max_episode_steps=max_episode_steps)
@@ -174,8 +202,8 @@ class _AvoidEverythingEnv(gym.Env):
         render_backend: Literal["ros", "pybullet"] | None = None,
         render_fps: float | None = None,
         highlight_collisions: bool = True,
-        normalize_rewards: bool = True,
         terminate_ep_on_collision: bool = True,
+        reward_config: dict | None = None,
     ):
         """Initialize environment.
         Args:
@@ -193,8 +221,8 @@ class _AvoidEverythingEnv(gym.Env):
                 "ros" for render_mode="human", "pybullet" for render_mode="rgb_array".
                 render_backend="ros" is incompatible with render_mode="rgb_array".
             highlight_collisions: whether to highlight the robot in red when in collision (only applies to render_backend='ros')
-            normalize_rewards: whether to scale rewards to be in [-1, 1] (default True)
             terminate_ep_on_collision: whether collisions terminate the episode (default True)
+            reward_config: optional reward configuration block.
         """
         super().__init__()
 
@@ -264,7 +292,7 @@ class _AvoidEverythingEnv(gym.Env):
 
         # Action space: normalized joint deltas [-1, 1] for main DOF
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.robot.MAIN_DOF,), dtype=np.float32,)
-        self.normalize_rewards = normalize_rewards
+        self.reward_config = build_reward_config(reward_config)
         self.terminate_ep_on_collision = terminate_ep_on_collision
 
         # Render setup
@@ -355,7 +383,7 @@ class _AvoidEverythingEnv(gym.Env):
         
         # Get new observation, compute reward, check termination and truncation
         obs = self._get_obs()
-        reward = self._compute_reward(collision, target_reached)
+        reward, reward_terms = self._compute_reward(collision, target_reached, pos_err, orien_err)
         self.episode_return += reward
         terminated = self._check_terminated_ep(collision, target_reached)
         truncated = False # truncation applyed via TimeLimit wrapper, not handled here
@@ -373,6 +401,8 @@ class _AvoidEverythingEnv(gym.Env):
                 "episode_limit_violation_sum": self.episode_limit_violation_sum,
                 "episode_action_abs_sum": self.episode_action_abs_sum,
                 "episode_action_abs_mean": episode_action_abs_mean,
+                "reward": reward,
+                "reward_terms": reward_terms,
                 }
 
         return obs, reward, terminated, truncated, info
@@ -520,13 +550,33 @@ class _AvoidEverythingEnv(gym.Env):
         target_reached = pos_err < self.position_threshold and orien_err < self.orientation_threshold
         return target_reached, pos_err, orien_err
 
-    def _compute_reward(self, collision, target_reached):
-        """Compute reward"""
-        # simple sparse reward for now, TODO: design better reward function
-        reward = -100 if collision else 100 if target_reached else -0.1  
-        if self.normalize_rewards:
-            return reward/100  # scale reward to be in [-1, 1]
-        return reward
+
+    def _compute_reward(
+        self,
+        collision: bool,
+        target_reached: bool,
+        position_error: float,
+        orientation_error: float,
+    ) -> tuple[float, dict[str, float]]:
+        
+        goal_term = self.reward_config["goal_weight"] if target_reached and not collision else 0.0
+        collision_term = self.reward_config["collision_weight"] if collision else 0.0
+
+        # gaussian distance reward
+        # =0 when error in inf, =1 when error is 0, with gaussian smooth decay in between
+        # with position and orientation errors normalized by thresholds
+        goal_distance_term = \
+            self.reward_config["goal_distance_weight"] \
+            * np.exp(-(position_error / self.position_threshold)**2) \
+            * np.exp(-(orientation_error / self.orientation_threshold)**2)
+
+        reward_terms = {
+            "goal": goal_term,
+            "collision": collision_term,
+            "goal_distance": goal_distance_term,
+        }
+        reward = self.reward_config["total_magnitude"] * sum(reward_terms.values())
+        return reward, reward_terms
 
     def _render_setup(
         self,

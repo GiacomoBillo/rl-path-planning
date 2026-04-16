@@ -143,7 +143,8 @@ def create_env(
         AvoidEverythingEnv(
             render_mode=render_mode, 
             render_backend=render_backend,
-            terminate_ep_on_collision=cfg.get("terminate_ep_on_collision", True)
+            terminate_ep_on_collision=cfg.get("terminate_ep_on_collision", True),
+            reward_config=cfg.get("reward"),
         ),
         info_keywords=info_keywords
     )
