@@ -116,6 +116,8 @@ def _create_single_env(
     dataset_type: DatasetType = DatasetType.TRAIN,
     trajectory_key: Optional[str] = None,
     overfit_idx: Optional[int] = None,
+    env_idx: int = 0,
+    total_env_number: int = 1,
 ) -> Monitor:
     """Create one Monitor-wrapped environment instance."""
     render_mode = "human" if render else None
@@ -149,6 +151,8 @@ def _create_single_env(
         num_workers=env_cfg.get("num_workers", 0),
         random_scale=0.0,  # No noise for RL (clean states)
         overfit_idx=overfit_idx,
+        env_idx=env_idx,
+        total_env_number=total_env_number,
     )
 
     return env
@@ -225,6 +229,8 @@ def create_env(
                 dataset_type=dataset_type,
                 trajectory_key=trajectory_key,
                 overfit_idx=overfit_idx,
+                env_idx=env_idx,
+                total_env_number=n_envs,
             )
             return env
 

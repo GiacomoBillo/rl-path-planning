@@ -285,7 +285,14 @@ class _AvoidEverythingEnv(gym.Env):
 
         # Sample random problem from dataloader
         if self.dataloader is not None:
-            batch = next(iter(self.dataloader))
+            if self._dataloader_iter is None:
+                self._dataloader_iter = iter(self.dataloader)
+            try:
+                batch = next(self._dataloader_iter)
+            except StopIteration:
+                self._dataloader_iter = iter(self.dataloader)
+                batch = next(self._dataloader_iter)
+
             # Data loader returns a batch dict with tensors of shape (batch_size, ...)
             # Extract and squeeze single sample from batch
             self.problem = {key: val.squeeze(0).numpy() if hasattr(val, 'numpy') else val for key, val in batch.items()}
@@ -766,7 +773,10 @@ class _AvoidEverythingEnv(gym.Env):
         dataset_type: DatasetType,
         num_workers: int = 0,
         random_scale: float = 0.0,
-        overfit_idx: int = None,
+        overfit_idx: int | None = None,
+        shuffle: bool = True,
+        env_idx: int = 0,
+        total_env_number: int = 1,
     ):
         """Set up scene generation from a TrajectoryDataset.
 
@@ -781,6 +791,9 @@ class _AvoidEverythingEnv(gym.Env):
             num_workers: Number of workers for the DataLoader (default: 0)
             random_scale: Standard deviation of random noise to add to joints (default: 0.0)
             overfit_idx: If provided, only use this specific trajectory index (for overfitting mode)
+            shuffle: Whether to shuffle samples in DataLoader
+            env_idx: Current environment index for deterministic dataset splitting
+            total_env_number: Total number of environments used in parallel
         """
         # Create TrajectoryDataset using environment's robot instance
         dataset = TrajectoryDataset.load_from_directory(
@@ -797,16 +810,23 @@ class _AvoidEverythingEnv(gym.Env):
         # Handle overfit mode: create subset with single trajectory
         if overfit_idx is not None:
             dataset = Subset(dataset, [overfit_idx])
+        elif total_env_number > 1:
+            total_len = len(dataset)
+            len_split = (total_len + total_env_number - 1) // total_env_number
+            start = env_idx * len_split
+            end = min(start + len_split, len(dataset))
+            indices_split = list(range(start, end))
+            dataset = Subset(dataset, indices_split)
+            print(f"✓ Environment {env_idx}/{total_env_number} using dataset indices [{start}:{end}] out of {total_len} total samples")
 
-        # Create DataLoader with shuffle=True for varied episode resets
+        # Create DataLoader for episode resets.
         self.dataloader = DataLoader(
             dataset,
             batch_size=1,
-            shuffle=True,
+            shuffle=shuffle,
             num_workers=num_workers,
         )
-
-        print(f"✓ Set dataloader with {len(dataset)} trajectory start states (q0)")
+        self._dataloader_iter = iter(self.dataloader)
 
 
 
