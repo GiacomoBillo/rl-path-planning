@@ -114,6 +114,7 @@ def create_env(
     dataset_type: DatasetType = DatasetType.TRAIN,
     trajectory_key: str = None,
     overfit_idx: Optional[int] = None,
+    eval_env: bool = False,
 ) -> DummyVecEnv:
     """
     Create and configure an AvoidEverything environment.
@@ -160,6 +161,7 @@ def create_env(
         num_workers=cfg["num_workers"],
         random_scale=0.0,  # No noise for RL (clean states)
         overfit_idx=overfit_idx,
+        n_eval_episodes=cfg["n_eval_episodes"] if eval_env else None,
     )
     
     # Wrap with vectorized environment

@@ -5,7 +5,7 @@ Custom Gymnasium environment for training the RL agent.
 
 import random
 import importlib
-from typing import Literal, Any
+from typing import Literal, Any, Optional
 import numpy as np
 import gymnasium as gym
 import numba as nb
@@ -228,6 +228,7 @@ class _AvoidEverythingEnv(gym.Env):
 
         # Store dataset reference
         self.dataloader: DataLoader = dataloader
+        self._dataloader_iter = iter(dataloader) if dataloader is not None else None
 
         # Store URDF path
         self.urdf_path = urdf_path
@@ -313,7 +314,13 @@ class _AvoidEverythingEnv(gym.Env):
 
         # Sample random problem from dataloader
         if self.dataloader is not None:
-            batch = next(iter(self.dataloader))
+            if self._dataloader_iter is None:
+                self._dataloader_iter = iter(self.dataloader)
+            try:
+                batch = next(self._dataloader_iter)
+            except StopIteration:
+                self._dataloader_iter = iter(self.dataloader)
+                batch = next(self._dataloader_iter)
             # Data loader returns a batch dict with tensors of shape (batch_size, ...)
             # Extract and squeeze single sample from batch
             self.problem = {key: val.squeeze(0).numpy() if hasattr(val, 'numpy') else val for key, val in batch.items()}
@@ -816,7 +823,8 @@ class _AvoidEverythingEnv(gym.Env):
         dataset_type: DatasetType,
         num_workers: int = 0,
         random_scale: float = 0.0,
-        overfit_idx: int = None,
+        overfit_idx: Optional[int] = None,
+        n_eval_episodes: Optional[int] = None,
     ):
         """Set up scene generation from a TrajectoryDataset.
 
@@ -831,6 +839,7 @@ class _AvoidEverythingEnv(gym.Env):
             num_workers: Number of workers for the DataLoader (default: 0)
             random_scale: Standard deviation of random noise to add to joints (default: 0.0)
             overfit_idx: If provided, only use this specific trajectory index (for overfitting mode)
+            n_eval_episodes: Number of episodes to evaluate (for evaluation environments) to always evaluate the same scenes
         """
         # Create TrajectoryDataset using environment's robot instance
         dataset = TrajectoryDataset.load_from_directory(
@@ -844,17 +853,22 @@ class _AvoidEverythingEnv(gym.Env):
             random_scale=random_scale,
         )
 
+        shuffle = True
         # Handle overfit mode: create subset with single trajectory
         if overfit_idx is not None:
             dataset = Subset(dataset, [overfit_idx])
+        elif n_eval_episodes:
+            dataset = Subset(dataset, list(range(n_eval_episodes)))
+            shuffle = False
 
         # Create DataLoader with shuffle=True for varied episode resets
         self.dataloader = DataLoader(
             dataset,
             batch_size=1,
-            shuffle=True,
+            shuffle=shuffle,
             num_workers=num_workers,
         )
+        self._dataloader_iter = iter(self.dataloader)
 
         print(f"✓ Set dataloader with {len(dataset)} trajectory start states (q0)")
 
