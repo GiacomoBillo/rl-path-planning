@@ -423,6 +423,7 @@ class MySAC(SACDebug):
         self._original_ent_coef_optimizer = None
         self._original_ent_coef_tensor = None
         self._had_ent_coef_tensor = False
+        self.log_period = 1
 
     @override
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
@@ -434,7 +435,6 @@ class MySAC(SACDebug):
         - Entropy (estimated from -log_prob)
         
         Standard metrics (actor_loss, critic_loss, ent_coef) are also logged.
-        Logs are dumped immediately after training to capture all gradient steps.
         
         Args:
             gradient_steps: Number of gradient steps to perform
@@ -557,11 +557,11 @@ class MySAC(SACDebug):
 
         # === Log standard metrics ===
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/ent_coef", np.mean(ent_coefs))
-        self.logger.record("train/actor_loss", np.mean(actor_losses))
-        self.logger.record("train/critic_loss", np.mean(critic_losses))
+        self.logger.record_mean("train/ent_coef", np.mean(ent_coefs))
+        self.logger.record_mean("train/actor_loss", np.mean(actor_losses))
+        self.logger.record_mean("train/critic_loss", np.mean(critic_losses))
         if len(ent_coef_losses) > 0:
-            self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
+            self.logger.record_mean("train/ent_coef_loss", np.mean(ent_coef_losses))
         
         # === NEW: Log additional metrics (log_std, std, entropy) ===
         # Average across gradient steps
@@ -572,19 +572,22 @@ class MySAC(SACDebug):
         # Log per-joint metrics
         action_dim = log_std_mean_per_joint.shape[0]
         for joint_idx in range(action_dim):
-            self.logger.record(f"train/log_std_joint_{joint_idx}", log_std_mean_per_joint[joint_idx].item())
+            self.logger.record_mean(
+                f"train/log_std_joint_{joint_idx}",
+                log_std_mean_per_joint[joint_idx].item(),
+            )
             # self.logger.record(f"train/std_joint_{joint_idx}", std_mean_per_joint[joint_idx].item())
         
         # Log summary metrics (mean across all joints)
-        self.logger.record("train/log_std_mean", log_std_mean_per_joint.mean().item())
+        self.logger.record_mean("train/log_std_mean", log_std_mean_per_joint.mean().item())
         # self.logger.record("train/std_mean", std_mean_per_joint.mean().item())
         
         # Log entropy
-        self.logger.record("train/entropy", np.mean(entropies))
+        self.logger.record_mean("train/entropy", np.mean(entropies))
         
-        # Force dump to log all metrics immediately
-        # This writes metrics to TensorBoard/WandB at the current timestep
-        self.logger.dump(step=self.num_timesteps)
+        # Dump train metrics every configured number of gradient updates
+        if self._n_updates % self.log_period == 0:
+            self.logger.dump(step=self.num_timesteps)
 
 
     @override
@@ -710,19 +713,19 @@ class MySAC(SACDebug):
         if self._actor_lr_schedule is not None:
             actor_lr = self._actor_lr_schedule(self.num_timesteps)
             update_learning_rate(self.actor.optimizer, actor_lr)
-            self.logger.record("train/actor_learning_rate", actor_lr)
+            self.logger.record_mean("train/actor_learning_rate", actor_lr)
         
         # Update critic LR if custom schedule is set
         if self._critic_lr_schedule is not None:
             critic_lr = self._critic_lr_schedule(self.num_timesteps)
             update_learning_rate(self.critic.optimizer, critic_lr)
-            self.logger.record("train/critic_learning_rate", critic_lr)
+            self.logger.record_mean("train/critic_learning_rate", critic_lr)
         
         # Handle entropy coefficient optimizer if it exists
         if self.ent_coef_optimizer is not None:
             ent_lr = self.lr_schedule(self._current_progress_remaining)
             update_learning_rate(self.ent_coef_optimizer, ent_lr)
-            self.logger.record("train/ent_coef_learning_rate", ent_lr)
+            self.logger.record_mean("train/ent_coef_learning_rate", ent_lr)
 
     def initialize_log_std(self, log_std_value: float = -20.0, state_independent_start: bool = True) -> None:
         """
@@ -776,6 +779,9 @@ class MySAC(SACDebug):
                 e.g. "logs/sac_run_2024-06-01_12-00-00"
         """
         formats = logger_config.get("formats", ["tensorboard"])
+        self.log_period = int(logger_config.get("log_period", 1))
+        if self.log_period <= 0:
+            raise ValueError(f"logger.log_period must be > 0, got {self.log_period}")
         
         # # Use provided run_name or generate new one with timestamp
         # if run_name is None:
@@ -933,6 +939,7 @@ class MySAC(SACDebug):
         self,
         critic_warmup_steps: int,
         callback: BaseCallback,
+        log_interval: int = 1,
         tb_log_name: Optional[str] = None,
     ) -> None:
         """
@@ -966,7 +973,7 @@ class MySAC(SACDebug):
             "total_timesteps": critic_warmup_steps,
             "progress_bar": True,
             "callback": callback,
-            "log_interval": 1,
+            "log_interval": log_interval,
         }
         
         # Only pass tb_log_name if explicitly provided

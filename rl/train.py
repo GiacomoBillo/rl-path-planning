@@ -240,13 +240,18 @@ def main(args, cfg):
         if periodic_eval_callback is not None:
             callbacks.append(periodic_eval_callback)
 
+        log_interval = int(cfg.get("logger", {}).get("log_interval", 1))
+        if log_interval <= 0:
+            raise ValueError(f"logger.log_interval must be > 0, got {log_interval}")
+        print(f"✓ log_interval: {log_interval}")
+
         # Run training
         model.learn(
             total_timesteps=finetuning_steps,
             progress_bar=True,
             callback=callbacks,
             reset_num_timesteps=False,  # Continue counting from loaded checkpoint
-            log_interval=1,  # Log every episode
+            log_interval=log_interval,
         )
         print(f"✓ RL finetuning completed ({finetuning_steps} steps)\n")
 

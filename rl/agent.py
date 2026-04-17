@@ -340,6 +340,10 @@ def main(args: argparse.Namespace, cfg: dict, run: dict) -> None:
     
     # --- Update LRs for critic warmup phase ---
     warmup_steps = cfg["critic_warmup_steps"]
+    log_interval = int(cfg.get("logger", {}).get("log_interval", 1))
+    if log_interval <= 0:
+        raise ValueError(f"logger.log_interval must be > 0, got {log_interval}")
+    print(f"✓ log_interval: {log_interval}")
     warmup_lr_schedule = build_lr_schedule(
         cfg["critic_warmup_lr"],
         phase_start_step=0,
@@ -350,7 +354,8 @@ def main(args: argparse.Namespace, cfg: dict, run: dict) -> None:
     
     # --- Warm-up critic with fixed/frozen actor ---
     model.warmup_critic(cfg["critic_warmup_steps"],
-                        train_callbacks)
+                        train_callbacks,
+                        log_interval=log_interval)
     # save warmuped-up model
     save_path = os.path.join(cfg["save_path"], run["run_name"] + "_warmup_" + run["timestamp"])
     model.save(save_path)
@@ -384,7 +389,7 @@ def main(args: argparse.Namespace, cfg: dict, run: dict) -> None:
         progress_bar=True,
         callback=train_callbacks,
         reset_num_timesteps=False,  # Keep counting timesteps across multiple learn() calls (e.g. critic warmup + main training)
-        log_interval=1,  # Log every episode
+        log_interval=log_interval,
         tb_log_name="rl_finetuning",  # TensorBoard subdirectory for this training phase
     )
     model.monitor_agent("AFTER TRAINING")
