@@ -1,5 +1,7 @@
+import warnings
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv, VecMonitor, is_vecenv_wrapped
 from tqdm import tqdm
 import numpy as np
 from typing import Any, Optional
@@ -96,10 +98,11 @@ class DebugCallback(BaseCallback):
         dones = locals_.get("dones", locals_.get("done", []))
         rewards = locals_.get("rewards", locals_.get("reward", []))
 
-        # 2. Select first env (index 0) in case of parallel envs
-        info = infos[0] if (isinstance(infos, list) and len(infos) > 0) else infos
-        done_val = dones[0] if (isinstance(dones, (list, np.ndarray)) and len(dones) > 0) else dones
-        reward_val = rewards[0] if (isinstance(rewards, (list, np.ndarray)) and len(rewards) > 0) else rewards
+        # 2. Select first env (index 0) in case of parallel envs.
+        # Supports list/tuple containers because SubprocVecEnv may return tuples.
+        info = infos[0] if (isinstance(infos, (list, tuple)) and len(infos) > 0) else infos
+        done_val = dones[0] if (isinstance(dones, (list, tuple, np.ndarray)) and len(dones) > 0) else dones
+        reward_val = rewards[0] if (isinstance(rewards, (list, tuple, np.ndarray)) and len(rewards) > 0) else rewards
 
         # 3. Log steps (only first env to avoid clutter)
         if self.log_steps:
@@ -108,15 +111,14 @@ class DebugCallback(BaseCallback):
             collision = info.get("collision", None) if isinstance(info, dict) else None
             print(f"[{self.description}-step] reward={reward_str} terminated={done_val} collision={collision} info={info_str}")
 
-        # 4. Log episode summary when any episode ends
-        # Handle both single and vectorized environments
-        if isinstance(infos, list) and isinstance(dones, (list, np.ndarray)):
-            # Vectorized environment: check each env
+        # 4. Log episode summary when any episode ends.
+        # Parallel VecEnv branch.
+        if isinstance(infos, (list, tuple)) and isinstance(dones, (list, tuple, np.ndarray)):
             for i, (done_val, info) in enumerate(zip(dones, infos)):
                 if done_val and isinstance(info, dict):
                     self._log_episode_summary(info, i)
         else:
-            # Single environment
+            # Single-env branch.
             if done_val and isinstance(info, dict):
                 self._log_episode_summary(info)
 
@@ -152,6 +154,8 @@ class DebugCallback(BaseCallback):
             return {k: self._format_info(v) for k, v in info.items()}
         elif isinstance(info, list):
             return [self._format_info(x) for x in info]
+        elif isinstance(info, tuple):
+            return tuple(self._format_info(x) for x in info)
         return info
 
     def _log_episode_summary(self, info: dict, env_idx: int = None) -> None:
@@ -206,17 +210,29 @@ class EvalMetricsCallback:
         self.action_abs_means = []
 
     def __call__(self, locals_: dict, globals_: dict) -> None:
-        infos = locals_.get("infos", locals_.get("info", []))
-        dones = locals_.get("dones", locals_.get("done", []))
+        # Single-env callback branch used by SB3 evaluate_policy internals:
+        # it passes scalar `info` and `done` in locals() for each env index.
+        info_single = locals_.get("info")
+        done_single = locals_.get("done")
+        if info_single is not None and done_single is not None:
+            if bool(done_single) and isinstance(info_single, dict):
+                self._consume_info(info_single)
+            return
 
-        if isinstance(infos, list) and isinstance(dones, (list, np.ndarray)):
+        # Parallel VecEnv callback branch (e.g. custom evaluation loops).
+        infos = locals_.get("infos", [])
+        dones = locals_.get("dones", [])
+        if isinstance(infos, (list, tuple)) and isinstance(dones, (list, tuple, np.ndarray)):
             for done, info in zip(dones, infos):
                 if done and isinstance(info, dict):
                     self._consume_info(info)
             return
 
-        if dones and isinstance(infos, dict):
-            self._consume_info(infos)
+        # Fallback single-env branch for code that provides `infos` as dict.
+        if isinstance(infos, dict):
+            done_flag = bool(dones) if not isinstance(dones, np.ndarray) else (bool(dones.item()) if dones.shape == () else False)
+            if done_flag:
+                self._consume_info(infos)
 
     def _consume_info(self, info: dict) -> None:
         self.episodes += 1
@@ -261,8 +277,9 @@ def evaluate_policy_with_metrics(
     n_eval_episodes: int,
     deterministic: bool = True,
     debug_callback: Optional[Any] = None,
+    single_pass_split: bool = True,
 ) -> dict:
-    """Run evaluate_policy once and return reward/length plus aggregated task metrics."""
+    """Run evaluation and return reward/length plus aggregated task metrics."""
     metrics_callback = EvalMetricsCallback()
     metrics_callback.reset()
 
@@ -273,13 +290,13 @@ def evaluate_policy_with_metrics(
             debug_callback(locals_, globals_)
             metrics_callback(locals_, globals_)
 
-    episode_rewards, episode_lengths = evaluate_policy(
-        model,
-        eval_env,
+    episode_rewards, episode_lengths = _evaluate_policy_episode_rewards(
+        model=model,
+        eval_env=eval_env,
         n_eval_episodes=n_eval_episodes,
         deterministic=deterministic,
         callback=callback,
-        return_episode_rewards=True,
+        single_pass_split=single_pass_split,
     )
 
     summary = metrics_callback.summary()
@@ -290,6 +307,95 @@ def evaluate_policy_with_metrics(
         "std_ep_length": float(np.std(episode_lengths)) if episode_lengths else 0.0,
     })
     return summary
+
+
+def _evaluate_policy_episode_rewards(
+    model: Any,
+    eval_env: Any,
+    n_eval_episodes: int,
+    deterministic: bool,
+    callback: Optional[Any],
+    single_pass_split: bool,
+) -> tuple[list[float], list[int]]:
+    """Evaluate policy and return per-episode rewards/lengths with optional one-pass split limits."""
+    if not isinstance(eval_env, VecEnv):
+        eval_env = DummyVecEnv([lambda: eval_env])
+
+    is_monitor_wrapped = is_vecenv_wrapped(eval_env, VecMonitor) or eval_env.env_is_wrapped(Monitor)[0]
+    n_envs = eval_env.num_envs
+    episode_count_targets = np.array([(n_eval_episodes + i) // n_envs for i in range(n_envs)], dtype="int")
+
+    if single_pass_split:
+        try:
+            split_sizes = np.asarray(eval_env.env_method("get_num_split_samples"), dtype="int")
+        except Exception as exc:
+            warnings.warn(
+                f"single_pass_split=True requested but eval env does not expose split sizes "
+                f"(error: {type(exc).__name__}). Falling back to standard episode targets.",
+                UserWarning,
+            )
+            split_sizes = None
+        if split_sizes is None:
+            split_sizes = episode_count_targets.copy()
+        episode_count_targets = np.minimum(episode_count_targets, split_sizes)
+        reduced_total = int(np.sum(episode_count_targets))
+        if reduced_total < n_eval_episodes:
+            warnings.warn(
+                f"Requested n_eval_episodes={n_eval_episodes}, but one-pass split mode limits "
+                f"evaluation to {reduced_total} episodes (sum of per-env split caps).",
+                UserWarning,
+            )
+        if reduced_total <= 0:
+            raise ValueError("No evaluation episodes available in one-pass split mode.")
+
+    episode_rewards: list[float] = []
+    episode_lengths: list[int] = []
+    episode_counts = np.zeros(n_envs, dtype="int")
+    current_rewards = np.zeros(n_envs)
+    current_lengths = np.zeros(n_envs, dtype="int")
+
+    observations = eval_env.reset()
+    states = None
+    episode_starts = np.ones((n_envs,), dtype=bool)
+
+    while (episode_counts < episode_count_targets).any():
+        actions, states = model.predict(
+            observations,
+            state=states,
+            episode_start=episode_starts,
+            deterministic=deterministic,
+        )
+        new_observations, rewards, dones, infos = eval_env.step(actions)
+        current_rewards += rewards
+        current_lengths += 1
+
+        for i in range(n_envs):
+            if episode_counts[i] >= episode_count_targets[i]:
+                continue
+
+            # Keep local names aligned with SB3 evaluate_policy callback locals.
+            reward = rewards[i]
+            done = dones[i]
+            info = infos[i]
+            episode_starts[i] = done
+
+            if callback is not None:
+                callback(locals(), globals())
+
+            if done:
+                if is_monitor_wrapped and "episode" in info:
+                    episode_rewards.append(info["episode"]["r"])
+                    episode_lengths.append(info["episode"]["l"])
+                else:
+                    episode_rewards.append(float(current_rewards[i]))
+                    episode_lengths.append(int(current_lengths[i]))
+                episode_counts[i] += 1
+                current_rewards[i] = 0
+                current_lengths[i] = 0
+
+        observations = new_observations
+
+    return episode_rewards, episode_lengths
 
 
 class PeriodicEvalMetricsCallback(BaseCallback):

@@ -12,14 +12,23 @@ num_robot_points: 2048
 action_chunk_length: 1
 
 # Environment
-terminate_ep_on_collision: true  # Whether to end the episode immediately upon collision (default: true)
-action_delta_clip: 0.2  # Hard clip joint deltas
-# reward = magnitude * (goal_weight * goal + collision_weight * collision + goal_distance_weight * exp(-position_error/position_threshold) * exp(-orientation_error/orientation_threshold))
-reward: 
-  total_magnitude: 1.0
-  goal_weight: 1.0
-  collision_weight: -1.0      # must be <= 0
-  goal_distance_weight: 0.01   # set >0 to add dense distance penalty, if =0 is disabled
+env:
+  terminate_ep_on_collision: true  # Whether to end the episode immediately upon collision
+  action_delta_clip: 0.2  # Hard clip joint deltas
+  # reward = magnitude * (goal_weight * goal + collision_weight * collision + goal_distance_weight * exp(-position_error/position_threshold) * exp(-orientation_error/orientation_threshold))
+  reward: 
+    total_magnitude: 1.0
+    goal_weight: 1.0
+    collision_weight: -1.0      # must be <= 0
+    goal_distance_weight: 0.0   # set >0 to add dense distance penalty, if =0 is disabled
+
+  vec_env_type: "subproc"            # "dummy" | "subproc"
+  n_envs: 6                        # Default env count when role-specific values are omitted
+  # train_n_envs: 1
+  # eval_n_envs: 1
+  # subproc_start_method: null       # null = SB3 default ("forkserver"/"spawn" depending on platform)
+  num_workers: 0                   # DataLoader workers per env process
+  subproc_dataset_num_workers: 0   # Conservative default to avoid nested multiprocessing
 
 # BC checkpoint (pre-trained AvoidEverything policy, for warm-start)
 # bc_checkpoint_parameters are baked into the checkpoint — they must match the architecture used during training and cannot be changed independently.
@@ -40,7 +49,7 @@ bc_checkpoint_parameters:
 
 # SAC / RL
 freeze_bc_encoder: true  # Freeze BC encoder during initial RL training; call extractor.unfreeze() to fine-tune end-to-end
-seed: 42
+seed: 42  # Single seed source for both SB3 model and VecEnv seeding
 n_eval_episodes: 10
 save_dir: ./checkpoints  # Base directory for checkpoints (structure: save_dir/experiment_group/timestamp_phase.zip)
 buffer_size: 1000

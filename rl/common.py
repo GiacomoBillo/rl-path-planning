@@ -31,7 +31,7 @@ import torch
 import yaml
 from dotenv import load_dotenv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 import wandb
 
 from avoid_everything.pretraining import PretrainingMotionPolicyTransformer
@@ -108,30 +108,22 @@ def setup_run_directory(cfg_path: str, cfg: dict, phase: str = "") -> dict:
     return run_info
 
 
-def create_env(
+def _create_single_env(
     cfg: dict,
+    env_cfg: dict,
+    *,
     render: bool = False,
     dataset_type: DatasetType = DatasetType.TRAIN,
-    trajectory_key: str = None,
+    trajectory_key: Optional[str] = None,
     overfit_idx: Optional[int] = None,
     eval_env: bool = False,
-) -> DummyVecEnv:
-    """
-    Create and configure an AvoidEverything environment.
-    
-    Args:
-        cfg: Configuration dictionary
-        render: Whether to render the environment
-        dataset_type: Type of dataset (TRAIN or VAL)
-        trajectory_key: Key for trajectory in dataset (defaults to cfg['train_trajectory_key'] or cfg['val_trajectory_key'])
-        overfit_idx: Optional index for overfitting mode
-        
-    Returns:
-        Vectorized environment wrapped with Monitor and DummyVecEnv
-    """
+    env_idx: int = 0,
+    total_env_number: int = 1,
+) -> Monitor:
+    """Create one Monitor-wrapped environment instance."""
     render_mode = "human" if render else None
     render_backend = "ros"
-    
+
     # Monitor with info_keywords to capture episode-level metrics
     info_keywords = (
         "target_reached", "collision", "position_error", "orientation_error",
@@ -140,35 +132,133 @@ def create_env(
         "episode_limit_violation_rate", "episode_action_clip_violation_rate",
         "episode_action_abs_mean",
     )
-    
+
     env = Monitor(
         AvoidEverythingEnv(
-            render_mode=render_mode, 
+            render_mode=render_mode,
             render_backend=render_backend,
-            terminate_ep_on_collision=cfg.get("terminate_ep_on_collision", True),
-            reward_config=cfg.get("reward"),
-            action_delta_clip=cfg.get("action_delta_clip", 0.2),
+            terminate_ep_on_collision=env_cfg.get("terminate_ep_on_collision", True),
+            reward_config=env_cfg.get("reward"),
+            action_delta_clip=env_cfg.get("action_delta_clip", 0.2),
         ),
         info_keywords=info_keywords
     )
-    
+
     # Set up dataset
     if trajectory_key is None:
         trajectory_key = cfg["train_trajectory_key"] if dataset_type == DatasetType.TRAIN else cfg["val_trajectory_key"]
-    
+
     env.unwrapped.set_scene_generation_from_dataset(
         data_dir=cfg["data_dir"],
         trajectory_key=trajectory_key,
         dataset_type=dataset_type,
-        num_workers=cfg["num_workers"],
+        num_workers=env_cfg.get("num_workers", 0),
         random_scale=0.0,  # No noise for RL (clean states)
         overfit_idx=overfit_idx,
         n_eval_episodes=cfg["n_eval_episodes"] if eval_env else None,
+        env_idx=env_idx,
+        total_env_number=total_env_number,
     )
-    
-    # Wrap with vectorized environment
-    env = DummyVecEnv([lambda: env])
-    
+
+    return env
+
+
+def create_env(
+    cfg: dict,
+    render: bool = False,
+    dataset_type: DatasetType = DatasetType.TRAIN,
+    trajectory_key: Optional[str] = None,
+    overfit_idx: Optional[int] = None,
+    env_role: str = "train",
+    env_cfg: Optional[dict] = None,
+) -> VecEnv:
+    """
+    Create and configure a vectorized AvoidEverything environment.
+
+    Keeps Gymnasium API at the environment level and delegates VecEnv API handling
+    to SB3 wrappers (DummyVecEnv/SubprocVecEnv).
+
+    Args:
+        cfg: Configuration dictionary
+        render: Whether to render the environment
+        dataset_type: Type of dataset (TRAIN or VAL)
+        trajectory_key: Key for trajectory in dataset
+        overfit_idx: Optional index for overfitting mode
+        env_role: Role-specific config selector ("train" or "eval")
+
+    Returns:
+        SB3 VecEnv instance (DummyVecEnv or SubprocVecEnv)
+    """
+    env_cfg = env_cfg if env_cfg is not None else cfg.get("env", {})
+    if not isinstance(env_cfg, dict):
+        raise ValueError("env_cfg must be a dictionary.")
+
+    n_envs = int(env_cfg.get(f"{env_role}_n_envs", env_cfg.get("n_envs", 1)))
+    if n_envs < 1:
+        raise ValueError(f"{env_role}_n_envs must be >= 1, got {n_envs}")
+
+    vec_env_type = str(
+        env_cfg.get(f"{env_role}_vec_env_type", env_cfg.get("vec_env_type", "dummy"))
+    ).lower()
+    if vec_env_type not in {"dummy", "subproc"}:
+        raise ValueError(
+            f"Unsupported vec_env_type={vec_env_type!r}. Expected 'dummy' or 'subproc'."
+        )
+
+    # Rendering with subprocess workers is fragile for ROS/PyBullet visualization.
+    if render and vec_env_type == "subproc":
+        print(
+            f"⚠  {env_role}: render=True is incompatible with SubprocVecEnv in this setup; "
+            "falling back to DummyVecEnv."
+        )
+        vec_env_type = "dummy"
+
+    dataset_num_workers = int(env_cfg.get("num_workers", 0))
+    if vec_env_type == "subproc":
+        # Avoid nested multiprocessing by default (SubprocVecEnv workers + DataLoader workers).
+        dataset_num_workers = int(env_cfg.get("subproc_dataset_num_workers", 0))
+        if dataset_num_workers == 0 and int(env_cfg.get("num_workers", 0)) != 0:
+            print(
+                f"⚠  {env_role}: using subproc_dataset_num_workers=0 to avoid nested multiprocessing."
+            )
+
+    def make_env_fn(env_idx: int):
+        def _init():
+            env = _create_single_env(
+                cfg,
+                {
+                    **env_cfg,
+                    "num_workers": dataset_num_workers,
+                },
+                render=render,
+                dataset_type=dataset_type,
+                trajectory_key=trajectory_key,
+                overfit_idx=overfit_idx,
+                env_idx=env_idx,
+                total_env_number=n_envs,
+                eval_env=(env_role == "eval"),
+            )
+            return env
+
+        return _init
+
+    env_fns = [make_env_fn(i) for i in range(n_envs)]
+    if vec_env_type == "subproc":
+        start_method = env_cfg.get("subproc_start_method", None)
+        env: VecEnv = SubprocVecEnv(env_fns, start_method=start_method)
+    else:
+        env = DummyVecEnv(env_fns)
+
+    # Single source of truth for env seeding: top-level cfg["seed"].
+    base_seed = cfg.get("seed", None)
+    if base_seed is not None:
+        # Note: env seed also set in SB3 BaseAlgorithm, but duplicated here for safety
+        env.seed(int(base_seed))  
+
+    print(
+        f"✓ Created {env_role} VecEnv: type={vec_env_type}, n_envs={n_envs}, "
+        f"dataset_num_workers={dataset_num_workers}"
+    )
     return env
 
 
@@ -196,7 +286,7 @@ def load_bc_checkpoint(cfg: dict, verbose=True) -> PretrainingMotionPolicyTransf
 
 
 def bootstrap_sac_from_bc(
-    env: DummyVecEnv,
+    env: VecEnv,
     cfg: dict,
     bc_model: PretrainingMotionPolicyTransformer,
     run_dir: str,
@@ -420,7 +510,7 @@ def save_checkpoint_with_metadata(
 def load_checkpoint_with_metadata(
     checkpoint_path: str,
     cfg: dict,
-    env: Optional[DummyVecEnv] = None,
+    env: Optional[VecEnv] = None,
     load_replay_buffer: bool = False,
 ) -> Tuple[MySAC, Optional[Dict[str, Any]]]:
     """

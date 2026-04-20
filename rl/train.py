@@ -122,13 +122,16 @@ def main(args, cfg):
             render=args.render,
             dataset_type=DatasetType.TRAIN,
             overfit_idx=overfit_idx,
+            env_role="train",
+            env_cfg=cfg["env"],
         )
         eval_env = create_env(
             cfg,
             render=args.render,
             dataset_type=DatasetType.TRAIN,
             overfit_idx=overfit_idx,
-            eval_env=True, 
+            env_role="eval",
+            env_cfg=cfg["env"],
         )
         print("✓ Environments created")
 

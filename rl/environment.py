@@ -860,7 +860,10 @@ class _AvoidEverythingEnv(gym.Env):
         num_workers: int = 0,
         random_scale: float = 0.0,
         overfit_idx: Optional[int] = None,
-        n_eval_episodes: Optional[int] = None,
+        n_eval_episodes: Optional[int] | None = None,
+        shuffle: bool = True,
+        env_idx: int = 0,
+        total_env_number: int = 1,
     ):
         """Set up scene generation from a TrajectoryDataset.
 
@@ -876,6 +879,9 @@ class _AvoidEverythingEnv(gym.Env):
             random_scale: Standard deviation of random noise to add to joints (default: 0.0)
             overfit_idx: If provided, only use this specific trajectory index (for overfitting mode)
             n_eval_episodes: Number of episodes to evaluate (for evaluation environments) to always evaluate the same scenes
+            shuffle: Whether to shuffle samples in DataLoader
+            env_idx: Current environment index for deterministic dataset splitting
+            total_env_number: Total number of environments used in parallel
         """
         # Create TrajectoryDataset using environment's robot instance
         dataset = TrajectoryDataset.load_from_directory(
@@ -897,7 +903,29 @@ class _AvoidEverythingEnv(gym.Env):
             dataset = Subset(dataset, list(range(n_eval_episodes)))
             shuffle = False
 
-        # Create DataLoader with shuffle=True for varied episode resets
+        # split dataset across parallel envs
+        if overfit_idx is None and total_env_number > 1:
+            if env_idx < 0 or env_idx >= total_env_number:
+                raise ValueError(
+                    f"env_idx must be in [0, {total_env_number - 1}], got {env_idx}"
+                )
+            total_len = len(dataset)
+            len_split = (total_len + total_env_number - 1) // total_env_number
+            start = env_idx * len_split
+            end = min(start + len_split, len(dataset))
+            if start >= total_len:
+                raise ValueError(
+                    f"Dataset split for env_idx={env_idx} is empty "
+                    f"(total_len={total_len}, total_env_number={total_env_number})."
+                )
+            indices_split = list(range(start, end))
+            dataset = Subset(dataset, indices_split)
+            print(
+                f"✓ Environment {env_idx}/{total_env_number} using split indices "
+                f"[{start}:{end}] out of {total_len} total samples"
+            )
+
+        # Create DataLoader for episode resets.
         self.dataloader = DataLoader(
             dataset,
             batch_size=1,
@@ -906,7 +934,11 @@ class _AvoidEverythingEnv(gym.Env):
         )
         self._dataloader_iter = iter(self.dataloader)
 
-        print(f"✓ Set dataloader with {len(dataset)} trajectory start states (q0)")
+    def get_num_split_samples(self) -> int:
+        """Return number of samples in this env split."""
+        if self.dataloader is None:
+            return 0
+        return len(self.dataloader.dataset)
 
 
 
