@@ -13,6 +13,7 @@ action_chunk_length: 1
 
 # Environment
 terminate_ep_on_collision: true  # Whether to end the episode immediately upon collision (default: true)
+action_delta_clip: 0.2  # Hard clip joint deltas
 # reward = magnitude * (goal_weight * goal + collision_weight * collision + goal_distance_weight * exp(-position_error/position_threshold) * exp(-orientation_error/orientation_threshold))
 reward: 
   total_magnitude: 1.0

@@ -6,6 +6,7 @@ Custom Gymnasium environment for training the RL agent.
 import random
 import importlib
 from typing import Literal, Any, Optional
+from collections.abc import Sequence
 import numpy as np
 import gymnasium as gym
 import numba as nb
@@ -62,6 +63,22 @@ def build_reward_config(reward_config: dict[str, Any] | None) -> dict[str, float
     }
 
 
+def build_action_delta_clip(action_delta_clip: float | Sequence[float], dof: int) -> np.ndarray:
+    """Build per-joint hard-clip bounds from scalar or sequence config."""
+    if isinstance(action_delta_clip, (int, float)):
+        clip = float(action_delta_clip)
+        if clip <= 0:
+            raise ValueError("action_delta_clip must be > 0.")
+        return np.full((dof,), clip, dtype=np.float32)
+
+    clip_array = np.asarray(action_delta_clip, dtype=np.float32)
+    if clip_array.shape != (dof,):
+        raise ValueError(f"action_delta_clip sequence must have shape {(dof,)}, got {clip_array.shape}.")
+    if np.any(clip_array <= 0):
+        raise ValueError("All action_delta_clip values must be > 0.")
+    return clip_array
+
+
 class AvoidEverythingEnv(TimeLimit):
     """
     Public environment: wraps `_AvoidEverythingEnv` with Gymnasium's `TimeLimit`.
@@ -93,6 +110,7 @@ class AvoidEverythingEnv(TimeLimit):
         highlight_collisions: bool = True,
         terminate_ep_on_collision: bool = True,
         reward_config: dict | None = None,
+        action_delta_clip: float | Sequence[float] = 0.2,
     ):
         """Initialize environment with an automatic TimeLimit wrapper.
 
@@ -113,6 +131,7 @@ class AvoidEverythingEnv(TimeLimit):
             highlight_collisions: whether to highlight the robot in red when in collision (only applies to render_backend='ros')
             terminate_ep_on_collision: whether collisions terminate the episode (default True)
             reward_config: optional reward configuration block.
+            action_delta_clip: hard clip bound(s) for joint deltas.
         """
         # instantiate the base env
         env = _AvoidEverythingEnv(
@@ -131,6 +150,7 @@ class AvoidEverythingEnv(TimeLimit):
             highlight_collisions=highlight_collisions,
             terminate_ep_on_collision=terminate_ep_on_collision,
             reward_config=reward_config,
+            action_delta_clip=action_delta_clip,
         )
         # apply time limit wrapper
         super().__init__(env, max_episode_steps=max_episode_steps)
@@ -204,6 +224,7 @@ class _AvoidEverythingEnv(gym.Env):
         highlight_collisions: bool = True,
         terminate_ep_on_collision: bool = True,
         reward_config: dict | None = None,
+        action_delta_clip: float | Sequence[float] = 0.2,
     ):
         """Initialize environment.
         Args:
@@ -223,6 +244,7 @@ class _AvoidEverythingEnv(gym.Env):
             highlight_collisions: whether to highlight the robot in red when in collision (only applies to render_backend='ros')
             terminate_ep_on_collision: whether collisions terminate the episode (default True)
             reward_config: optional reward configuration block.
+            action_delta_clip: hard clip bound(s) for joint deltas.
         """
         super().__init__()
 
@@ -293,6 +315,7 @@ class _AvoidEverythingEnv(gym.Env):
 
         # Action space: normalized joint deltas [-1, 1] for main DOF
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.robot.MAIN_DOF,), dtype=np.float32,)
+        self.action_delta_clip = build_action_delta_clip(action_delta_clip, self.robot.MAIN_DOF)
         self.reward_config = build_reward_config(reward_config)
         self.terminate_ep_on_collision = terminate_ep_on_collision
 
@@ -344,7 +367,8 @@ class _AvoidEverythingEnv(gym.Env):
         self.episode_num_steps = 0
         self.episode_num_collisions = 0
         self.episode_return = 0.0  # cumulative reward
-        self.episode_limit_violation_sum = 0.0  # cumulative amount of config clipping due to joint limits
+        self.episode_limit_violation_count = 0  # number of clipped joint-components due to config limits
+        self.episode_action_clip_violation_count = 0  # number of clipped joint-components due to action delta clip
         self.episode_action_abs_sum = np.zeros(self.robot.MAIN_DOF, dtype=np.float32)  # cumulative abs(delta q) per joint
         return obs, info
 
@@ -353,6 +377,7 @@ class _AvoidEverythingEnv(gym.Env):
 
         Args:
             action (np.array): array of shape (MAIN_DOF,) with values in [-1, 1], representing normalized joint deltas.
+                Executed deltas are clipped to +/- action_delta_clip.
 
         Returns:
             obs (dict): dict with keys "point_cloud", "point_cloud_labels", "configuration"
@@ -361,25 +386,34 @@ class _AvoidEverythingEnv(gym.Env):
             truncated (bool): whether episode is truncated
             info (dict): dict with additional info
         """
+        action = np.asarray(action, dtype=np.float32)
         # check action dimension
         assert action.shape == (self.robot.MAIN_DOF,), f"Expected action shape {(self.robot.MAIN_DOF,)}, got {action.shape}"
 
-        # Apply action to configuration
-        upclipped_config = self.robot_config + action
+        # Clip per-step deltas before applying them
+        clipped_action = np.clip(action, -self.action_delta_clip, self.action_delta_clip)
+        action_clip_violations = np.abs(action - clipped_action)
+        self.episode_action_clip_violation_count += int(np.count_nonzero(action_clip_violations > 0))
+
+        # Apply clipped action to configuration
+        upclipped_config = self.robot_config + clipped_action
         # Clip action to make robot config in valid bounds
         clipped_config = np.clip(upclipped_config, -1.0, 1.0)
         self.robot_config = clipped_config
         self.episode_num_steps += 1
+        denom = float(self.episode_num_steps * self.robot.MAIN_DOF)
 
         # Action magnitude tracking (per-joint abs(delta q))
-        action_abs = np.abs(action)
+        action_abs = np.abs(clipped_action)
         self.episode_action_abs_sum += action_abs
         episode_action_abs_mean = self.episode_action_abs_sum / self.episode_num_steps
+        episode_action_clip_violation_rate = self.episode_action_clip_violation_count / denom
 
         # joint limit violation
         limit_violations = np.abs(clipped_config - upclipped_config)  # How much was the action clipped?
         # Accumulate the total magnitude of violations for this episode
-        self.episode_limit_violation_sum += np.sum(limit_violations)
+        self.episode_limit_violation_count += int(np.count_nonzero(limit_violations > 0))
+        episode_limit_violation_rate = self.episode_limit_violation_count / denom
         # TODO: penalize if action push joint config out of bounds? reward
 
         # Check for collision and target reaching
@@ -400,12 +434,14 @@ class _AvoidEverythingEnv(gym.Env):
                 "target_reached": target_reached, 
                 "position_error": pos_err, 
                 "orientation_error": orien_err, 
+                "action_clip_violations": action_clip_violations,
                 "limit_violations": limit_violations,
                 # episode metrics
                 "episode_num_collisions": self.episode_num_collisions,
                 "episode_num_steps": self.episode_num_steps,
                 "episode_return": self.episode_return,
-                "episode_limit_violation_sum": self.episode_limit_violation_sum,
+                "episode_action_clip_violation_rate": episode_action_clip_violation_rate,
+                "episode_limit_violation_rate": episode_limit_violation_rate,
                 "episode_action_abs_sum": self.episode_action_abs_sum,
                 "episode_action_abs_mean": episode_action_abs_mean,
                 "reward": reward,

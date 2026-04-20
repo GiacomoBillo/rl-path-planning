@@ -608,7 +608,8 @@ class MySAC(SACDebug):
         - task/position_error: Position error at episode end (meters)
         - task/orientation_error: Orientation error at episode end (radians)
         - task/timeout: Whether episode was truncated due to max steps (bool: 0 or 1)
-        - task/limit_violation_sum: Magnitude of joint configuration clipping due to joint limits, cumulated in episode (float)
+        - task/limit_violation_rate: Fraction of joint-components clipped by joint limits over the episode
+        - task/action_clip_violation_rate: Fraction of joint-components clipped by action_delta_clip over the episode
         - task/action_abs_mean_j*: Episode mean abs(delta q) per joint
         - task/action_abs_mean: Episode mean abs(delta q), averaged across joints
         
@@ -646,7 +647,8 @@ class MySAC(SACDebug):
             self.logger.record("task/timeout", float(latest_episode["TimeLimit.truncated"]))
 
             # Joint limit violation
-            self.logger.record("task/limit_violation_sum", latest_episode["episode_limit_violation_sum"])
+            self.logger.record("task/limit_violation_rate", latest_episode["episode_limit_violation_rate"])
+            self.logger.record("task/action_clip_violation_rate", latest_episode["episode_action_clip_violation_rate"])
 
             # Episode action magnitude (abs(delta q))
             action_abs_mean = np.asarray(latest_episode["episode_action_abs_mean"], dtype=np.float32)

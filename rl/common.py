@@ -136,7 +136,8 @@ def create_env(
     info_keywords = (
         "target_reached", "collision", "position_error", "orientation_error",
         "episode_num_collisions", "episode_num_steps", "episode_return",
-        "TimeLimit.truncated", "episode_limit_violation_sum",
+        "TimeLimit.truncated", 
+        "episode_limit_violation_rate", "episode_action_clip_violation_rate",
         "episode_action_abs_mean",
     )
     
@@ -146,6 +147,7 @@ def create_env(
             render_backend=render_backend,
             terminate_ep_on_collision=cfg.get("terminate_ep_on_collision", True),
             reward_config=cfg.get("reward"),
+            action_delta_clip=cfg.get("action_delta_clip", 0.2),
         ),
         info_keywords=info_keywords
     )
