@@ -1070,7 +1070,7 @@ class MySAC(SACDebug):
             Tuple of (transitions_added, episodes_added, mean_reward, mean_length, num_collisions)
         """
         if target_transitions <= 0:
-            return 0, 0, 0.0, 0.0
+            return 0, 0, 0.0, 0.0, 0
 
         env = self.get_env()
         if env is None:
@@ -1103,22 +1103,15 @@ class MySAC(SACDebug):
                 self.log_action_sampling(obs, actions, step=transitions_added, deterministic=force_deterministic)
             
             next_obs, rewards, dones, infos = env.step(actions)
-            
-            # Store one transition per env until the transition target is reached.
-            progress_delta = 0
+
+            # ReplayBuffer for VecEnv expects one batched add per env step.
+            self.replay_buffer.add(obs, next_obs, actions, rewards, dones, infos)
+
+            transitions_added += n_envs
+            progress_delta = min(n_envs, target_transitions - transitions_added)
+
+            # per-env metrics
             for i in range(n_envs):
-                if transitions_added >= target_transitions:
-                    break
-
-                obs_i = {k: np.array(v[i : i + 1]) for k, v in obs.items()}
-                next_obs_i = {k: np.array(v[i : i + 1]) for k, v in next_obs.items()}
-                action_i = np.array(actions[i : i + 1], dtype=np.float32)
-                reward_i = np.array([rewards[i]], dtype=np.float32)
-                done_i = np.array([dones[i]], dtype=np.float32)
-
-                self.replay_buffer.add(obs_i, next_obs_i, action_i, reward_i, done_i, [infos[i]])
-                transitions_added += 1
-                progress_delta += 1
                 num_collisions += int(infos[i].get("collision", False))
                 current_rewards[i] += rewards[i]
                 current_lengths[i] += 1
