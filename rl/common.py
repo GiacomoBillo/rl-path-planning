@@ -259,6 +259,7 @@ def bootstrap_sac_from_bc(
         buffer_size=cfg["buffer_size"],
         learning_starts=0,  # Start training immediately with BC policy
         batch_size=cfg["batch_size"],
+        gradient_steps=cfg["gradient_steps"],
         ent_coef=cfg["entropy_coef"],
         target_entropy=cfg["target_entropy"],
         policy_kwargs=policy_kwargs,

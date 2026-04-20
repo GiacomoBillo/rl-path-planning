@@ -195,8 +195,10 @@ def main(args, cfg):
         print(f"Target entropy: {model.target_entropy}")
         raw_freq = cfg["train_freq"]
         parsed_train_freq = tuple(raw_freq) if isinstance(raw_freq, list) else raw_freq
+        gradient_steps = int(cfg.get("gradient_steps", model.gradient_steps))
         model.train_freq = parsed_train_freq  # Update train_freq for finetuning phase
         model._convert_train_freq()
+        model.gradient_steps = gradient_steps
 
         model.update_learning_rates(
             actor_schedule=actor_lr_schedule,

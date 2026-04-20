@@ -46,6 +46,7 @@ save_dir: ./checkpoints  # Base directory for checkpoints (structure: save_dir/e
 buffer_size: 1000
 batch_size: 16  # Increased from 1 to reduce gradient variance
 train_freq: [1, "step"] # int | Tuple[int, str] , Update the model every ... (n, "step") or (n, "episode")
+gradient_steps: 1  # Number of gradient updates to perform after each train_freq
 
 # Prefill buffer with current policy rollouts
 transitions_before_learn: 200  # Prefill replay buffer with transitions before learn()
