@@ -811,13 +811,25 @@ class _AvoidEverythingEnv(gym.Env):
         if overfit_idx is not None:
             dataset = Subset(dataset, [overfit_idx])
         elif total_env_number > 1:
+            if env_idx < 0 or env_idx >= total_env_number:
+                raise ValueError(
+                    f"env_idx must be in [0, {total_env_number - 1}], got {env_idx}"
+                )
             total_len = len(dataset)
             len_split = (total_len + total_env_number - 1) // total_env_number
             start = env_idx * len_split
             end = min(start + len_split, len(dataset))
+            if start >= total_len:
+                raise ValueError(
+                    f"Dataset split for env_idx={env_idx} is empty "
+                    f"(total_len={total_len}, total_env_number={total_env_number})."
+                )
             indices_split = list(range(start, end))
             dataset = Subset(dataset, indices_split)
-            print(f"✓ Environment {env_idx}/{total_env_number} using dataset indices [{start}:{end}] out of {total_len} total samples")
+            print(
+                f"✓ Environment {env_idx}/{total_env_number} using split indices "
+                f"[{start}:{end}] out of {total_len} total samples"
+            )
 
         # Create DataLoader for episode resets.
         self.dataloader = DataLoader(
@@ -827,6 +839,12 @@ class _AvoidEverythingEnv(gym.Env):
             num_workers=num_workers,
         )
         self._dataloader_iter = iter(self.dataloader)
+
+    def get_num_split_samples(self) -> int:
+        """Return number of samples in this env split."""
+        if self.dataloader is None:
+            return 0
+        return len(self.dataloader.dataset)
 
 
 
