@@ -5,7 +5,7 @@ Custom Gymnasium environment for training the RL agent.
 
 import random
 import importlib
-from typing import Literal, Any, Optional
+from typing import Literal, Optional
 from collections.abc import Sequence
 import numpy as np
 import gymnasium as gym
@@ -28,40 +28,12 @@ from avoid_everything.data_loader import StateDataset, TrajectoryDataset
 from avoid_everything.type_defs import DatasetType
 from torch.utils.data import Subset
 from pathlib import Path
+from rl.reward import RewardCalculator
 
 import viz_client
 from utils.visualization import visualize_problem
 
 BYPASS_LAZY_ROS_RENDER = True # if True, always publish the full scene on each render call instead of only on the first call per episode. 
-
-
-
-def build_reward_config(reward_config: dict[str, Any] | None) -> dict[str, float]:
-    reward_config = reward_config or {}
-    if not isinstance(reward_config, dict):
-        raise ValueError("reward_config must be a dict when provided.")
-
-    total_magnitude = float(reward_config.get("total_magnitude", 1.0))
-    goal_weight = float(reward_config.get("goal_weight", 1.0))
-    collision_weight = float(reward_config.get("collision_weight", -1.0))
-    goal_distance_weight = float(reward_config.get("goal_distance_weight", 0.0))
-
-    if total_magnitude <= 0:
-        raise ValueError("reward.total_magnitude must be > 0.")
-    if goal_weight < 0:
-        raise ValueError("reward.goal_weight must be >= 0.")
-    if collision_weight > 0:
-        raise ValueError("reward.collision_weight must be <= 0.")
-    if goal_distance_weight < 0:
-        raise ValueError("reward.goal_distance_weight must be >= 0.")
-
-    return {
-        "total_magnitude": total_magnitude,
-        "goal_weight": goal_weight,
-        "collision_weight": collision_weight,
-        "goal_distance_weight": goal_distance_weight,
-    }
-
 
 def build_action_delta_clip(action_delta_clip: float | Sequence[float], dof: int) -> np.ndarray:
     """Build per-joint hard-clip bounds from scalar or sequence config."""
@@ -316,7 +288,11 @@ class _AvoidEverythingEnv(gym.Env):
         # Action space: normalized joint deltas [-1, 1] for main DOF
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.robot.MAIN_DOF,), dtype=np.float32,)
         self.action_delta_clip = build_action_delta_clip(action_delta_clip, self.robot.MAIN_DOF)
-        self.reward_config = build_reward_config(reward_config)
+        self.reward_calculator = RewardCalculator(
+            reward_config=reward_config,
+            position_threshold=self.position_threshold,
+            orientation_threshold=self.orientation_threshold,
+        )
         self.terminate_ep_on_collision = terminate_ep_on_collision
 
         # Render setup
@@ -370,6 +346,7 @@ class _AvoidEverythingEnv(gym.Env):
         self.episode_limit_violation_count = 0  # number of clipped joint-components due to config limits
         self.episode_action_clip_violation_count = 0  # number of clipped joint-components due to action delta clip
         self.episode_action_abs_sum = np.zeros(self.robot.MAIN_DOF, dtype=np.float32)  # cumulative abs(delta q) per joint
+        self.reward_calculator.reset()
         return obs, info
 
     def step(self, action):
@@ -411,20 +388,29 @@ class _AvoidEverythingEnv(gym.Env):
 
         # joint limit violation
         limit_violations = np.abs(clipped_config - upclipped_config)  # How much was the action clipped?
+        joint_limit_violation = float(np.mean(limit_violations))
         # Accumulate the total magnitude of violations for this episode
         self.episode_limit_violation_count += int(np.count_nonzero(limit_violations > 0))
         episode_limit_violation_rate = self.episode_limit_violation_count / denom
-        # TODO: penalize if action push joint config out of bounds? reward
 
         # Check for collision and target reaching
-        collision = self._check_collision()
+        collision, sdf_obstacles, sdf_self_collision = self._compute_collision_metrics()
         self.collision = collision
         self.episode_num_collisions += int(collision)
         target_reached, pos_err, orien_err = self._check_target_reached()
         
         # Get new observation, compute reward, check termination and truncation
         obs = self._get_obs()
-        reward, reward_terms = self._compute_reward(collision, target_reached, pos_err, orien_err)
+        reward, reward_terms = self._compute_reward(
+            collision=collision,
+            target_reached=target_reached,
+            position_error=pos_err,
+            orientation_error=orien_err,
+            action=action,
+            joint_limit_violation=limit_violations,
+            sdf_obstacles=sdf_obstacles,
+            sdf_self_collision=sdf_self_collision,
+        )
         self.episode_return += reward
         terminated = self._check_terminated_ep(collision, target_reached)
         truncated = False # truncation applyed via TimeLimit wrapper, not handled here
@@ -436,6 +422,9 @@ class _AvoidEverythingEnv(gym.Env):
                 "orientation_error": orien_err, 
                 "action_clip_violations": action_clip_violations,
                 "limit_violations": limit_violations,
+                "joint_limit_violation": joint_limit_violation,
+                "sdf_obstacles": sdf_obstacles,
+                "sdf_self_collision": sdf_self_collision,
                 # episode metrics
                 "episode_num_collisions": self.episode_num_collisions,
                 "episode_num_steps": self.episode_num_steps,
@@ -579,6 +568,43 @@ class _AvoidEverythingEnv(gym.Env):
                     return True
             return False
 
+    def _compute_collision_metrics(self) -> tuple[bool, float, float]:
+        if self.collision_mode != "franka" or self._scene_primitives is None:
+            collision = self._check_collision()
+            return collision, float("inf"), float("inf")
+
+        q = self.robot.unnormalize_joints(self.robot_config)
+        prismatic_joint = self.robot.auxiliary_joint_defaults.get("panda_finger_joint1", 0.04)
+
+        # Same logic as franka_arm_collides_fast, but also expose signed margins.
+        has_self_collision = self._collision_checker.has_self_collision(q, prismatic_joint, 0.0)
+        cspheres = self._collision_checker.csphere_info(q, prismatic_joint, with_base_link=False)
+
+        scene_collision = False
+        sdf_obstacles = float("inf")
+        for arr in self._scene_primitives:
+            scene_sdf = arr.scene_sdf(cspheres.centers)
+            margins = scene_sdf - (cspheres.radii + self.scene_buffer)
+            sdf_obstacles = min(sdf_obstacles, float(np.min(margins)))
+            if np.any(margins < 0.0):
+                scene_collision = True
+
+        self_spheres = self._collision_checker.self_collision_spheres(q, prismatic_joint)
+        centers = np.asarray([sphere.center for sphere in self_spheres], dtype=np.float64)
+        if centers.shape[0] < 2:
+            sdf_self_collision = float("inf")
+        else:
+            pairwise_distances = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+            valid_pairs = np.isfinite(self._collision_checker.collision_matrix)
+            if np.any(valid_pairs):
+                margins = pairwise_distances[valid_pairs] - self._collision_checker.collision_matrix[valid_pairs]
+                sdf_self_collision = float(np.min(margins))
+            else:
+                sdf_self_collision = float("inf")
+
+        collision = has_self_collision or scene_collision
+        return collision, sdf_obstacles, sdf_self_collision
+
 
     def _check_target_reached(self):
         """Check if current end-effector pose is within position and orientation thresholds of the target."""
@@ -600,26 +626,21 @@ class _AvoidEverythingEnv(gym.Env):
         target_reached: bool,
         position_error: float,
         orientation_error: float,
+        action: np.ndarray,
+        joint_limit_violation: float,
+        sdf_obstacles: float,
+        sdf_self_collision: float,
     ) -> tuple[float, dict[str, float]]:
-        
-        goal_term = self.reward_config["goal_weight"] if target_reached and not collision else 0.0
-        collision_term = self.reward_config["collision_weight"] if collision else 0.0
-
-        # gaussian distance reward
-        # =0 when error in inf, =1 when error is 0, with gaussian smooth decay in between
-        # with position and orientation errors normalized by thresholds
-        goal_distance_term = \
-            self.reward_config["goal_distance_weight"] \
-            * np.exp(-(position_error / self.position_threshold)**2) \
-            * np.exp(-(orientation_error / self.orientation_threshold)**2)
-
-        reward_terms = {
-            "goal": goal_term,
-            "collision": collision_term,
-            "goal_distance": goal_distance_term,
-        }
-        reward = self.reward_config["total_magnitude"] * sum(reward_terms.values())
-        return reward, reward_terms
+        return self.reward_calculator.compute_reward(
+            collision=collision,
+            target_reached=target_reached,
+            position_error=position_error,
+            orientation_error=orientation_error,
+            sdf_obstacles=sdf_obstacles,
+            sdf_self_collision=sdf_self_collision,
+            joint_limit_violation=joint_limit_violation,
+            action=action,
+        )
 
     def _render_setup(
         self,

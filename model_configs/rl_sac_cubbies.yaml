@@ -15,12 +15,23 @@ action_chunk_length: 1
 env:
   terminate_ep_on_collision: true  # Whether to end the episode immediately upon collision
   action_delta_clip: 0.2  # Hard clip joint deltas
-  # reward = magnitude * (goal_weight * goal + collision_weight * collision + goal_distance_weight * exp(-position_error/position_threshold) * exp(-orientation_error/orientation_threshold))
+  # Reward = total_magnitude * sum(terms). Keep optional terms at 0.0 to disable.
   reward: 
     total_magnitude: 1.0
-    goal_weight: 1.0
-    collision_weight: -1.0      # must be <= 0
-    goal_distance_weight: 0.0   # set >0 to add dense distance penalty, if =0 is disabled
+    goal_weight: 1.0                     # >= 0
+    collision_weight: -1.0              # <= 0
+    goal_distance_weight: 0.0           # >= 0 (gaussian dense term)
+    goal_distance_progress_weight: 0.0     # >= 0 (progress shaping)
+    orientation_position_weight: 0.0      # >= 0 (balance position vs orientation in goal distance)
+    step_penalty_weight: 0.0            # <= 0
+    action_l2_weight: 0.0               # <= 0
+    joint_limit_weight: 0.0             # <= 0
+    sdf_obstacle_weight: 0.0            # <= 0
+    sdf_obstacle_threshold: 0.0         # >= 0 (margin where penalty starts)
+    sdf_obstacle_max_penalty: 0.0       # >= 0 (clamp)
+    sdf_self_collision_weight: 0.0      # <= 0
+    sdf_self_collision_threshold: 0.0   # >= 0 (margin where penalty starts)
+    sdf_self_collision_max_penalty: 0.0 # >= 0 (clamp)
 
   vec_env_type: "subproc"            # "dummy" | "subproc"
   n_envs: 6                        # Default env count when role-specific values are omitted
