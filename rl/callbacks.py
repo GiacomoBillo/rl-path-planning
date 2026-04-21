@@ -28,6 +28,7 @@ class DebugCallback(BaseCallback):
         self,
         description: str = "train",
         log_steps: bool = False,
+        log_ep_summary: bool = False,
         render: bool = False,
         progress_bar: bool = False,
         total: int = None, # total number of steps or episodes for progress bar (if None, will try to infer from locals)
@@ -36,6 +37,7 @@ class DebugCallback(BaseCallback):
         super().__init__(verbose)
         self.description = description
         self.log_steps = log_steps
+        self.log_ep_summary = log_ep_summary
         self.render_enabled = render
         self.progress_bar_enabled = progress_bar
         self.pbar = None
@@ -113,14 +115,15 @@ class DebugCallback(BaseCallback):
 
         # 4. Log episode summary when any episode ends.
         # Parallel VecEnv branch.
-        if isinstance(infos, (list, tuple)) and isinstance(dones, (list, tuple, np.ndarray)):
-            for i, (done_val, info) in enumerate(zip(dones, infos)):
+        if self.log_ep_summary:
+            if isinstance(infos, (list, tuple)) and isinstance(dones, (list, tuple, np.ndarray)):
+                for i, (done_val, info) in enumerate(zip(dones, infos)):
+                    if done_val and isinstance(info, dict):
+                        self._log_episode_summary(info, i)
+            else:
+                # Single-env branch.
                 if done_val and isinstance(info, dict):
-                    self._log_episode_summary(info, i)
-        else:
-            # Single-env branch.
-            if done_val and isinstance(info, dict):
-                self._log_episode_summary(info)
+                    self._log_episode_summary(info)
 
         # 5. Render
         if self.render_enabled and env is not None:
