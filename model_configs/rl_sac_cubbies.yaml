@@ -14,7 +14,10 @@ action_chunk_length: 1
 # Environment
 env:
   terminate_ep_on_collision: true  # Whether to end the episode immediately upon collision
-  action_delta_clip: 0.2  # Hard clip joint deltas
+  
+  max_delta_q: 0.2  # env action bound [-max_delta_q, max_delta_q]
+  # action_delta_clip: 0.2  # Hard clip joint deltas
+  
   # Reward = total_magnitude * sum(terms). Keep optional terms at 0.0 to disable.
   reward: 
     total_magnitude: 1.0

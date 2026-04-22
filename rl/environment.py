@@ -51,6 +51,14 @@ def build_action_delta_clip(action_delta_clip: float | Sequence[float], dof: int
     return clip_array
 
 
+def validate_max_delta_q(max_delta_q: float) -> float:
+    """Validate and normalize max_delta_q config value."""
+    value = float(max_delta_q)
+    if value <= 0:
+        raise ValueError("max_delta_q must be > 0.")
+    return value
+
+
 class AvoidEverythingEnv(TimeLimit):
     """
     Public environment: wraps `_AvoidEverythingEnv` with Gymnasium's `TimeLimit`.
@@ -83,6 +91,7 @@ class AvoidEverythingEnv(TimeLimit):
         terminate_ep_on_collision: bool = True,
         reward_config: dict | None = None,
         action_delta_clip: float | Sequence[float] = 0.2,
+        max_delta_q: float = 1.0,
     ):
         """Initialize environment with an automatic TimeLimit wrapper.
 
@@ -104,6 +113,7 @@ class AvoidEverythingEnv(TimeLimit):
             terminate_ep_on_collision: whether collisions terminate the episode (default True)
             reward_config: optional reward configuration block.
             action_delta_clip: hard clip bound(s) for joint deltas.
+            max_delta_q: maximum absolute action bound for the environment action space.
         """
         # instantiate the base env
         env = _AvoidEverythingEnv(
@@ -123,6 +133,7 @@ class AvoidEverythingEnv(TimeLimit):
             terminate_ep_on_collision=terminate_ep_on_collision,
             reward_config=reward_config,
             action_delta_clip=action_delta_clip,
+            max_delta_q=max_delta_q,
         )
         # apply time limit wrapper
         super().__init__(env, max_episode_steps=max_episode_steps)
@@ -197,6 +208,7 @@ class _AvoidEverythingEnv(gym.Env):
         terminate_ep_on_collision: bool = True,
         reward_config: dict | None = None,
         action_delta_clip: float | Sequence[float] = 0.2,
+        max_delta_q: float = 1.0,
     ):
         """Initialize environment.
         Args:
@@ -217,6 +229,7 @@ class _AvoidEverythingEnv(gym.Env):
             terminate_ep_on_collision: whether collisions terminate the episode (default True)
             reward_config: optional reward configuration block.
             action_delta_clip: hard clip bound(s) for joint deltas.
+            max_delta_q: maximum absolute action bound for the environment action space.
         """
         super().__init__()
 
@@ -234,6 +247,7 @@ class _AvoidEverythingEnv(gym.Env):
         self.num_robot_points = num_robot_points
         self.num_obstacle_points = num_obstacle_points
         self.num_target_points = num_target_points
+        self.max_delta_q = max_delta_q
 
         # Initialize sampler for point cloud generation
         # NumpyRobotSampler() as in avoid_everything/data_loader.py
@@ -285,8 +299,13 @@ class _AvoidEverythingEnv(gym.Env):
             }
         )
 
-        # Action space: normalized joint deltas [-1, 1] for main DOF
-        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.robot.MAIN_DOF,), dtype=np.float32,)
+        # Action space: bounded joint deltas for main DOF
+        self.action_space = gym.spaces.Box(
+            low=-self.max_delta_q,
+            high=self.max_delta_q,
+            shape=(self.robot.MAIN_DOF,),
+            dtype=np.float32,
+        )
         self.action_delta_clip = build_action_delta_clip(action_delta_clip, self.robot.MAIN_DOF)
         self.reward_calculator = RewardCalculator(
             reward_config=reward_config,
@@ -353,7 +372,8 @@ class _AvoidEverythingEnv(gym.Env):
         """Execute action: update config, check collision, compute reward.
 
         Args:
-            action (np.array): array of shape (MAIN_DOF,) with values in [-1, 1], representing normalized joint deltas.
+            action (np.array): array of shape (MAIN_DOF,) with values in
+                [-max_delta_q, max_delta_q], representing joint deltas.
                 Executed deltas are clipped to +/- action_delta_clip.
 
         Returns:

@@ -26,6 +26,7 @@ import zipfile
 import json
 import base64
 import pickle
+import math
 
 import torch
 import yaml
@@ -36,7 +37,7 @@ import wandb
 
 from avoid_everything.pretraining import PretrainingMotionPolicyTransformer
 from avoid_everything.type_defs import DatasetType
-from rl.environment import AvoidEverythingEnv
+from rl.environment import AvoidEverythingEnv, validate_max_delta_q
 from rl.feature_extractor import MPiFormerExtractor
 from rl.my_sac import MySAC
 
@@ -119,6 +120,7 @@ def _create_single_env(
     eval_env: bool = False,
     env_idx: int = 0,
     total_env_number: int = 1,
+    max_delta_q: float = 1.0,
 ) -> Monitor:
     """Create one Monitor-wrapped environment instance."""
     render_mode = "human" if render else None
@@ -139,7 +141,8 @@ def _create_single_env(
             render_backend=render_backend,
             terminate_ep_on_collision=env_cfg.get("terminate_ep_on_collision", True),
             reward_config=env_cfg.get("reward"),
-            action_delta_clip=env_cfg.get("action_delta_clip", 0.2),
+            action_delta_clip=env_cfg.get("action_delta_clip", max_delta_q),
+            max_delta_q=max_delta_q,
         ),
         info_keywords=info_keywords
     )
@@ -204,6 +207,9 @@ def create_env(
         raise ValueError(
             f"Unsupported vec_env_type={vec_env_type!r}. Expected 'dummy' or 'subproc'."
         )
+    
+    max_delta_q = validate_max_delta_q(env_cfg.get("max_delta_q", 1.0))
+    print(f"✓ Environment with max_delta_q={max_delta_q}")
 
     # Rendering with subprocess workers is fragile for ROS/PyBullet visualization.
     if render and vec_env_type == "subproc":
@@ -237,6 +243,7 @@ def create_env(
                 env_idx=env_idx,
                 total_env_number=n_envs,
                 eval_env=(env_role == "eval"),
+                max_delta_q=max_delta_q,
             )
             return env
 
@@ -283,6 +290,37 @@ def load_bc_checkpoint(cfg: dict, verbose=True) -> PretrainingMotionPolicyTransf
     if verbose:
         print(f"✓ BC checkpoint loaded from: {cfg['bc_checkpoint_path']}")
     return bc_model
+
+
+def scale_actor_for_action_bounds(model: MySAC, action_scale_factor: float) -> None:
+    """
+    Scale actor parameters to preserve physical action magnitude after action-space rescaling.
+
+    Applies:
+      - mu.weight and mu.bias multiplied by action_scale_factor
+      - log_std bias/parameter shifted by log(action_scale_factor)
+    """
+    factor = float(action_scale_factor)
+    if factor <= 0:
+        raise ValueError(f"action_scale_factor must be > 0, got {factor}.")
+    if math.isclose(factor, 1.0):
+        return
+
+    noise_offset = math.log(factor)
+    actor = model.policy.actor
+    with torch.no_grad():
+        actor.mu.weight.mul_(factor)
+        actor.mu.bias.mul_(factor)
+
+        log_std_head = actor.log_std
+        if hasattr(log_std_head, "bias") and log_std_head.bias is not None:
+            log_std_head.bias.add_(noise_offset)
+        elif isinstance(log_std_head, torch.nn.Parameter):
+            log_std_head.add_(noise_offset)
+        else:
+            raise TypeError(
+                f"Unsupported actor.log_std type for scaling: {type(log_std_head).__name__}"
+            )
 
 
 def bootstrap_sac_from_bc(
@@ -368,6 +406,12 @@ def bootstrap_sac_from_bc(
     # Explicit log_std initialization
     log_std_init_value = policy_kwargs.get("log_std_init", -20.0)
     model.initialize_log_std(log_std_value=log_std_init_value, state_independent_start=True)
+
+    # Scale actor outputs to match env.max_delta_q while keeping physical action magnitude.
+    action_scale_factor = 1.0 / validate_max_delta_q(cfg.get("env", {}).get("max_delta_q", 1.0))
+    if not math.isclose(action_scale_factor, 1.0):
+        scale_actor_for_action_bounds(model, action_scale_factor)
+        print(f"✓ Applied actor action_scale_factor={action_scale_factor:.6g}")
 
     # Cleanup to save memory
     if "bc_model" in model.policy_kwargs.get("features_extractor_kwargs", {}):
