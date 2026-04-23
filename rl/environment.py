@@ -236,6 +236,9 @@ class _AvoidEverythingEnv(gym.Env):
         # Store dataset reference
         self.dataloader: DataLoader = dataloader
         self._dataloader_iter = iter(dataloader) if dataloader is not None else None
+        self._num_split_samples = (
+            len(dataloader.dataset) if dataloader is not None else 0
+        )
 
         # Store URDF path
         self.urdf_path = urdf_path
@@ -941,7 +944,7 @@ class _AvoidEverythingEnv(gym.Env):
         if overfit_idx is not None:
             dataset = Subset(dataset, [overfit_idx])
         elif n_eval_episodes:
-            dataset = Subset(dataset, list(range(n_eval_episodes)))
+            dataset = Subset(dataset, range(n_eval_episodes))
             shuffle = False
 
         # split dataset across parallel envs
@@ -951,20 +954,19 @@ class _AvoidEverythingEnv(gym.Env):
                     f"env_idx must be in [0, {total_env_number - 1}], got {env_idx}"
                 )
             total_len = len(dataset)
-            len_split = (total_len + total_env_number - 1) // total_env_number
-            start = env_idx * len_split
-            end = min(start + len_split, len(dataset))
-            if start >= total_len:
+            indices_split = range(env_idx, total_len, total_env_number)
+            if not indices_split:
                 raise ValueError(
                     f"Dataset split for env_idx={env_idx} is empty "
                     f"(total_len={total_len}, total_env_number={total_env_number})."
                 )
-            indices_split = list(range(start, end))
             dataset = Subset(dataset, indices_split)
             print(
-                f"✓ Environment {env_idx}/{total_env_number} using split indices "
-                f"[{start}:{end}] out of {total_len} total samples"
+                f"✓ Environment {env_idx}/{total_env_number} using {len(indices_split)} "
+                f"round-robin samples out of {total_len} total samples"
             )
+
+        self._num_split_samples = len(dataset)
 
         # Create DataLoader for episode resets.
         self.dataloader = DataLoader(
@@ -977,9 +979,7 @@ class _AvoidEverythingEnv(gym.Env):
 
     def get_num_split_samples(self) -> int:
         """Return number of samples in this env split."""
-        if self.dataloader is None:
-            return 0
-        return len(self.dataloader.dataset)
+        return self._num_split_samples
 
 
 

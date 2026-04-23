@@ -172,7 +172,6 @@ def main(args, cfg):
             n_eval_episodes=cfg["n_eval_episodes"],
             deterministic=args.deterministic,
             debug_callback=eval_debug_callback,
-            single_pass_split=True,
         )
         eval_debug_callback.close_progress_bar()
 

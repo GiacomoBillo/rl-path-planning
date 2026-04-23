@@ -1,4 +1,3 @@
-import warnings
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv, VecMonitor, is_vecenv_wrapped
@@ -280,7 +279,6 @@ def evaluate_policy_with_metrics(
     n_eval_episodes: int,
     deterministic: bool = True,
     debug_callback: Optional[Any] = None,
-    single_pass_split: bool = True,
 ) -> dict:
     """Run evaluation and return reward/length plus aggregated task metrics."""
     metrics_callback = EvalMetricsCallback()
@@ -299,7 +297,6 @@ def evaluate_policy_with_metrics(
         n_eval_episodes=n_eval_episodes,
         deterministic=deterministic,
         callback=callback,
-        single_pass_split=single_pass_split,
     )
 
     summary = metrics_callback.summary()
@@ -318,38 +315,24 @@ def _evaluate_policy_episode_rewards(
     n_eval_episodes: int,
     deterministic: bool,
     callback: Optional[Any],
-    single_pass_split: bool,
 ) -> tuple[list[float], list[int]]:
-    """Evaluate policy and return per-episode rewards/lengths with optional one-pass split limits."""
+    """Evaluate policy and return per-episode rewards/lengths."""
     if not isinstance(eval_env, VecEnv):
         eval_env = DummyVecEnv([lambda: eval_env])
 
     is_monitor_wrapped = is_vecenv_wrapped(eval_env, VecMonitor) or eval_env.env_is_wrapped(Monitor)[0]
     n_envs = eval_env.num_envs
-    episode_count_targets = np.array([(n_eval_episodes + i) // n_envs for i in range(n_envs)], dtype="int")
-
-    if single_pass_split:
-        try:
-            split_sizes = np.asarray(eval_env.env_method("get_num_split_samples"), dtype="int")
-        except Exception as exc:
-            warnings.warn(
-                f"single_pass_split=True requested but eval env does not expose split sizes "
-                f"(error: {type(exc).__name__}). Falling back to standard episode targets.",
-                UserWarning,
-            )
-            split_sizes = None
-        if split_sizes is None:
-            split_sizes = episode_count_targets.copy()
-        episode_count_targets = np.minimum(episode_count_targets, split_sizes)
-        reduced_total = int(np.sum(episode_count_targets))
-        if reduced_total < n_eval_episodes:
-            warnings.warn(
-                f"Requested n_eval_episodes={n_eval_episodes}, but one-pass split mode limits "
-                f"evaluation to {reduced_total} episodes (sum of per-env split caps).",
-                UserWarning,
-            )
-        if reduced_total <= 0:
-            raise ValueError("No evaluation episodes available in one-pass split mode.")
+    episode_count_targets = np.asarray(eval_env.env_method("get_num_split_samples"), dtype="int").reshape(-1)
+    if episode_count_targets.size != n_envs:
+        raise ValueError(f"Expected {n_envs} split sizes, got {episode_count_targets.size}.")
+    split_total = int(np.sum(episode_count_targets))
+    if split_total != n_eval_episodes:
+        raise ValueError(
+            f"Requested n_eval_episodes={n_eval_episodes}, but eval env exposes "
+            f"{split_total} split samples."
+        )
+    if split_total <= 0:
+        raise ValueError("No evaluation episodes available.")
 
     episode_rewards: list[float] = []
     episode_lengths: list[int] = []
