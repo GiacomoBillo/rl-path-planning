@@ -17,7 +17,6 @@ Usage:
     --eval_after            Evaluate the trained policy after finetuning (default: True)
     --overfit N             Overfit on training scene with idx N for debugging (default: 1 if flag is used)
     --render                Render the environment during training
-    --eval_freq N           Periodic evaluation frequency in training steps (default: 1000, <=0 disables periodic eval)
 
 Output:
     - Trained checkpoint saved to: {save_path}/{run_name}_finetuning_{timestamp}.zip
@@ -83,12 +82,6 @@ def get_args_and_cfg():
         type=int,
         default=1,
         help="Debug level: 0=None, 1=Summary, 2=Component, 3=Detailed"
-    )
-    parser.add_argument(
-        "--eval_freq",
-        type=int,
-        default=1000,
-        help="Periodic evaluation frequency in training steps (default: 1000, <=0 disables periodic eval)"
     )
     args = parser.parse_args()
 
@@ -219,12 +212,17 @@ def main(args, cfg):
             verbose=args.verbose,
         )
 
+        logger_cfg = cfg.get("logger", {})
+        log_eval_freq = int(logger_cfg.get("log_eval_freq", 0))
+        if log_eval_freq < 0:
+            raise ValueError(f"logger.log_eval_freq must be >= 0, got {log_eval_freq}")
+
         periodic_eval_callback = None
         effective_eval_freq = 0
-        if args.eval_freq > 0:
+        if log_eval_freq > 0:
             n_envs = env.num_envs if hasattr(env, "num_envs") else 1
-            effective_eval_freq = max(args.eval_freq // max(n_envs, 1), 1)
-            if effective_eval_freq != args.eval_freq:
+            effective_eval_freq = max(log_eval_freq // max(n_envs, 1), 1)
+            if effective_eval_freq != log_eval_freq:
                 print(f"✓ Periodic eval frequency scaled for VecEnv: {effective_eval_freq} calls")
 
             periodic_eval_callback = PeriodicEvalMetricsCallback(
@@ -237,7 +235,7 @@ def main(args, cfg):
                 print_prefix="Periodic evaluation",
             )
             print(
-                f"✓ Periodic eval enabled: every {args.eval_freq} training steps "
+                f"✓ Periodic eval enabled: every {log_eval_freq} training steps "
                 f"({cfg['n_eval_episodes']} episodes)"
             )
 
@@ -245,10 +243,10 @@ def main(args, cfg):
         if periodic_eval_callback is not None:
             callbacks.append(periodic_eval_callback)
 
-        log_interval = int(cfg.get("logger", {}).get("log_interval", 1))
-        if log_interval <= 0:
-            raise ValueError(f"logger.log_interval must be > 0, got {log_interval}")
-        print(f"✓ log_interval: {log_interval}")
+        log_ep_freq = int(logger_cfg.get("log_ep_freq", logger_cfg.get("log_interval", 1)))
+        if log_ep_freq <= 0:
+            raise ValueError(f"logger.log_ep_freq must be > 0, got {log_ep_freq}")
+        print(f"✓ log_ep_freq: {log_ep_freq}")
 
         # Run training
         model.learn(
@@ -256,7 +254,7 @@ def main(args, cfg):
             progress_bar=True,
             callback=callbacks,
             reset_num_timesteps=False,  # Continue counting from loaded checkpoint
-            log_interval=log_interval,
+            log_interval=log_ep_freq,
         )
         print(f"✓ RL finetuning completed ({finetuning_steps} steps)\n")
 
@@ -307,7 +305,7 @@ def main(args, cfg):
             "finetuning_steps": finetuning_steps,
             "loaded_from_checkpoint": args.checkpoint,
             "saved_checkpoint_path": save_path+".zip",
-            "periodic_eval_freq": args.eval_freq,
+            "periodic_eval_freq": log_eval_freq,
             "effective_eval_freq": effective_eval_freq if periodic_eval_callback else None,
         }
 

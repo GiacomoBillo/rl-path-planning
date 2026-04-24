@@ -424,6 +424,45 @@ class MySAC(SACDebug):
         self._original_ent_coef_tensor = None
         self._had_ent_coef_tensor = False
         self.log_period = 1
+        self._last_task_log_episode_num = 0
+        self.metrics_accumulators = {
+            "train": self._new_train_metrics_accumulator(),
+            "task": self._new_task_metrics_accumulator(),
+        }
+
+    def _new_train_metrics_accumulator(self) -> Dict[str, Any]:
+        return {
+            "steps": 0,
+            "ent_coef_sum": 0.0,
+            "actor_loss_sum": 0.0,
+            "critic_loss_sum": 0.0,
+            "ent_coef_loss_sum": 0.0,
+            "ent_coef_loss_steps": 0,
+            "entropy_sum": 0.0,
+            "log_std_sum_per_joint": None,
+            "lr_steps": 0,
+            "actor_lr_sum": 0.0,
+            "critic_lr_sum": 0.0,
+            "ent_coef_lr_sum": 0.0,
+            "actor_lr_count": 0,
+            "critic_lr_count": 0,
+            "ent_coef_lr_count": 0,
+        }
+
+    def _new_task_metrics_accumulator(self) -> Dict[str, Any]:
+        return {
+            "steps": 0,
+            "target_reached_sum": 0.0,
+            "timeout_sum": 0.0,
+            "num_steps_sum": 0.0,
+            "collision_rate_sum": 0.0,
+            "return_sum": 0.0,
+            "position_error_sum": 0.0,
+            "orientation_error_sum": 0.0,
+            "q_violation_rate_sum": 0.0,
+            "delta_q_violation_rate_sum": 0.0,
+            "action_abs_sum_per_joint": None,
+        }
 
     @override
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
@@ -555,110 +594,169 @@ class MySAC(SACDebug):
 
         self._n_updates += gradient_steps
 
-        # === Log standard metrics ===
-        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record_mean("train/ent_coef", np.mean(ent_coefs))
-        self.logger.record_mean("train/actor_loss", np.mean(actor_losses))
-        self.logger.record_mean("train/critic_loss", np.mean(critic_losses))
+        # Accumulate train metrics independently from logger internals.
+        train_acc = self.metrics_accumulators["train"]
+        train_acc["steps"] += int(gradient_steps)
+        train_acc["ent_coef_sum"] += float(np.sum(ent_coefs))
+        train_acc["actor_loss_sum"] += float(np.sum(actor_losses))
+        train_acc["critic_loss_sum"] += float(np.sum(critic_losses))
+        train_acc["entropy_sum"] += float(np.sum(entropies))
         if len(ent_coef_losses) > 0:
-            self.logger.record_mean("train/ent_coef_loss", np.mean(ent_coef_losses))
-        
-        # === NEW: Log additional metrics (log_std, std, entropy) ===
-        # Average across gradient steps
+            train_acc["ent_coef_loss_sum"] += float(np.sum(ent_coef_losses))
+            train_acc["ent_coef_loss_steps"] += int(len(ent_coef_losses))
+
         log_stds_per_joint_tensor = th.stack(log_stds_per_joint)  # (gradient_steps, action_dim)
-        log_std_mean_per_joint = log_stds_per_joint_tensor.mean(dim=0)  # (action_dim,)
-        # std_mean_per_joint = th.exp(log_std_mean_per_joint)  # (action_dim,)
-        
-        # Log per-joint metrics
-        action_dim = log_std_mean_per_joint.shape[0]
-        for joint_idx in range(action_dim):
-            self.logger.record_mean(
-                f"train/log_std_joint_{joint_idx}",
-                log_std_mean_per_joint[joint_idx].item(),
+        log_std_sum_per_joint = log_stds_per_joint_tensor.sum(dim=0).detach().cpu().numpy().astype(np.float64)
+        if train_acc["log_std_sum_per_joint"] is None:
+            train_acc["log_std_sum_per_joint"] = np.zeros_like(log_std_sum_per_joint, dtype=np.float64)
+        elif train_acc["log_std_sum_per_joint"].shape != log_std_sum_per_joint.shape:
+            raise ValueError(
+                f"Inconsistent train log_std shape: {log_std_sum_per_joint.shape} != "
+                f"{train_acc['log_std_sum_per_joint'].shape}"
             )
-            # self.logger.record(f"train/std_joint_{joint_idx}", std_mean_per_joint[joint_idx].item())
-        
-        # Log summary metrics (mean across all joints)
-        self.logger.record_mean("train/log_std_mean", log_std_mean_per_joint.mean().item())
-        # self.logger.record("train/std_mean", std_mean_per_joint.mean().item())
-        
-        # Log entropy
-        self.logger.record_mean("train/entropy", np.mean(entropies))
-        
-        # Dump train metrics every configured number of gradient updates
-        if self._n_updates % self.log_period == 0:
+        train_acc["log_std_sum_per_joint"] += log_std_sum_per_joint
+
+        # Dump train metrics every configured number of gradient updates.
+        if self._n_updates % self.log_period == 0 and train_acc["steps"] > 0:
+            train_steps = float(train_acc["steps"])
+            self.logger.record("train/n_updates", self._n_updates)
+            self.logger.record("train/ent_coef", train_acc["ent_coef_sum"] / train_steps)
+            self.logger.record("train/actor_loss", train_acc["actor_loss_sum"] / train_steps)
+            self.logger.record("train/critic_loss", train_acc["critic_loss_sum"] / train_steps)
+            if train_acc["ent_coef_loss_steps"] > 0:
+                ent_coef_loss_steps = float(train_acc["ent_coef_loss_steps"])
+                self.logger.record("train/ent_coef_loss", train_acc["ent_coef_loss_sum"] / ent_coef_loss_steps)
+            self.logger.record("train/entropy", train_acc["entropy_sum"] / train_steps)
+            if train_acc["actor_lr_count"] > 0:
+                self.logger.record(
+                    "train/actor_lr",
+                    train_acc["actor_lr_sum"] / float(train_acc["actor_lr_count"]),
+                )
+            if train_acc["critic_lr_count"] > 0:
+                self.logger.record(
+                    "train/critic_lr",
+                    train_acc["critic_lr_sum"] / float(train_acc["critic_lr_count"]),
+                )
+            if train_acc["ent_coef_lr_count"] > 0:
+                self.logger.record(
+                    "train/ent_coef_lt",
+                    train_acc["ent_coef_lr_sum"] / float(train_acc["ent_coef_lr_count"]),
+                )
+
+            log_std_mean_per_joint = train_acc["log_std_sum_per_joint"] / train_steps
+            for joint_idx, joint_value in enumerate(log_std_mean_per_joint):
+                self.logger.record(f"train/log_std_j{joint_idx}", float(joint_value))
+            self.logger.record("train/log_std_mean", float(np.mean(log_std_mean_per_joint)))
             self.logger.dump(step=self.num_timesteps)
+            self.metrics_accumulators["train"] = self._new_train_metrics_accumulator()
 
 
     @override
     def _dump_logs(self) -> None:
         """
-        Override to add raw per-episode metrics from environment info.
+        Override to add aggregated task metrics from environment info.
 
         Extracts task-specific metrics from ep_info_buffer (populated by Monitor wrapper).
         Assumes strict compliance: all keys MUST be present in the info dict, or a 
         KeyError will be raised (fail-fast design).
-        
-        Extracts task-specific metrics from the LATEST completed episode (not averaged):
-        use a mew prefix "task/" to distinguish from standard SB3 "rollout/" metrics.
-        - task/target_reached: Whether target was reached (bool: 0 or 1)
-        - task/num_steps: Number of steps taken in episode (int)
-        - task/num_collisions: Number of collisions in episode (int)
-        - task/return: Episode return (float)
-        - task/position_error: Position error at episode end (meters)
-        - task/orientation_error: Orientation error at episode end (radians)
-        - task/timeout: Whether episode was truncated due to max steps (bool: 0 or 1)
-        - task/limit_violation_rate: Fraction of joint-components clipped by joint limits over the episode
-        - task/action_clip_violation_rate: Fraction of joint-components clipped by action_delta_clip over the episode
-        - task/action_abs_mean_j*: Episode mean abs(delta q) per joint
-        - task/action_abs_mean: Episode mean abs(delta q), averaged across joints
-        
-        These are RAW per-episode values (not moving averages like ep_rew_mean).
-        You can apply smoothing in WandB if needed, but you can't un-smooth averaged data.
 
         Strategy: 
-        - record new custom (episode-level) metrics
+        - record aggregated task metrics over episodes since previous dump
         - then call super()._dump_logs() which adds standard metrics and dumps everything in a single call.
         """
-        # Add our custom episode-level metrics to logger buffer
-        # Extract ONLY the latest episode (not averaged over buffer)
-        if len(self.ep_info_buffer) > 0:
-            latest_episode = self.ep_info_buffer[-1]  # Most recent completed episode
-            
-            # Task success (binary: 0 or 1)
-            self.logger.record("task/target_reached", float(latest_episode["target_reached"]))
-            
-            # Number of steps in episode
-            self.logger.record("task/num_steps", latest_episode["episode_num_steps"])
+        # Handle learn() resets that can reduce _episode_num.
+        if self._episode_num < self._last_task_log_episode_num:
+            self._last_task_log_episode_num = 0
 
-            # Number of collisions in episode
-            self.logger.record("task/num_collisions", latest_episode["episode_num_collisions"])
-            
-            # Episode return (individual, not 100-ep moving average like ep_rew_mean)
-            self.logger.record("task/return", latest_episode["episode_return"])
-            
-            # Final position error at episode end (meters)
-            self.logger.record("task/position_error", latest_episode["position_error"])
-            
-            # Final orientation error at episode end (radians)
-            self.logger.record("task/orientation_error", latest_episode["orientation_error"])
-            
-            # Terminated due to max steps (truncated)
-            self.logger.record("task/timeout", float(latest_episode["TimeLimit.truncated"]))
+        interval_episodes = self._episode_num - self._last_task_log_episode_num
+        should_reset_task_accumulator = False
+        if interval_episodes > 0:
+            available = len(self.ep_info_buffer)
+            if available < interval_episodes:
+                raise RuntimeError(
+                    f"Need {interval_episodes} episode infos for task aggregation, but only {available} "
+                    "are available in ep_info_buffer. Increase stats_window_size or reduce log_interval."
+                )
 
-            # Joint limit violation
-            self.logger.record("task/limit_violation_rate", latest_episode["episode_limit_violation_rate"])
-            self.logger.record("task/action_clip_violation_rate", latest_episode["episode_action_clip_violation_rate"])
+            recent_episodes = list(self.ep_info_buffer)[-interval_episodes:]
 
-            # Episode action magnitude (abs(delta q))
-            action_abs_mean = np.asarray(latest_episode["episode_action_abs_mean"], dtype=np.float32)
-            for joint_idx, joint_value in enumerate(action_abs_mean):
-                self.logger.record(f"task/action_abs_mean_j{joint_idx}", float(joint_value))
-            self.logger.record("task/action_abs_mean", float(np.mean(action_abs_mean)))
+            keys = [
+                "target_reached",
+                "episode_num_steps",
+                "episode_num_collisions",
+                "episode_return",
+                "position_error",
+                "orientation_error",
+                "TimeLimit.truncated",
+                "episode_limit_violation_rate",
+                "episode_action_clip_violation_rate",
+            ]
+            data = np.array([[float(ep[k]) for k in keys] for ep in recent_episodes], dtype=np.float32)
+            (
+                target_reached_rate,
+                mean_num_steps,
+                mean_num_collisions,
+                mean_return,
+                mean_position_error,
+                mean_orientation_error,
+                timeout_rate,
+                mean_limit_violation_rate,
+                mean_action_clip_violation_rate,
+            ) = data.sum(axis=0)
+
+            action_abs_per_episode = np.stack(
+                [np.asarray(ep["episode_action_abs_mean"], dtype=np.float32) for ep in recent_episodes]
+            )
+            action_abs_sum_per_joint = action_abs_per_episode.sum(axis=0).astype(np.float64)
+
+            task_acc = self.metrics_accumulators["task"]
+            task_acc["steps"] += int(interval_episodes)
+            task_acc["target_reached_sum"] += float(target_reached_rate)
+            task_acc["timeout_sum"] += float(timeout_rate)
+            task_acc["num_steps_sum"] += float(mean_num_steps)
+            task_acc["collision_rate_sum"] += float(mean_num_collisions)
+            task_acc["return_sum"] += float(mean_return)
+            task_acc["position_error_sum"] += float(mean_position_error)
+            task_acc["orientation_error_sum"] += float(mean_orientation_error)
+            task_acc["q_violation_rate_sum"] += float(mean_limit_violation_rate)
+            task_acc["delta_q_violation_rate_sum"] += float(mean_action_clip_violation_rate)
+
+            if task_acc["action_abs_sum_per_joint"] is None:
+                task_acc["action_abs_sum_per_joint"] = np.zeros_like(action_abs_sum_per_joint, dtype=np.float64)
+            elif task_acc["action_abs_sum_per_joint"].shape != action_abs_sum_per_joint.shape:
+                raise ValueError(
+                    f"Inconsistent task action_abs shape: {action_abs_sum_per_joint.shape} != "
+                    f"{task_acc['action_abs_sum_per_joint'].shape}"
+                )
+            task_acc["action_abs_sum_per_joint"] += action_abs_sum_per_joint
+
+            task_steps = float(task_acc["steps"])
+            ratio = 1.0 / task_steps
+            prefix = "ep/" # for episode-level metrics 
+            self.logger.record(f"{prefix}episodes", self._episode_num)
+            self.logger.record(f"{prefix}target_reached_rate", task_acc["target_reached_sum"] * ratio)
+            self.logger.record(f"{prefix}timeout_rate", task_acc["timeout_sum"] * ratio)
+            self.logger.record(f"{prefix}num_steps", task_acc["num_steps_sum"] * ratio)
+            self.logger.record(f"{prefix}collision_rate", task_acc["collision_rate_sum"] * ratio)
+            self.logger.record(f"{prefix}return", task_acc["return_sum"] * ratio)
+            self.logger.record(f"{prefix}position_error", task_acc["position_error_sum"] * ratio)
+            self.logger.record(f"{prefix}orientation_error", task_acc["orientation_error_sum"] * ratio)
+            self.logger.record(f"{prefix}q_violation_rate", task_acc["q_violation_rate_sum"] * ratio)
+            self.logger.record(f"{prefix}delta_q_violation_rate", task_acc["delta_q_violation_rate_sum"] * ratio)
+
+            action_abs_mean_per_joint = task_acc["action_abs_sum_per_joint"] * ratio
+            for joint_idx, joint_value in enumerate(action_abs_mean_per_joint):
+                self.logger.record(f"{prefix}action_abs_j{joint_idx}", float(joint_value))
+            self.logger.record(f"{prefix}action_abs_mean", float(np.mean(action_abs_mean_per_joint)))
+            should_reset_task_accumulator = True
+
+        self._last_task_log_episode_num = self._episode_num
         
         # Call parent to add standard metrics (ep_rew_mean, ep_len_mean, fps, etc.)
         # and dump ALL metrics (ours + parent's) in a single call
         super()._dump_logs()
+        if should_reset_task_accumulator:
+            self.metrics_accumulators["task"] = self._new_task_metrics_accumulator()
 
     def update_learning_rates(
         self,
@@ -712,22 +810,27 @@ class MySAC(SACDebug):
         Only updates optimizers if their custom schedules have been set via update_learning_rates().
         """
         # Update actor LR if custom schedule is set
+        train_acc = self.metrics_accumulators["train"]
+        train_acc["lr_steps"] += 1
         if self._actor_lr_schedule is not None:
             actor_lr = self._actor_lr_schedule(self.num_timesteps)
             update_learning_rate(self.actor.optimizer, actor_lr)
-            self.logger.record_mean("train/actor_learning_rate", actor_lr)
+            train_acc["actor_lr_sum"] += float(actor_lr)
+            train_acc["actor_lr_count"] += 1
         
         # Update critic LR if custom schedule is set
         if self._critic_lr_schedule is not None:
             critic_lr = self._critic_lr_schedule(self.num_timesteps)
             update_learning_rate(self.critic.optimizer, critic_lr)
-            self.logger.record_mean("train/critic_learning_rate", critic_lr)
+            train_acc["critic_lr_sum"] += float(critic_lr)
+            train_acc["critic_lr_count"] += 1
         
         # Handle entropy coefficient optimizer if it exists
         if self.ent_coef_optimizer is not None:
             ent_lr = self.lr_schedule(self._current_progress_remaining)
             update_learning_rate(self.ent_coef_optimizer, ent_lr)
-            self.logger.record_mean("train/ent_coef_learning_rate", ent_lr)
+            train_acc["ent_coef_lr_sum"] += float(ent_lr)
+            train_acc["ent_coef_lr_count"] += 1
 
     def initialize_log_std(self, log_std_value: float = -20.0, state_independent_start: bool = True) -> None:
         """
@@ -781,9 +884,9 @@ class MySAC(SACDebug):
                 e.g. "logs/sac_run_2024-06-01_12-00-00"
         """
         formats = logger_config.get("formats", ["tensorboard"])
-        self.log_period = int(logger_config.get("log_period", 1))
+        self.log_period = int(logger_config.get("log_train_freq", logger_config.get("log_period", 1)))
         if self.log_period <= 0:
-            raise ValueError(f"logger.log_period must be > 0, got {self.log_period}")
+            raise ValueError(f"logger.log_train_freq must be > 0, got {self.log_period}")
         
         # # Use provided run_name or generate new one with timestamp
         # if run_name is None:

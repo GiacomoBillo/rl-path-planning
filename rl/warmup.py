@@ -207,13 +207,14 @@ def main(args, cfg):
             render=args.render,
             verbose=args.verbose,
         )
-        log_interval = int(cfg.get("logger", {}).get("log_interval", 1))
-        if log_interval <= 0:
-            raise ValueError(f"logger.log_interval must be > 0, got {log_interval}")
-        print(f"✓ log_interval: {log_interval}")
+        logger_cfg = cfg.get("logger", {})
+        log_ep_freq = int(logger_cfg.get("log_ep_freq", logger_cfg.get("log_interval", 1)))
+        if log_ep_freq <= 0:
+            raise ValueError(f"logger.log_ep_freq must be > 0, got {log_ep_freq}")
+        print(f"✓ log_ep_freq: {log_ep_freq}")
 
         # Run critic warmup
-        model.warmup_critic(warmup_steps, [train_callback], log_interval=log_interval)
+        model.warmup_critic(warmup_steps, [train_callback], log_interval=log_ep_freq)
         print(f"✓ Critic warmup completed ({warmup_steps} steps)\n")
 
         model.monitor_agent("AFTER WARMUP")
