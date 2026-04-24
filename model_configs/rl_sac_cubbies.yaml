@@ -62,7 +62,8 @@ bc_checkpoint_parameters:
   disable_viz: true
 
 # SAC / RL
-freeze_bc_encoder: true  # Freeze BC encoder during initial RL training; call extractor.unfreeze() to fine-tune end-to-end
+freeze_bc_encoder: true  # Freeze BC encoder during initial RL training
+freeze_transformer_layers: 7  # Number of transformer layers to freeze (out of 8)
 seed: 42  # Single seed source for both SB3 model and VecEnv seeding
 n_eval_episodes: 10
 save_dir: ./checkpoints  # Base directory for checkpoints (structure: save_dir/experiment_group/timestamp_phase.zip)

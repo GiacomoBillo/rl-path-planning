@@ -941,17 +941,34 @@ class MySAC(SACDebug):
         #     )
         #     self.log(f"✓ WandB enabled: project={wandb_project}, run={run_name}", level=0)
         # return run_name, wandb_callback
+    
+    def _set_transformer_final_norm_trainable(self, backbone: Any, trainable: bool, label: str) -> None:
+        """Toggle requires_grad on the transformer's final norm module if present."""
+        transformer = getattr(getattr(backbone, "transformer_encoder", None), "transformer", None)
+        final_norm = getattr(transformer, "norm", None) if transformer is not None else None
+        if final_norm is None:
+            return
+
+        state = "Unfreezing" if trainable else "Freezing"
+        self.log(f"{state} {label} transformer final norm...", level=1)
+        for param in final_norm.parameters():
+            param.requires_grad = trainable
 
     def freeze_learnable_actor(self) -> None:
         """
         Freeze learnable part of the actor
         """
-        if "perception" not in self.policy.actor.features_extractor.permanently_frozen_components:
+        actor_backbone = self.policy.actor.features_extractor
+        if "perception" in actor_backbone.learnable_components:
             self.log("Freezing actor perception module...", level=1)
-            self.policy.actor.features_extractor.freeze_perception()
-        if "transformer" not in self.policy.actor.features_extractor.permanently_frozen_components:
+            actor_backbone.freeze_perception()
+        if "transformer" in actor_backbone.learnable_components:
             self.log("Freezing actor transformer module...", level=1)
-            self.policy.actor.features_extractor.freeze_transformer()
+            actor_backbone.freeze_transformer()
+        elif actor_backbone.learnable_transformer_layers:
+            self.log(f"Freezing actor transformer layers {actor_backbone.learnable_transformer_layers}...", level=1)
+            actor_backbone.freeze_transformer_layers(actor_backbone.learnable_transformer_layers)
+            self._set_transformer_final_norm_trainable(actor_backbone, trainable=False, label="actor")
 
         # always freeze policy heads (mu and log_std)
         self.log("Freezing actor policy heads (mu and log_std)...", level=1)
@@ -964,12 +981,17 @@ class MySAC(SACDebug):
         """
         Unfreeze learnable part of the actor
         """
-        if "perception" not in self.policy.actor.features_extractor.permanently_frozen_components:
+        actor_backbone = self.policy.actor.features_extractor
+        if "perception" in actor_backbone.learnable_components:
             self.log("Unfreezing actor perception module...", level=1)
-            self.policy.actor.features_extractor.unfreeze_perception()
-        if "transformer" not in self.policy.actor.features_extractor.permanently_frozen_components:
+            actor_backbone.unfreeze_perception()
+        if "transformer" in actor_backbone.learnable_components:
             self.log("Unfreezing actor transformer module...", level=1)
-            self.policy.actor.features_extractor.unfreeze_transformer()
+            actor_backbone.unfreeze_transformer()
+        elif actor_backbone.learnable_transformer_layers:
+            self.log(f"Unfreezing actor transformer layers {actor_backbone.learnable_transformer_layers}...", level=1)
+            actor_backbone.unfreeze_transformer_layers(actor_backbone.learnable_transformer_layers)
+            self._set_transformer_final_norm_trainable(actor_backbone, trainable=True, label="actor")
         
         self.log("Unfreezing actor policy heads (mu and log_std)...", level=1)
         for param in self.policy.actor.mu.parameters():
@@ -981,12 +1003,18 @@ class MySAC(SACDebug):
         """
         Freeze learnable part of the critic
         """
-        if "perception" not in self.policy.critic.features_extractor.permanently_frozen_components:
+        critic_backbone = self.policy.critic.features_extractor
+        if "perception" in critic_backbone.learnable_components:
             self.log("Freezing critic perception module...", level=1)
-            self.policy.critic.features_extractor.freeze_perception()
-        if "transformer" not in self.policy.critic.features_extractor.permanently_frozen_components:
+            critic_backbone.freeze_perception()
+        if "transformer" in critic_backbone.learnable_components:
             self.log("Freezing critic transformer module...", level=1)
-            self.policy.critic.features_extractor.freeze_transformer()
+            critic_backbone.freeze_transformer()
+        elif critic_backbone.learnable_transformer_layers:
+            self.log(f"Freezing critic transformer layers {critic_backbone.learnable_transformer_layers}...", level=1)
+            critic_backbone.freeze_transformer_layers(critic_backbone.learnable_transformer_layers)
+            self._set_transformer_final_norm_trainable(critic_backbone, trainable=False, label="critic")
+
         # always freeze Q-value head
         self.log("Freezing critic Q-value head...", level=1)
         for param in self.policy.critic.q_networks.parameters():
@@ -996,12 +1024,18 @@ class MySAC(SACDebug):
         """
         Unfreeze learnable part of the critic
         """
-        if "perception" not in self.policy.critic.features_extractor.permanently_frozen_components:
+        critic_backbone = self.policy.critic.features_extractor
+        if "perception" in critic_backbone.learnable_components:
             self.log("Unfreezing critic perception module...", level=1)
-            self.policy.critic.features_extractor.unfreeze_perception()
-        if "transformer" not in self.policy.critic.features_extractor.permanently_frozen_components:
+            critic_backbone.unfreeze_perception()
+        if "transformer" in critic_backbone.learnable_components:
             self.log("Unfreezing critic transformer module...", level=1)
-            self.policy.critic.features_extractor.unfreeze_transformer()
+            critic_backbone.unfreeze_transformer()
+        elif critic_backbone.learnable_transformer_layers:
+            self.log(f"Unfreezing critic transformer layers {critic_backbone.learnable_transformer_layers}...", level=1)
+            critic_backbone.unfreeze_transformer_layers(critic_backbone.learnable_transformer_layers)
+            self._set_transformer_final_norm_trainable(critic_backbone, trainable=True, label="critic")
+
         self.log("Unfreezing critic Q-value head...", level=1)
         for param in self.policy.critic.q_networks.parameters():
             param.requires_grad = True

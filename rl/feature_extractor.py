@@ -178,15 +178,51 @@ class MPiFormerTransformerEncoder(nn.Module):
         action_embedding = self.transformer(embedded_sequence, mask=None)[-1:]  # (1, B, D)
         return action_embedding.squeeze(0)  # (B, D)
 
-    def freeze(self) -> None:
-        """Freeze transformer encoder parameters."""
-        for p in self.transformer.parameters():
-            p.requires_grad = False
+    def num_layers(self) -> int:
+        """Return number of transformer layers."""
+        return len(self.transformer.layers)
 
-    def unfreeze(self) -> None:
-        """Unfreeze transformer encoder parameters."""
-        for p in self.transformer.parameters():
-            p.requires_grad = True
+    def freeze(self, layer_indices: list[int] | None = None) -> None:
+        """Freeze transformer encoder layers by index.
+
+        Args:
+            layer_indices: List of layer indices to freeze (0-indexed, supports negative indexing).
+                          If None, freeze all layers.
+        """
+        if layer_indices is None:
+            for p in self.transformer.parameters():
+                p.requires_grad = False
+        else:
+            num_layers = len(self.transformer.layers)
+            for idx in layer_indices:
+                # Handle negative indexing
+                if idx < 0:
+                    idx = num_layers + idx
+                if idx < 0 or idx >= num_layers:
+                    raise IndexError(f"Layer index {idx} out of range [0, {num_layers-1}]")
+                for p in self.transformer.layers[idx].parameters():
+                    p.requires_grad = False
+
+    def unfreeze(self, layer_indices: list[int] | None = None) -> None:
+        """Unfreeze transformer encoder layers by index.
+
+        Args:
+            layer_indices: List of layer indices to unfreeze (0-indexed, supports negative indexing).
+                          If None, unfreeze all layers.
+        """
+        if layer_indices is None:
+            for p in self.transformer.parameters():
+                p.requires_grad = True
+        else:
+            num_layers = len(self.transformer.layers)
+            for idx in layer_indices:
+                # Handle negative indexing
+                if idx < 0:
+                    idx = num_layers + idx
+                if idx < 0 or idx >= num_layers:
+                    raise IndexError(f"Layer index {idx} out of range [0, {num_layers-1}]")
+                for p in self.transformer.layers[idx].parameters():
+                    p.requires_grad = True
    
 
 class MPiFormerExtractor(BaseFeaturesExtractor):
@@ -205,7 +241,8 @@ class MPiFormerExtractor(BaseFeaturesExtractor):
             nested list ``[min_xyz, max_xyz]``.  Registered as a buffer so it
             moves to the correct device automatically.
         freeze_perception: If True, freeze perception encoder parameters on construction. Default: True.
-        freeze_transformer: If True, freeze transformer encoder parameters on construction. Default: False.
+        freeze_transformer: If True, freeze all transformer encoder parameters on construction. Default: False.
+        freeze_transformer_layers: First N transformer layers to freeze on construction. Default: None (ignored if freeze_transformer=True).
         deep_copy_perception: If True, deep copy the perception components from bc_model. Default: True.
         deep_copy_transformer: If True, deep copy the transformer components from bc_model. Default: True.
     """
@@ -217,6 +254,7 @@ class MPiFormerExtractor(BaseFeaturesExtractor):
         pc_bounds: list,
         freeze_perception: bool = True,
         freeze_transformer: bool = False,
+        freeze_transformer_layers: int | None = None,
         deep_copy_perception: bool = True,
         deep_copy_transformer: bool = True,
     ):
@@ -233,17 +271,24 @@ class MPiFormerExtractor(BaseFeaturesExtractor):
             "pc_bounds", torch.tensor(pc_bounds, dtype=torch.float32)
         )
         
-        self.permanently_frozen_components = []
+        self.learnable_components = []
+        self.learnable_transformer_layers = None  # Track selectively frozen layers
         if freeze_perception:
             self.freeze_perception()
-            self.permanently_frozen_components.append("perception")
         else:
             self.unfreeze_perception()
+            self.learnable_components.append("perception")
+        
         if freeze_transformer:
             self.freeze_transformer()
-            self.permanently_frozen_components.append("transformer")
+        elif freeze_transformer_layers is not None:
+            self.frozen_transformer_layers = list(range(freeze_transformer_layers))
+            self.learnable_transformer_layers = list(range(freeze_transformer_layers, self.transformer_encoder.num_layers()))
+            self.freeze_transformer_layers(self.frozen_transformer_layers)
+            self.learnable_components.append(f"transformer layers {self.learnable_transformer_layers}")
         else:
             self.unfreeze_transformer()
+            self.learnable_components.append("transformer")
 
     def freeze_perception(self) -> None:
         """Freeze perception encoder parameters."""
@@ -254,12 +299,20 @@ class MPiFormerExtractor(BaseFeaturesExtractor):
         self.perception_encoder.unfreeze()
 
     def freeze_transformer(self) -> None:
-        """Freeze transformer encoder parameters."""
+        """Freeze all transformer encoder parameters."""
         self.transformer_encoder.freeze()
 
+    def freeze_transformer_layers(self, layer_indices: list[int]) -> None:
+        """Freeze specific transformer layers by index."""
+        self.transformer_encoder.freeze(layer_indices=layer_indices)
+
     def unfreeze_transformer(self) -> None:
-        """Unfreeze transformer encoder parameters."""
+        """Unfreeze all transformer encoder parameters."""
         self.transformer_encoder.unfreeze()
+
+    def unfreeze_transformer_layers(self, layer_indices: list[int]) -> None:
+        """Unfreeze specific transformer layers by index."""
+        self.transformer_encoder.unfreeze(layer_indices=layer_indices)
 
     def forward(self, observations: dict) -> torch.Tensor:
         """

@@ -356,16 +356,19 @@ def bootstrap_sac_from_bc(
     # 2) Per-instance trainable transformer via MPiFormerTransformerExtractor
     # 3) Linear-only heads (net_arch={"pi": [], "qf": []})
     
+    features_extractor_kwargs = {
+        "bc_model": bc_model,
+        "pc_bounds": cfg["bc_checkpoint_parameters"]["pc_bounds"],
+        "freeze_perception": cfg.get("freeze_perception", True),  # Freeze perception encoder
+        "freeze_transformer": cfg.get("freeze_transformer", False),  # Transformer is trainable
+        "freeze_transformer_layers": cfg.get("freeze_transformer_layers", None), 
+        "deep_copy_perception": True,
+        "deep_copy_transformer": True,
+    }
+
     policy_kwargs = {
         "features_extractor_class": MPiFormerExtractor,
-        "features_extractor_kwargs": {
-            "bc_model": bc_model,
-            "pc_bounds": cfg["bc_checkpoint_parameters"]["pc_bounds"],
-            "freeze_perception": True,  # Freeze perception encoder
-            "freeze_transformer": False,  # Transformer is trainable
-            "deep_copy_perception": True,
-            "deep_copy_transformer": True,
-        },
+        "features_extractor_kwargs": features_extractor_kwargs,
         "net_arch": {
             "pi": [],  # Actor: just Linear(d_model, robot_dof)
             "qf": []   # Critic: just Linear(d_model + action_dim, 1)
