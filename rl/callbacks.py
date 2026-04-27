@@ -385,7 +385,10 @@ def _evaluate_policy_episode_rewards(
 
 
 class PeriodicEvalMetricsCallback(BaseCallback):
-    """Run one evaluation pass and log aggregated task metrics."""
+    """Run one evaluation pass and log aggregated task metrics.
+    
+    Evaluates at training start, periodically during training, and at training end.
+    """
 
     def __init__(
         self,
@@ -393,7 +396,7 @@ class PeriodicEvalMetricsCallback(BaseCallback):
         eval_freq: int,
         n_eval_episodes: int,
         deterministic: bool = True,
-        verbose: int = 0,
+        verbose: int = 1,
         logger_prefix: str = "eval",
         print_prefix: str = "Periodic evaluation",
     ) -> None:
@@ -405,10 +408,29 @@ class PeriodicEvalMetricsCallback(BaseCallback):
         self.logger_prefix = logger_prefix
         self.print_prefix = print_prefix
 
+    def _on_training_start(self) -> None:
+        """Called at the start of model.learn() - run initial eval."""
+        if self.verbose > 0:
+            print(f"\n=== {self.print_prefix} | step {self.num_timesteps} (start) ===")
+        self._run_evaluation(verbose=self.verbose > 0)
+
+    def _on_training_end(self) -> None:
+        """Called at the end of model.learn() - run final eval."""
+        if self.verbose > 0:
+            print(f"\n=== {self.print_prefix} | step {self.num_timesteps} (end) ===")
+        self._run_evaluation(verbose=self.verbose > 0)
+
     def _on_step(self) -> bool:
         if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
             return True
 
+        if self.verbose > 1:
+            print(f"\n=== {self.print_prefix} | step {self.num_timesteps} ===")
+        self._run_evaluation(self.verbose > 1)
+        return True
+
+    def _run_evaluation(self, verbose=False) -> None:
+        """Internal method that runs the actual evaluation and logging."""
         metrics = evaluate_policy_with_metrics(
             model=self.model,
             eval_env=self.eval_env,
@@ -416,20 +438,19 @@ class PeriodicEvalMetricsCallback(BaseCallback):
             deterministic=self.deterministic,
         )
 
-        print(f"\n=== {self.print_prefix} @ step {self.num_timesteps} ===")
-        print(
-            f"mean_reward={metrics['mean_reward']:.2f} +/- {metrics['std_reward']:.2f}, "
-            f"mean_len={metrics['mean_ep_length']:.2f} +/- {metrics['std_ep_length']:.2f}"
-        )
-        print(
-            f"target_reached_rate={metrics['target_reached_rate']:.3f}, "
-            f"mean_collisions={metrics['mean_num_collisions']:.3f}, "
-            f"mean_pos_err={metrics['mean_position_error']:.4f}m, "
-            f"mean_orient_err={metrics['mean_orientation_error']:.2f}deg, "
-            f"mean_action_abs={metrics['ep_action_abs_mean']:.4f}"
-        )
+        if verbose:
+            print(
+                f"mean_reward={metrics['mean_reward']:.2f} +/- {metrics['std_reward']:.2f}, "
+                f"mean_len={metrics['mean_ep_length']:.2f} +/- {metrics['std_ep_length']:.2f}"
+            )
+            print(
+                f"target_reached_rate={metrics['target_reached_rate']:.3f}, "
+                f"mean_collisions={metrics['mean_num_collisions']:.3f}, "
+                f"mean_pos_err={metrics['mean_position_error']:.4f}m, "
+                f"mean_orient_err={metrics['mean_orientation_error']:.2f}deg, "
+                f"mean_action_abs={metrics['ep_action_abs_mean']:.4f}"
+            )
 
         for key, value in metrics.items():
             self.logger.record(f"{self.logger_prefix}/{key}", value)
         self.logger.dump(step=self.num_timesteps)
-        return True

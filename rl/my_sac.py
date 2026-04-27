@@ -429,6 +429,8 @@ class MySAC(SACDebug):
             "train": self._new_train_metrics_accumulator(),
             "task": self._new_task_metrics_accumulator(),
         }
+        # Phase prefix for metric logging (e.g., "warmup", "finetune")
+        self._log_phase_prefix = None
 
     def _new_train_metrics_accumulator(self) -> Dict[str, Any]:
         return {
@@ -463,6 +465,10 @@ class MySAC(SACDebug):
             "delta_q_violation_rate_sum": 0.0,
             "action_abs_sum_per_joint": None,
         }
+
+    def set_log_phase_prefix(self, prefix: Optional[str]) -> None:
+        """Set phase prefix for all subsequent logger.record() calls."""
+        self._log_phase_prefix = prefix
 
     @override
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
@@ -617,36 +623,39 @@ class MySAC(SACDebug):
         train_acc["log_std_sum_per_joint"] += log_std_sum_per_joint
 
         # Dump train metrics every configured number of gradient updates.
+        prefix = "train" # for episode-level metrics
+        if self._log_phase_prefix is not None:
+            prefix = f"{self._log_phase_prefix}/" + prefix
         if self._n_updates % self.log_period == 0 and train_acc["steps"] > 0:
             train_steps = float(train_acc["steps"])
-            self.logger.record("train/n_updates", self._n_updates)
-            self.logger.record("train/ent_coef", train_acc["ent_coef_sum"] / train_steps)
-            self.logger.record("train/actor_loss", train_acc["actor_loss_sum"] / train_steps)
-            self.logger.record("train/critic_loss", train_acc["critic_loss_sum"] / train_steps)
+            self.logger.record(f"{prefix}/n_updates", self._n_updates)
+            self.logger.record(f"{prefix}/ent_coef", train_acc["ent_coef_sum"] / train_steps)
+            self.logger.record(f"{prefix}/actor_loss", train_acc["actor_loss_sum"] / train_steps)
+            self.logger.record(f"{prefix}/critic_loss", train_acc["critic_loss_sum"] / train_steps)
             if train_acc["ent_coef_loss_steps"] > 0:
                 ent_coef_loss_steps = float(train_acc["ent_coef_loss_steps"])
-                self.logger.record("train/ent_coef_loss", train_acc["ent_coef_loss_sum"] / ent_coef_loss_steps)
-            self.logger.record("train/entropy", train_acc["entropy_sum"] / train_steps)
+                self.logger.record(f"{prefix}/ent_coef_loss", train_acc["ent_coef_loss_sum"] / ent_coef_loss_steps)
+            self.logger.record(f"{prefix}/entropy", train_acc["entropy_sum"] / train_steps)
             if train_acc["actor_lr_count"] > 0:
                 self.logger.record(
-                    "train/actor_lr",
+                    f"{prefix}/actor_lr",
                     train_acc["actor_lr_sum"] / float(train_acc["actor_lr_count"]),
                 )
             if train_acc["critic_lr_count"] > 0:
                 self.logger.record(
-                    "train/critic_lr",
+                    f"{prefix}/critic_lr",
                     train_acc["critic_lr_sum"] / float(train_acc["critic_lr_count"]),
                 )
             if train_acc["ent_coef_lr_count"] > 0:
                 self.logger.record(
-                    "train/ent_coef_lt",
+                    f"{prefix}/ent_coef_lr",
                     train_acc["ent_coef_lr_sum"] / float(train_acc["ent_coef_lr_count"]),
                 )
 
             log_std_mean_per_joint = train_acc["log_std_sum_per_joint"] / train_steps
             for joint_idx, joint_value in enumerate(log_std_mean_per_joint):
-                self.logger.record(f"train/log_std_j{joint_idx}", float(joint_value))
-            self.logger.record("train/log_std_mean", float(np.mean(log_std_mean_per_joint)))
+                self.logger.record(f"{prefix}/log_std_j{joint_idx}", float(joint_value))
+            self.logger.record(f"{prefix}/log_std_mean", float(np.mean(log_std_mean_per_joint)))
             self.logger.dump(step=self.num_timesteps)
             self.metrics_accumulators["train"] = self._new_train_metrics_accumulator()
 
@@ -732,22 +741,24 @@ class MySAC(SACDebug):
 
             task_steps = float(task_acc["steps"])
             ratio = 1.0 / task_steps
-            prefix = "ep/" # for episode-level metrics 
-            self.logger.record(f"{prefix}episodes", self._episode_num)
-            self.logger.record(f"{prefix}target_reached_rate", task_acc["target_reached_sum"] * ratio)
-            self.logger.record(f"{prefix}timeout_rate", task_acc["timeout_sum"] * ratio)
-            self.logger.record(f"{prefix}num_steps", task_acc["num_steps_sum"] * ratio)
-            self.logger.record(f"{prefix}collision_rate", task_acc["collision_rate_sum"] * ratio)
-            self.logger.record(f"{prefix}return", task_acc["return_sum"] * ratio)
-            self.logger.record(f"{prefix}position_error", task_acc["position_error_sum"] * ratio)
-            self.logger.record(f"{prefix}orientation_error", task_acc["orientation_error_sum"] * ratio)
-            self.logger.record(f"{prefix}q_violation_rate", task_acc["q_violation_rate_sum"] * ratio)
-            self.logger.record(f"{prefix}delta_q_violation_rate", task_acc["delta_q_violation_rate_sum"] * ratio)
+            prefix = "ep" # for episode-level metrics
+            if self._log_phase_prefix is not None:
+                prefix = f"{self._log_phase_prefix}/" + prefix
+            self.logger.record(f"{prefix}/episodes", self._episode_num)
+            self.logger.record(f"{prefix}/target_reached_rate", task_acc["target_reached_sum"] * ratio)
+            self.logger.record(f"{prefix}/timeout_rate", task_acc["timeout_sum"] * ratio)
+            self.logger.record(f"{prefix}/num_steps", task_acc["num_steps_sum"] * ratio)
+            self.logger.record(f"{prefix}/collision_rate", task_acc["collision_rate_sum"] * ratio)
+            self.logger.record(f"{prefix}/return", task_acc["return_sum"] * ratio)
+            self.logger.record(f"{prefix}/position_error", task_acc["position_error_sum"] * ratio)
+            self.logger.record(f"{prefix}/orientation_error", task_acc["orientation_error_sum"] * ratio)
+            self.logger.record(f"{prefix}/q_violation_rate", task_acc["q_violation_rate_sum"] * ratio)
+            self.logger.record(f"{prefix}/delta_q_violation_rate", task_acc["delta_q_violation_rate_sum"] * ratio)
 
             action_abs_mean_per_joint = task_acc["action_abs_sum_per_joint"] * ratio
             for joint_idx, joint_value in enumerate(action_abs_mean_per_joint):
-                self.logger.record(f"{prefix}action_abs_j{joint_idx}", float(joint_value))
-            self.logger.record(f"{prefix}action_abs_mean", float(np.mean(action_abs_mean_per_joint)))
+                self.logger.record(f"{prefix}/action_abs_j{joint_idx}", float(joint_value))
+            self.logger.record(f"{prefix}/action_abs_mean", float(np.mean(action_abs_mean_per_joint)))
             should_reset_task_accumulator = True
 
         self._last_task_log_episode_num = self._episode_num
