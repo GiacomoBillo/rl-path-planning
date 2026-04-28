@@ -99,11 +99,12 @@ class MPiFormerPerceptionEncoder(nn.Module):
         embedded_sequence = sequence + pos_emb
         return embedded_sequence
 
-    def freeze(self, components: list[Literal["pointnet", "joint_encoder", "action_token", "type_embeddings"]] | None = None) -> None:
-        """Freeze components.
+    def set_trainable(self, components: list[Literal["pointnet", "joint_encoder", "action_token", "type_embeddings"]] | None = None, trainable: bool = True) -> None:
+        """Set trainability of perception components.
         
         Args:
-            components: List of component names to freeze. None means all.
+            components: List of component names. None means all.
+            trainable: If True, enable training; if False, freeze.
         """
         if components is None:
             components = ["pointnet", "joint_encoder", "action_token", "type_embeddings"]
@@ -111,41 +112,25 @@ class MPiFormerPerceptionEncoder(nn.Module):
         for comp in components:
             if comp == "pointnet":
                 for p in self.point_cloud_embedder.parameters():
-                    p.requires_grad = False
+                    p.requires_grad = trainable
             elif comp == "joint_encoder":
                 for p in self.feature_embedder.parameters():
-                    p.requires_grad = False
+                    p.requires_grad = trainable
             elif comp == "action_token":
-                self.action_tokens.requires_grad = False
+                self.action_tokens.requires_grad = trainable
             elif comp == "type_embeddings":
                 for p in self.token_type_embedding.parameters():
-                    p.requires_grad = False
+                    p.requires_grad = trainable
             else:
                 raise ValueError(f"Unknown component name: {comp}")
 
+    def freeze(self, components: list[Literal["pointnet", "joint_encoder", "action_token", "type_embeddings"]] | None = None) -> None:
+        """Freeze components. Convenience wrapper for set_trainable(trainable=False)."""
+        self.set_trainable(components=components, trainable=False)
+
     def unfreeze(self, components: list[Literal["pointnet", "joint_encoder", "action_token", "type_embeddings"]] | None = None) -> None:
-        """Unfreeze components.
-        
-        Args:
-            components: List of component names to unfreeze. None means all.
-        """
-        if components is None:
-            components = ["pointnet", "joint_encoder", "action_token", "type_embeddings"]
-        
-        for comp in components:
-            if comp == "pointnet":
-                for p in self.point_cloud_embedder.parameters():
-                    p.requires_grad = True
-            elif comp == "joint_encoder":
-                for p in self.feature_embedder.parameters():
-                    p.requires_grad = True
-            elif comp == "action_token":
-                self.action_tokens.requires_grad = True
-            elif comp == "type_embeddings":
-                for p in self.token_type_embedding.parameters():
-                    p.requires_grad = True
-            else:
-                raise ValueError(f"Unknown component name: {comp}")
+        """Unfreeze components. Convenience wrapper for set_trainable(trainable=True)."""
+        self.set_trainable(components=components, trainable=True)
 
 
 class MPiFormerTransformerEncoder(nn.Module):
@@ -182,47 +167,51 @@ class MPiFormerTransformerEncoder(nn.Module):
         """Return number of transformer layers."""
         return len(self.transformer.layers)
 
-    def freeze(self, layer_indices: list[int] | None = None) -> None:
-        """Freeze transformer encoder layers by index.
+    def set_trainable(self, components: list[int | str] | None = None, trainable: bool = True) -> None:
+        """Set trainability of transformer layers and components.
 
         Args:
-            layer_indices: List of layer indices to freeze (0-indexed, supports negative indexing).
-                          If None, freeze all layers.
+            components: List of layer indices (int, 0-indexed, supports negative indexing) or 
+                       component names (str). Special component: "final_norm" for transformer's final norm layer.
+                       Example: [0, 1, 2, "final_norm"] to set layers 0,1,2 and final norm.
+                       If None, sets all layers.
+            trainable: If True, enable training; if False, freeze.
         """
-        if layer_indices is None:
+        if components is None:
+            # Set all layers and final norm
             for p in self.transformer.parameters():
-                p.requires_grad = False
+                p.requires_grad = trainable
         else:
             num_layers = len(self.transformer.layers)
-            for idx in layer_indices:
-                # Handle negative indexing
-                if idx < 0:
-                    idx = num_layers + idx
-                if idx < 0 or idx >= num_layers:
-                    raise IndexError(f"Layer index {idx} out of range [0, {num_layers-1}]")
-                for p in self.transformer.layers[idx].parameters():
-                    p.requires_grad = False
+            for comp in components:
+                if isinstance(comp, int):
+                    # Handle layer index
+                    idx = comp
+                    if idx < 0:
+                        idx = num_layers + idx
+                    if idx < 0 or idx >= num_layers:
+                        raise IndexError(f"Layer index {comp} out of range [0, {num_layers-1}]")
+                    for p in self.transformer.layers[idx].parameters():
+                        p.requires_grad = trainable
+                elif isinstance(comp, str):
+                    # Handle component names
+                    if comp == "final_norm":
+                        final_norm = getattr(self.transformer, "norm", None)
+                        if final_norm is not None:
+                            for p in final_norm.parameters():
+                                p.requires_grad = trainable
+                    else:
+                        raise ValueError(f"Unknown component name: {comp}. Supported: 'final_norm'")
+                else:
+                    raise TypeError(f"Component must be int (layer index) or str (component name), got {type(comp)}")
+
+    def freeze(self, layer_indices: list[int] | None = None) -> None:
+        """Freeze transformer encoder layers by index. Convenience wrapper for set_trainable(trainable=False)."""
+        self.set_trainable(components=layer_indices, trainable=False)
 
     def unfreeze(self, layer_indices: list[int] | None = None) -> None:
-        """Unfreeze transformer encoder layers by index.
-
-        Args:
-            layer_indices: List of layer indices to unfreeze (0-indexed, supports negative indexing).
-                          If None, unfreeze all layers.
-        """
-        if layer_indices is None:
-            for p in self.transformer.parameters():
-                p.requires_grad = True
-        else:
-            num_layers = len(self.transformer.layers)
-            for idx in layer_indices:
-                # Handle negative indexing
-                if idx < 0:
-                    idx = num_layers + idx
-                if idx < 0 or idx >= num_layers:
-                    raise IndexError(f"Layer index {idx} out of range [0, {num_layers-1}]")
-                for p in self.transformer.layers[idx].parameters():
-                    p.requires_grad = True
+        """Unfreeze transformer encoder layers by index. Convenience wrapper for set_trainable(trainable=True)."""
+        self.set_trainable(components=layer_indices, trainable=True)
    
 
 class MPiFormerExtractor(BaseFeaturesExtractor):
@@ -283,36 +272,57 @@ class MPiFormerExtractor(BaseFeaturesExtractor):
             self.freeze_transformer()
         elif freeze_transformer_layers is not None:
             self.frozen_transformer_layers = list(range(freeze_transformer_layers))
-            self.learnable_transformer_layers = list(range(freeze_transformer_layers, self.transformer_encoder.num_layers()))
-            self.freeze_transformer_layers(self.frozen_transformer_layers)
+            # Include "final_norm" with the learnable layer indices
+            self.learnable_transformer_layers = list(range(freeze_transformer_layers, self.transformer_encoder.num_layers())) + ["final_norm"]
+            self.freeze_transformer(components=self.frozen_transformer_layers)
             self.learnable_components.append(f"transformer layers {self.learnable_transformer_layers}")
         else:
             self.unfreeze_transformer()
             self.learnable_components.append("transformer")
 
+    def set_trainable_perception(self, trainable: bool = True) -> None:
+        """Set trainability of all perception encoder components."""
+        self.perception_encoder.set_trainable(trainable=trainable)
+
+    def set_trainable_transformer(self, components: list[int | str] | None = None, trainable: bool = True) -> None:
+        """Set trainability of transformer layers and components.
+        
+        Args:
+            components: List of layer indices (int) or component names (str).
+                       Special component: "final_norm" for transformer's final norm layer.
+                       None means all layers.
+            trainable: If True, enable training; if False, freeze.
+        """
+        self.transformer_encoder.set_trainable(components=components, trainable=trainable)
+
+    # Backwards compatibility wrappers (kept for API stability)
     def freeze_perception(self) -> None:
-        """Freeze perception encoder parameters."""
-        self.perception_encoder.freeze()
+        """Freeze perception encoder parameters. Deprecated: use set_trainable_perception(trainable=False)."""
+        self.set_trainable_perception(trainable=False)
 
     def unfreeze_perception(self) -> None:
-        """Unfreeze perception encoder parameters."""
-        self.perception_encoder.unfreeze()
+        """Unfreeze perception encoder parameters. Deprecated: use set_trainable_perception(trainable=True)."""
+        self.set_trainable_perception(trainable=True)
 
-    def freeze_transformer(self) -> None:
-        """Freeze all transformer encoder parameters."""
-        self.transformer_encoder.freeze()
+    def freeze_transformer(self, components: list[int | str] | None = None) -> None:
+        """Freeze transformer encoder parameters.
+        
+        Args:
+            components: List of layer indices (int) or component names (str).
+                       Special component: "final_norm" for transformer's final norm layer.
+                       None means freeze all layers.
+        """
+        self.set_trainable_transformer(components=components, trainable=False)
 
-    def freeze_transformer_layers(self, layer_indices: list[int]) -> None:
-        """Freeze specific transformer layers by index."""
-        self.transformer_encoder.freeze(layer_indices=layer_indices)
-
-    def unfreeze_transformer(self) -> None:
-        """Unfreeze all transformer encoder parameters."""
-        self.transformer_encoder.unfreeze()
-
-    def unfreeze_transformer_layers(self, layer_indices: list[int]) -> None:
-        """Unfreeze specific transformer layers by index."""
-        self.transformer_encoder.unfreeze(layer_indices=layer_indices)
+    def unfreeze_transformer(self, components: list[int | str] | None = None) -> None:
+        """Unfreeze transformer encoder parameters.
+        
+        Args:
+            components: List of layer indices (int) or component names (str).
+                       Special component: "final_norm" for transformer's final norm layer.
+                       None means unfreeze all layers.
+        """
+        self.set_trainable_transformer(components=components, trainable=True)
 
     def forward(self, observations: dict) -> torch.Tensor:
         """
