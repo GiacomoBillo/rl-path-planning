@@ -4,6 +4,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv, VecMonitor, is
 from tqdm import tqdm
 import numpy as np
 from typing import Any, Optional
+import os
 
 
 
@@ -388,6 +389,7 @@ class PeriodicEvalMetricsCallback(BaseCallback):
     """Run one evaluation pass and log aggregated task metrics.
     
     Evaluates at training start, periodically during training, and at training end.
+    Optionally saves checkpoints at peaks in the target_reached_rate metric.
     """
 
     def __init__(
@@ -399,6 +401,8 @@ class PeriodicEvalMetricsCallback(BaseCallback):
         verbose: int = 1,
         logger_prefix: str = "eval",
         print_prefix: str = "Periodic evaluation",
+        peak_checkpoints: bool = False,
+        checkpoint_base_path: Optional[str] = "checkpoints/model",
     ) -> None:
         super().__init__(verbose=verbose)
         self.eval_env = eval_env
@@ -407,6 +411,19 @@ class PeriodicEvalMetricsCallback(BaseCallback):
         self.deterministic = deterministic
         self.logger_prefix = logger_prefix
         self.print_prefix = print_prefix
+        
+        # Peak checkpoint configuration
+        self.peak_checkpoints = peak_checkpoints
+        self.peak_entry_threshold = 0.9  # Threshold to enter a peak
+        self.peak_exit_threshold = 0.85  # Threshold to exit a peak (hysteresis)
+        self.checkpoint_base_path = checkpoint_base_path
+        if self.checkpoint_base_path is not None and self.checkpoint_base_path.endswith(".zip"):
+            self.checkpoint_base_path = self.checkpoint_base_path[:-4]
+        
+        # Peak state tracking
+        self.current_peak_active = False
+        self.current_peak_best_value = 0.0
+        self.current_peak_checkpoint_path = None
 
     def _on_training_start(self) -> None:
         """Called at the start of model.learn() - run initial eval."""
@@ -454,3 +471,74 @@ class PeriodicEvalMetricsCallback(BaseCallback):
         for key, value in metrics.items():
             self.logger.record(f"{self.logger_prefix}/{key}", value)
         self.logger.dump(step=self.num_timesteps)
+        
+        # Handle peak checkpoint saving
+        if self.peak_checkpoints:
+            self._handle_peak_checkpoint(metrics)
+
+    def _handle_peak_checkpoint(self, metrics: dict) -> None:
+        """Handle peak detection and checkpoint saving with hysteresis.
+        
+        Peak strategy with hysteresis to avoid oscillations:
+        - Entry threshold: 0.9 - need to reach this to enter a peak
+        - Exit threshold: 0.85 - must drop below this to exit (prevents false exits)
+        
+        This prevents rapid enter/exit cycles if metric bounces around 0.9.
+        """
+        target_reached_rate = metrics.get("target_reached_rate", 0.0)
+        
+        if not self.current_peak_active:
+            # Not in peak - check if entering
+            if target_reached_rate >= self.peak_entry_threshold:
+                # Entering a new peak
+                self.current_peak_active = True
+                self.current_peak_best_value = target_reached_rate
+                self._save_peak_checkpoint()
+                if self.verbose > 2:
+                    print(f"📈 Peak detected at step {self.num_timesteps}: {target_reached_rate:.4f}")
+        else:
+            # In peak - check if exiting or improving
+            if target_reached_rate < self.peak_exit_threshold:
+                # Exiting the peak (hysteresis: must drop below exit threshold)
+                self.current_peak_active = False
+                self.current_peak_checkpoint_path = None
+                if self.verbose > 2:
+                    print(f"📉 Peak ended. Best value: {self.current_peak_best_value:.4f}")
+            elif target_reached_rate > self.current_peak_best_value:
+                # Better value within the same peak, replace checkpoint
+                self._delete_peak_checkpoint()
+                self.current_peak_best_value = target_reached_rate
+                self._save_peak_checkpoint()
+                if self.verbose > 2:
+                    print(f"📈 Peak improved at step {self.num_timesteps}: {target_reached_rate:.4f}")
+
+    def _save_peak_checkpoint(self) -> None:
+        """Save a checkpoint at the current peak."""
+        if self.model is None:
+            return
+        
+        checkpoint_path = f"{self.checkpoint_base_path}_step_{self.num_timesteps}"
+        self.current_peak_checkpoint_path = checkpoint_path
+        
+        try:
+            self.model.save(checkpoint_path)
+            if self.verbose > 2:
+                print(f"✓ Peak checkpoint saved: {checkpoint_path}.zip")
+        except Exception as e:
+            if self.verbose > 2:
+                print(f"Warning: Failed to save peak checkpoint: {e}")
+
+    def _delete_peak_checkpoint(self) -> None:
+        """Delete the current peak checkpoint if it exists."""
+        if self.current_peak_checkpoint_path is None:
+            return
+        
+        checkpoint_path = f"{self.current_peak_checkpoint_path}.zip"
+        try:
+            if os.path.exists(checkpoint_path):
+                os.remove(checkpoint_path)
+                if self.verbose > 2:
+                    print(f"🗑️  Removed old peak checkpoint: {checkpoint_path}")
+        except Exception as e:
+            if self.verbose > 2:
+                print(f"Warning: Failed to delete peak checkpoint: {e}")

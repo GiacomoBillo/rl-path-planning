@@ -285,6 +285,9 @@ def run_finetune(
         if effective_eval_freq != log_eval_freq:
             print(f"✓ Periodic eval frequency scaled: {effective_eval_freq} calls")
 
+        # Compute checkpoint base path for peak checkpoints
+        checkpoint_base_path = get_save_path(cfg, run_info)
+
         periodic_eval_callback = PeriodicEvalMetricsCallback(
             eval_env=eval_env,
             eval_freq=effective_eval_freq,
@@ -293,6 +296,8 @@ def run_finetune(
             verbose=args.verbose,
             logger_prefix="finetune/eval",
             print_prefix="Policy eval",
+            peak_checkpoints=True,
+            checkpoint_base_path=checkpoint_base_path,
         )
         print(f"✓ Periodic eval: every {log_eval_freq} steps ({cfg['n_eval_episodes']} eps)")
 
