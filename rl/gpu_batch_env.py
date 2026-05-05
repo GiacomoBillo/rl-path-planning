@@ -348,16 +348,102 @@ class AvoidEverythingEnv(EnvBase):
         return target_reached, pos_err, orient_err
 
     def _reset(self, tensordict: TensorDictBase | None = None, **kwargs) -> TensorDictBase:
-        batch = self._next_problem_batch()
-        self.robot_config = batch["configuration"].to(torch.float32).clone()
-        self.target_position = batch["target_position"].to(torch.float32).clone()
-        self.target_orientation = batch["target_orientation"].to(torch.float32).clone()
-        self._base_point_cloud = batch["point_cloud"].to(torch.float32).clone()
-        self._point_cloud_labels = batch["point_cloud_labels"].to(torch.int32).clone()
-        self._scene_primitives = self._build_scene_primitives(batch)
-        self._episode_step_count = torch.zeros(
-            self.num_envs, dtype=torch.int64, device=self.device
-        )
+        """Reset environment state.
+
+        Supports partial reset when tensordict contains an "_reset" boolean mask (shape [B,1]).
+        """
+        # Full reset when no mask is provided
+        if tensordict is None or "_reset" not in getattr(tensordict, "keys", lambda: [])():
+            batch = self._next_problem_batch()
+            self.robot_config = batch["configuration"].to(torch.float32).clone()
+            self.target_position = batch["target_position"].to(torch.float32).clone()
+            self.target_orientation = batch["target_orientation"].to(torch.float32).clone()
+            self._base_point_cloud = batch["point_cloud"].to(torch.float32).clone()
+            self._point_cloud_labels = batch["point_cloud_labels"].to(torch.int32).clone()
+            self._scene_primitives = self._build_scene_primitives(batch)
+            self._episode_step_count = torch.zeros(
+                self.num_envs, dtype=torch.int64, device=self.device
+            )
+
+            obs = self._get_obs()
+            false_flag = torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
+            out = TensorDict(
+                {
+                    "point_cloud": obs["point_cloud"],
+                    "point_cloud_labels": obs["point_cloud_labels"],
+                    "configuration": obs["configuration"],
+                    "done": false_flag.clone(),
+                    "terminated": false_flag.clone(),
+                    "truncated": false_flag.clone(),
+                },
+                batch_size=self.batch_size,
+                device=self.device,
+            )
+            return out
+
+        # Partial reset: expect an explicit mask under "_reset"
+        mask_td = tensordict.get("_reset")
+        if mask_td is None:
+            return self._reset(None)
+
+        mask = mask_td.squeeze(-1).to(torch.bool)
+        # nothing to reset
+        if not mask.any():
+            obs = self._get_obs()
+            false_flag = torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
+            out = TensorDict(
+                {
+                    "point_cloud": obs["point_cloud"],
+                    "point_cloud_labels": obs["point_cloud_labels"],
+                    "configuration": obs["configuration"],
+                    "done": false_flag.clone(),
+                    "terminated": false_flag.clone(),
+                    "truncated": false_flag.clone(),
+                },
+                batch_size=self.batch_size,
+                device=self.device,
+            )
+            return out
+
+        # full replace when all True
+        if mask.all():
+            return self._reset(None)
+
+        # perform partial replacement for masked indices
+        idxs = mask.nonzero(as_tuple=True)[0]
+        k = int(idxs.numel())
+        new_batch = self._next_problem_batch()
+
+        # update scalar/batched tensors
+        self.robot_config[idxs] = new_batch["configuration"][:k].to(torch.float32).clone()
+        self.target_position[idxs] = new_batch["target_position"][:k].to(torch.float32).clone()
+        self.target_orientation[idxs] = new_batch["target_orientation"][:k].to(torch.float32).clone()
+        self._base_point_cloud[idxs] = new_batch["point_cloud"][:k].to(torch.float32).clone()
+        self._point_cloud_labels[idxs] = new_batch["point_cloud_labels"][:k].to(torch.int32).clone()
+
+        # update scene primitives in-place
+        new_prims = self._build_scene_primitives(new_batch)
+        if self._scene_primitives is None:
+            self._scene_primitives = new_prims
+        else:
+            old_cuboids, old_cylinders = self._scene_primitives
+            new_cuboids, new_cylinders = new_prims
+
+            old_cuboids.centers[idxs] = new_cuboids.centers[:k]
+            old_cuboids.dims[idxs] = new_cuboids.dims[:k]
+            old_cuboids.quats[idxs] = new_cuboids.quats[:k]
+            old_cuboids.inv_frames[idxs] = new_cuboids.inv_frames[:k]
+            old_cuboids.mask[idxs] = new_cuboids.mask[:k]
+
+            old_cylinders.centers[idxs] = new_cylinders.centers[:k]
+            old_cylinders.radii[idxs] = new_cylinders.radii[:k]
+            old_cylinders.heights[idxs] = new_cylinders.heights[:k]
+            old_cylinders.quats[idxs] = new_cylinders.quats[:k]
+            old_cylinders.inv_frames[idxs] = new_cylinders.inv_frames[:k]
+            old_cylinders.mask[idxs] = new_cylinders.mask[:k]
+
+        # reset episode counters for masked indices
+        self._episode_step_count[idxs] = 0
 
         obs = self._get_obs()
         false_flag = torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
