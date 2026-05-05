@@ -73,7 +73,7 @@ train_freq: [1, "step"] # int | Tuple[int, str] , Update the model every ... (n,
 gradient_steps: 1  # Number of gradient updates to perform after each train_freq
 
 # Prefill buffer with current policy rollouts
-transitions_before_learn: 200  # Prefill replay buffer with transitions before learn()
+transitions_before_learn: 0  # Prefill replay buffer with transitions before learn()
 prefill_deterministic: false  # Use deterministic actions during replay prefill
 prefill_render: true
 
@@ -89,7 +89,7 @@ target_entropy: -30  # Target entropy for 'auto' entropy coefficient tuning
 #   - linear: Linear decay from start_lr to end_lr
 
 # Critic warmup phase (actor frozen, critic trains on BC rollouts):
-critic_warmup_steps: 1000
+critic_warmup_steps: 0
 critic_warmup_lr:
   type: "linear"       # "constant" or "linear"
   start_lr: 3.0e-4       # Learning rate during warmup
