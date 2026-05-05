@@ -46,3 +46,4 @@ gymnasium==1.0.0
 stable_baselines3[extra]==2.4.1
 wandb==0.22.3
 python-dotenv==1.2.2
+torchrl==0.12.0
