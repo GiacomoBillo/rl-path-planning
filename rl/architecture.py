@@ -191,7 +191,10 @@ class MPiFormerActorHeadNetwork(nn.Module):
 
 
 class MPiFormerCriticHeadNetwork(nn.Module):
-    """Critic head: remaining transformer layers + twin Q outputs."""
+    """
+    Critic head: remaining transformer layers + single Q output.
+    -> Instantiate two separate heads for double critic
+    """
 
     def __init__(
         self,
@@ -204,17 +207,17 @@ class MPiFormerCriticHeadNetwork(nn.Module):
         self.tail = _TailNetwork(bc_model, split_layer=split_layer, deep_copy=deep_copy)
         action_dim = bc_model.action_decoder.out_features
         critic_in_dim = self.tail.d_model + action_dim
-        self.q1 = nn.Linear(critic_in_dim, 1)
-        self.q2 = nn.Linear(critic_in_dim, 1)
+        self.q = nn.Linear(critic_in_dim, 1)
 
-    def forward(self, features: torch.Tensor, rl_action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, features: torch.Tensor, rl_action: torch.Tensor) -> torch.Tensor:
         latent = self.tail(features)
         x = torch.cat([latent, rl_action], dim=-1)
-        return self.q1(x), self.q2(x)
+        return self.q(x)
 
 
 class MPiFormerTorchRLArchitecture:
     """
+    Wrap MPiFormer components into modular TorchRL components to use TensorDictModules as inputs and outputs
     Encapsulated TorchRL wiring:
       1) backbone_module: observation -> features
       2) head_module: features -> loc, scale
@@ -230,6 +233,8 @@ class MPiFormerTorchRLArchitecture:
         deep_copy: bool = True,
         log_std_init: float = -10.0,
     ):
+        # split bc model at split_layer into frozen backbone and actor/critic heads that can be fine-tuned
+        # torch modules
         self.backbone = MPiFormerBackboneNetwork(
             bc_model,
             pc_bounds=pc_bounds,
@@ -242,21 +247,80 @@ class MPiFormerTorchRLArchitecture:
             deep_copy=deep_copy,
             log_std_init=log_std_init,
         )
-        self.critic_head = MPiFormerCriticHeadNetwork(
+        self.critic_head_q1 = MPiFormerCriticHeadNetwork(
             bc_model,
             split_layer=split_layer,
             deep_copy=deep_copy,
         )
+        self.critic_head_q2 = MPiFormerCriticHeadNetwork(
+            bc_model,
+            split_layer=split_layer,
+            deep_copy=deep_copy,
+        )
+
+    class _BatchFirst(nn.Module):
+        """Wrapper to let modules that expect sequence-first tensors ([S,B,...])
+        accept batch-first inputs ([B,S,...]) and optionally transpose outputs.
+
+        - S: transformer sequence length
+        - B: batch size
+        - D: feature dimension
+
+        Why is it needed?
+            Replay stores features as [B,S,D] (batch_first) to be memory-friendly. 
+            Heads/tails still expect sequence-first [S,B,D], 
+            so _BatchFirst centralizes the transpose logic and avoids duplicating small adapters.
+
+        Usage:
+          - For actor/critic heads: transpose_in=True, transpose_out=False
+          - For backbone: transpose_in=False, transpose_out=True
+        """
+
+        def __init__(self, module: nn.Module, *, transpose_in: bool = False, transpose_out: bool = False):
+            super().__init__()
+            self.module = module
+            self.transpose_in = transpose_in
+            self.transpose_out = transpose_out
+
+        def forward(self, *args, **kwargs):
+            # transpose incoming 'features' if present in kwargs
+            if self.transpose_in:
+                if "features" in kwargs:
+                    f = kwargs["features"]
+                    if isinstance(f, torch.Tensor) and f.ndim == 3:
+                        kwargs["features"] = f.transpose(0, 1).contiguous()
+                elif len(args) >= 1 and isinstance(args[0], torch.Tensor) and args[0].ndim == 3:
+                    f = args[0]
+                    args = (f.transpose(0, 1).contiguous(),) + args[1:]
+
+            out = self.module(*args, **kwargs)
+
+            if self.transpose_out:
+                # transpose sequence-first outputs like [S,B,D] -> [B,S,D]
+                if isinstance(out, torch.Tensor) and out.ndim == 3:
+                    return out.transpose(0, 1).contiguous()
+                if isinstance(out, (tuple, list)):
+                    out_list = []
+                    for v in out:
+                        if isinstance(v, torch.Tensor) and v.ndim == 3:
+                            out_list.append(v.transpose(0, 1).contiguous())
+                        else:
+                            out_list.append(v)
+                    return tuple(out_list) if isinstance(out, tuple) else out_list
+
+            return out
 
     def build_backbone_module(
         self,
         *,
         in_keys: Sequence[str] = ("point_cloud_labels", "point_cloud", "configuration"),
         out_key: str = "features",
+        batch_first: bool = False,
     ) -> Any:
         _require_torchrl()
+        module = self.backbone if not batch_first else self._BatchFirst(self.backbone, transpose_in=False, transpose_out=True)
         return TensorDictModule(  # type: ignore[misc]
-            self.backbone,
+            module,
             in_keys=list(in_keys),
             out_keys=[out_key],
         )
@@ -266,10 +330,12 @@ class MPiFormerTorchRLArchitecture:
         *,
         in_key: str = "features",
         out_keys: Sequence[str] = ("loc", "scale"),
+        batch_first: bool = False,
     ) -> Any:
         _require_torchrl()
+        module = self.actor_head if not batch_first else self._BatchFirst(self.actor_head, transpose_in=True, transpose_out=False)
         return TensorDictModule(  # type: ignore[misc]
-            self.actor_head,
+            module,
             in_keys=[in_key],
             out_keys=list(out_keys),
         )
@@ -277,18 +343,21 @@ class MPiFormerTorchRLArchitecture:
     def build_probabilistic_actor(
         self,
         *,
-        action_spec: Any,
+        action_spec: Any | None = None,
         in_keys: Sequence[str] = ("loc", "scale"),
-        out_key: str = "rl_action",
+        out_key: str = "action",
+        distribution_kwargs: dict | None = None,
         return_log_prob: bool = True,
+        batch_first: bool = False,
     ) -> Any:
         _require_torchrl()
-        head_module = self.build_head_module(in_key="features", out_keys=in_keys)
+        head_module = self.build_head_module(in_key="features", out_keys=in_keys, batch_first=batch_first)
         return ProbabilisticActor(  # type: ignore[misc]
             module=head_module,
             in_keys=list(in_keys),
             out_keys=[out_key],
             distribution_class=TanhNormal,
+            distribution_kwargs=distribution_kwargs,
             return_log_prob=return_log_prob,
             spec=action_spec,
         )
@@ -299,35 +368,39 @@ class MPiFormerTorchRLArchitecture:
         action_spec: Any,
         observation_in_keys: Sequence[str] = ("point_cloud_labels", "point_cloud", "configuration"),
         features_key: str = "features",
-        out_key: str = "rl_action",
+        out_key: str = "action",
         return_log_prob: bool = True,
+        batch_first: bool = False,
     ) -> Any:
         _require_torchrl()
         backbone_module = self.build_backbone_module(
             in_keys=observation_in_keys,
             out_key=features_key,
+            batch_first=batch_first,
         )
         actor = self.build_probabilistic_actor(
             action_spec=action_spec,
             in_keys=("loc", "scale"),
             out_key=out_key,
             return_log_prob=return_log_prob,
+            batch_first=batch_first,
         )
         return TensorDictSequential(backbone_module, actor)  # type: ignore[misc]
 
-    def build_critic_module(
+    def build_critic_modules(
         self,
         *,
         features_key: str = "features",
-        action_key: str = "rl_action",
-        out_keys: Sequence[str] = ("q1", "q2"),
-    ) -> Any:
+        action_key: str = "action",
+        batch_first: bool = False,
+    ) -> list[Any]:
+        """Build list with 2 separate critic tensordict modules for double critic."""
         _require_torchrl()
-        return TensorDictModule(  # type: ignore[misc]
-            self.critic_head,
-            in_keys=[features_key, action_key],
-            out_keys=list(out_keys),
-        )
+        q1_mod = self.critic_head_q1 if not batch_first else self._BatchFirst(self.critic_head_q1, transpose_in=True, transpose_out=False)
+        q2_mod = self.critic_head_q2 if not batch_first else self._BatchFirst(self.critic_head_q2, transpose_in=True, transpose_out=False)
+        q1_td = TensorDictModule(q1_mod, in_keys=[features_key, action_key], out_keys=["state_action_value"])  # type: ignore[misc]
+        q2_td = TensorDictModule(q2_mod, in_keys=[features_key, action_key], out_keys=["state_action_value"])  # type: ignore[misc]
+        return [q1_td, q2_td]
 
 
 __all__ = [

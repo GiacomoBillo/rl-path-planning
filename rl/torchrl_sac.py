@@ -43,55 +43,8 @@ class TrainMetrics:
     replay_size: int = 0
 
 
-class CriticQ1Only(nn.Module):
-    def __init__(self, critic_head: nn.Module):
-        super().__init__()
-        self.critic_head = critic_head
-
-    def forward(self, features: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        hidden = features.transpose(0, 1).contiguous()
-        q1, _ = self.critic_head(hidden, action)
-        return q1
-
-
-class CriticQ2Only(nn.Module):
-    def __init__(self, critic_head: nn.Module):
-        super().__init__()
-        self.critic_head = critic_head
-
-    def forward(self, features: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        hidden = features.transpose(0, 1).contiguous()
-        _, q2 = self.critic_head(hidden, action)
-        return q2
-
-
-class BackboneToAbstract(nn.Module):
-    """Convert backbone output from [S, B, D] to replay-friendly [B, S, D]."""
-
-    def __init__(self, backbone: nn.Module):
-        super().__init__()
-        self.backbone = backbone
-
-    def forward(
-        self,
-        point_cloud_labels: torch.Tensor,
-        point_cloud: torch.Tensor,
-        configuration: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden = self.backbone(point_cloud_labels, point_cloud, configuration)
-        return hidden.transpose(0, 1).contiguous()
-
-
-class ActorFromAbstract(nn.Module):
-    """Consume abstract feature [B, S, D] and return Gaussian params."""
-
-    def __init__(self, actor_head: nn.Module):
-        super().__init__()
-        self.actor_head = actor_head
-
-    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden = features.transpose(0, 1).contiguous()
-        return self.actor_head(hidden)
+# Adapters removed: use MPiFormerTorchRLArchitecture.build_backbone_module(..., batch_first=True)
+# and build_head_module(..., batch_first=True) instead of local transposing adapters.
 
 
 def parse_args() -> argparse.Namespace:
@@ -182,42 +135,121 @@ def load_bc_model(cfg: dict[str, Any], device: torch.device) -> PretrainingMotio
     return model
 
 
-def build_sac_loss(
-    actor: ProbabilisticActor,
-    critic_head: nn.Module,
-    target_entropy: float,
-    fixed_alpha: bool,
-    alpha_init: float,
-    gamma: float,
-) -> SACLoss:
-    q1_module = TensorDictModule(
-        CriticQ1Only(critic_head),
-        in_keys=["features", "action"],
-        out_keys=["state_action_value"],
-    )
-    q2_module = TensorDictModule(
-        CriticQ2Only(critic_head),
-        in_keys=["features", "action"],
-        out_keys=["state_action_value"],
-    )
-
-    loss_module = SACLoss(
-        actor_network=actor,
-        qvalue_network=[q1_module, q2_module],
-        target_entropy=target_entropy,
-        fixed_alpha=fixed_alpha,
-        alpha_init=alpha_init,
-    )
-    loss_module.make_value_estimator(ValueEstimators.TD0, gamma=gamma)
-    return loss_module
-
-
 def soft_update_qvalue_targets(loss_module: SACLoss, tau: float) -> None:
     with torch.no_grad():
         target_params = list(loss_module.target_qvalue_network_params.values(True, True))
         source_params = list(loss_module.qvalue_network_params.values(True, True))
         for target, source in zip(target_params, source_params):
             target.data.mul_(1.0 - tau).add_(source.data, alpha=tau)
+
+
+def _cpuify(obj):
+    """Recursively move all tensors in obj to CPU for smaller checkpoint files."""
+    if torch.is_tensor(obj):
+        return obj.cpu()
+    if isinstance(obj, dict):
+        return {k: _cpuify(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_cpuify(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_cpuify(v) for v in obj)
+    return obj
+
+
+def save_checkpoint(
+    save_dir: Path,
+    architecture: "MPiFormerTorchRLArchitecture",
+    actor_optim: Adam,
+    qvalue_optim: Adam,
+    alpha_optim: Adam | None,
+    loss_module: SACLoss,
+    cfg: dict[str, Any],
+    step: int,
+    save_replay: bool = False,
+    replay_buffer: TensorDictReplayBuffer | None = None,
+) -> Path:
+    """Save actor/critic heads, optimizer states, alpha and some metadata.
+
+    Returns the path to the saved checkpoint.
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = save_dir / f"sac_checkpoint_{step}.pt"
+
+    ckpt: dict[str, Any] = {
+        "actor_head": _cpuify(architecture.actor_head.state_dict()),
+        "critic_head_q1": _cpuify(architecture.critic_head_q1.state_dict()),
+        "critic_head_q2": _cpuify(architecture.critic_head_q2.state_dict()),
+        "actor_optim": _cpuify(actor_optim.state_dict()),
+        "critic_optim": _cpuify(qvalue_optim.state_dict()),
+        "alpha_optim": _cpuify(alpha_optim.state_dict()) if alpha_optim is not None else None,
+        "log_alpha": _cpuify(loss_module.log_alpha.detach().cpu()) if hasattr(loss_module, "log_alpha") else None,
+        "cfg": cfg,
+        "step": int(step),
+    }
+
+    if save_replay and replay_buffer is not None:
+        try:
+            ckpt["replay_len"] = len(replay_buffer)
+        except Exception:
+            ckpt["replay_len"] = None
+
+    torch.save(ckpt, ckpt_path)
+    print(f"Saved checkpoint: {ckpt_path}")
+    return ckpt_path
+
+
+def load_checkpoint(
+    ckpt_path: Path,
+    architecture: "MPiFormerTorchRLArchitecture",
+    actor_optim: Adam,
+    qvalue_optim: Adam,
+    alpha_optim: Adam | None,
+    loss_module: SACLoss,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Load the checkpoint and restore model/optim state. Returns the checkpoint dict."""
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    # restore modules
+    architecture.actor_head.load_state_dict(ckpt["actor_head"])
+    architecture.critic_head_q1.load_state_dict(ckpt["critic_head_q1"])
+    architecture.critic_head_q2.load_state_dict(ckpt["critic_head_q2"])
+
+    # restore optimizers
+    try:
+        actor_optim.load_state_dict(ckpt["actor_optim"])
+    except Exception as e:
+        print(f"Warning: failed to load actor optimizer state: {e}")
+    try:
+        qvalue_optim.load_state_dict(ckpt["critic_optim"])
+    except Exception as e:
+        print(f"Warning: failed to load critic optimizer state: {e}")
+
+    if alpha_optim is not None and ckpt.get("alpha_optim") is not None:
+        try:
+            alpha_optim.load_state_dict(ckpt["alpha_optim"])
+        except Exception as e:
+            print(f"Warning: failed to load alpha optimizer state: {e}")
+
+    # restore log_alpha if present
+    if hasattr(loss_module, "log_alpha") and ckpt.get("log_alpha") is not None:
+        try:
+            loss_module.log_alpha.data.copy_(ckpt["log_alpha"].to(loss_module.log_alpha.device))
+        except Exception as e:
+            print(f"Warning: failed to restore log_alpha: {e}")
+
+    # ensure target q networks match loaded critic parameters
+    try:
+        with torch.no_grad():
+            src = list(loss_module.qvalue_network_params.values(True, True))
+            tgt = list(loss_module.target_qvalue_network_params.values(True, True))
+            for s, t in zip(src, tgt):
+                t.copy_(s)
+    except Exception as e:
+        print(f"Warning: failed to copy qvalue params to targets: {e}")
+
+    return ckpt
 
 
 def train_step(
@@ -284,27 +316,25 @@ def main() -> None:
         log_std_init=float(cfg.get("log_std_init", -10.0)),
     )
 
-    backbone_module = TensorDictModule(
-        BackboneToAbstract(architecture.backbone),
-        in_keys=["point_cloud_labels", "point_cloud", "configuration"],
-        out_keys=["features"],
-    )
-    actor_head_module = TensorDictModule(
-        ActorFromAbstract(architecture.actor_head),
-        in_keys=["features"],
-        out_keys=["loc", "scale"],
+    # build TorchRL TensorDictModules to wrap pytorch modules
+    # use batch_first=True so modules accept and return [B, S, D] features compatible with replay buffer and gpu env
+    backbone_module = architecture.build_backbone_module(
+        in_keys=("point_cloud_labels", "point_cloud", "configuration"),
+        out_key="features",
+        batch_first=True,
     )
 
     action_low = -float(cfg.get("env", {}).get("max_delta_q", 1.0))
     action_high = float(cfg.get("env", {}).get("max_delta_q", 1.0))
-    actor = ProbabilisticActor(
-        module=actor_head_module,
-        in_keys=["loc", "scale"],
-        out_keys=["action"],
-        distribution_class=TanhNormal,
+    actor = architecture.build_probabilistic_actor(
+        in_keys=("loc", "scale"),
+        out_key="action",
         distribution_kwargs={"low": action_low, "high": action_high},
         return_log_prob=True,
+        batch_first=True,
     )
+    # Build critic modules (list with two TensorDictModules returning 'state_action_value') and create SACLoss
+    critic_modules = architecture.build_critic_modules(features_key="features", action_key="action", batch_first=True)
 
     gamma = float(cfg.get("gamma", 0.99))
     tau = float(cfg.get("tau", 0.005))
@@ -317,21 +347,22 @@ def main() -> None:
     else:
         fixed_alpha = True
         alpha_init = float(entropy_cfg)
-
     target_entropy = float(cfg.get("target_entropy", -float(env.robot.MAIN_DOF)))
-    loss_module = build_sac_loss(
-        actor=actor,
-        critic_head=architecture.critic_head,
+    
+    loss_module = SACLoss(
+        actor_network=actor,
+        qvalue_network=critic_modules,
         target_entropy=target_entropy,
         fixed_alpha=fixed_alpha,
         alpha_init=alpha_init,
-        gamma=gamma,
     )
+    loss_module.make_value_estimator(ValueEstimators.TD0, gamma=gamma)
 
+    # lr and optimizers
     actor_lr = extract_start_lr(cfg.get("finetuning_actor_lr"), 3e-4)
     critic_lr = extract_start_lr(cfg.get("finetuning_critic_lr"), 3e-4)
     actor_optim = Adam(architecture.actor_head.parameters(), lr=actor_lr)
-    qvalue_optim = Adam(architecture.critic_head.parameters(), lr=critic_lr)
+    qvalue_optim = Adam(list(architecture.critic_head_q1.parameters()) + list(architecture.critic_head_q2.parameters()), lr=critic_lr)
     alpha_optim = None if fixed_alpha else Adam([loss_module.log_alpha], lr=actor_lr)
 
     batch_size = int(cfg["batch_size"])
@@ -354,22 +385,25 @@ def main() -> None:
         f"learning_starts={learning_starts}, update_every={update_every}, gradient_steps={gradient_steps}"
     )
 
+    # --- Training loop ---
     for step in range(total_steps):
         with torch.no_grad():
-            backbone_module(obs_td)
-            actor(obs_td)
+            # Note: outputs added to tensordict in place
+            backbone_module(obs_td) # predicts features and adds to obs_td in place
+            features = obs_td["features"]
+            actor(obs_td) # predicts action from features and adds to obs_td in place
             action = obs_td["action"]
 
         step_input = TensorDict({"action": action}, batch_size=env.batch_size, device=device)
-        step_td = env.step(step_input)
+        step_td = env.step(step_input) # apply action to env and get next observation, reward, done, etc in step_td
         next_td = get_next_td(step_td)
 
         with torch.no_grad():
-            backbone_module(next_td)
+            backbone_module(next_td) # predicts next features and adds to next_td in place
 
         transition = TensorDict(
             {
-                "features": obs_td["features"].detach(),
+                "features": features.detach(), # state = observation features from backbone
                 "action": action.detach(),
                 "next": TensorDict(
                     {
@@ -413,6 +447,15 @@ def main() -> None:
                 f"qvalue_loss={metrics.qvalue_loss:.4f} "
                 f"alpha={metrics.alpha:.4f}"
             )
+
+    # --- Save final checkpoint ---
+    # (actor/critic heads + optimizers, no frozen backbone, no replay buffer)
+    try:
+        save_dir = Path(cfg.get("save_dir", "checkpoints"))
+        final_step = (step + 1) if "step" in locals() else total_steps
+        save_checkpoint(save_dir, architecture, actor_optim, qvalue_optim, alpha_optim, loss_module, cfg, final_step)
+    except Exception as e:
+        print(f"Warning: failed to save checkpoint: {e}")
 
     env.close()
     print("Training complete.")
