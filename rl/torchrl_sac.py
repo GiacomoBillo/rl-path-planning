@@ -14,16 +14,18 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from tqdm import tqdm
 
 import torch
 import yaml
 from tensordict import TensorDict, TensorDictBase
-from tensordict.nn import TensorDictModule
+from tensordict.nn import TensorDictModule, TensorDictSequential
 from torch import nn
 from torch.optim import Adam
 from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
 from torchrl.modules import ProbabilisticActor, TanhNormal
 from torchrl.objectives import SACLoss, ValueEstimators
+from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 from avoid_everything.pretraining import PretrainingMotionPolicyTransformer
 from avoid_everything.type_defs import DatasetType
@@ -88,9 +90,9 @@ def get_next_td(step_td: TensorDictBase) -> TensorDictBase:
     return step_td.get("next") if "next" in step_td.keys() else step_td
 
 
-def make_env(cfg: dict[str, Any], device: torch.device, overfit: int | None) -> AvoidEverythingEnv:
+def make_env(cfg: dict[str, Any], device: torch.device, overfit: int | None = None) -> AvoidEverythingEnv:
     env_cfg = cfg.get("env", {})
-    n_envs = int(env_cfg.get("train_n_envs", env_cfg.get("n_envs", 1)))
+    batch_size = int(env_cfg.get("batch_size",None))
     max_delta_q = float(env_cfg.get("max_delta_q", 1.0))
 
     env = AvoidEverythingEnv(
@@ -106,7 +108,7 @@ def make_env(cfg: dict[str, Any], device: torch.device, overfit: int | None) -> 
         terminate_ep_on_collision=bool(env_cfg.get("terminate_ep_on_collision", True)),
         action_delta_clip=env_cfg.get("action_delta_clip", max_delta_q),
         max_delta_q=max_delta_q,
-        batch_size=n_envs,
+        batch_size=batch_size,
         device=device,
     )
 
@@ -116,8 +118,7 @@ def make_env(cfg: dict[str, Any], device: torch.device, overfit: int | None) -> 
         dataset_type=DatasetType.TRAIN,
         num_workers=int(env_cfg.get("num_workers", 0)),
         random_scale=0.0,
-        overfit_idx=overfit,
-        n_eval_episodes=None,
+        n_eval_episodes=int(cfg.get("n_eval_episodes", 0)),
         shuffle=True,
     )
     return env
@@ -296,15 +297,77 @@ def train_step(
     )
 
 
-def main() -> None:
-    args = parse_args()
-    cfg = load_cfg(args.cfg_path)
 
-    device = resolve_device(args.device)
-    set_seed(args.seed)
-    print(f"Using device: {device}")
+@torch.no_grad()
+def evaluate_policy(inference_policy: nn.Module, eval_env: Any, n_episodes: int = 4, max_steps: int | None = None) -> dict:
+    """Run deterministic evaluation using the actor mean (via TorchRL ExplorationType.DETERMINISTIC).
 
-    env = make_env(cfg, device=device, overfit=args.overfit)
+    Returns a dict with 'avg_return' and 'episode_returns'.
+    """
+    # ensure policy and env are on the same device
+    policy_dev = getattr(eval_env, "device", None)
+    if policy_dev is None:
+        try:
+            policy_dev = next(inference_policy.parameters()).device
+        except StopIteration:
+            policy_dev = torch.device("cpu")
+    inference_policy.to(policy_dev)
+    inference_policy.eval()
+
+    episode_returns: list[float] = []
+    cum_returns = torch.zeros(eval_env.batch_size, device=policy_dev)
+    dones = torch.zeros(eval_env.batch_size, dtype=torch.bool, device=policy_dev)
+
+    with set_exploration_type(ExplorationType.DETERMINISTIC):
+        obs = eval_env.reset()
+        steps = 0
+
+        with tqdm(total=n_episodes, desc="Evaluating", leave=False) as pbar:
+            while len(episode_returns) < n_episodes:
+                # policy mutates obs in-place and writes 'action'
+                inference_policy(obs)
+
+                step_input = TensorDict({"action": obs["action"]}, batch_size=eval_env.batch_size, device=policy_dev)
+                step_td = eval_env.step(step_input)
+                next_td = get_next_td(step_td)
+
+                reward = next_td["reward"]
+                if reward.ndim > 1:
+                    reward = reward.view(eval_env.env_batch_size, -1).sum(dim=1)
+                cum_returns += reward.to(policy_dev) * (~dones)
+    
+                done = next_td["done"]
+                if done.ndim > 1:
+                    done_mask = done.view(eval_env.env_batch_size, -1).any(dim=1).to(torch.bool).to(policy_dev)
+                else:
+                    done_mask = done.to(torch.bool).to(policy_dev)
+
+                if done_mask.any():
+                    idxs = done_mask.nonzero(as_tuple=True)[0]
+                    for i in idxs.tolist():
+                        episode_returns.append(float(cum_returns[i].item()))
+                        cum_returns[i] = 0.0
+                        if len(episode_returns) >= n_episodes:
+                            break
+
+                # partial reset for finished envs
+                next_td.set("_reset", next_td.get("done"))
+                obs = eval_env.reset(next_td)
+
+                steps += 1
+                pbar.update(1)
+                if max_steps is not None and steps >= max_steps:
+                    break
+
+    avg_return = float(sum(episode_returns[:n_episodes]) / len(episode_returns[:n_episodes])) if episode_returns else 0.0
+    print(f"Evaluation: avg_return={avg_return:.4f} episodes={len(episode_returns[:n_episodes])}")
+    return {"avg_return": avg_return, "episode_returns": episode_returns[:n_episodes]}
+
+
+def main(args, cfg, device) -> None:
+
+    env = make_env(cfg, device=device)
+    eval_env = make_env(cfg, device=device)
     bc_model = load_bc_model(cfg, device=device)
 
     split_layer = int(cfg.get("freeze_transformer_layers", 7))
@@ -358,6 +421,26 @@ def main() -> None:
     )
     loss_module.make_value_estimator(ValueEstimators.TD0, gamma=gamma)
 
+    # Build inference policy (backbone + actor) for deterministic evaluation
+    try:
+        inference_policy = architecture.build_actor_pipeline(action_spec=None, batch_first=True).to(device)
+    except Exception:
+        # Fallback: compose backbone + actor manually
+        inference_policy = TensorDictSequential(backbone_module, actor)  # type: ignore[operator]
+        inference_policy = inference_policy.to(device)
+
+    # Initial evaluation (if configured)
+    try:
+        n_eval_cfg = int(cfg.get("n_eval_episodes", 0))
+        if n_eval_cfg > 0:
+            _res = evaluate_policy(inference_policy, eval_env, n_eval_cfg)
+            print(f"Initial evaluation avg_return={_res['avg_return']:.4f}")
+    except Exception as e:
+        print(f"Warning: initial evaluation failed: {e}")
+        # traceback
+        import traceback
+        traceback.print_exc()
+
     # lr and optimizers
     actor_lr = extract_start_lr(cfg.get("finetuning_actor_lr"), 3e-4)
     critic_lr = extract_start_lr(cfg.get("finetuning_critic_lr"), 3e-4)
@@ -376,17 +459,19 @@ def main() -> None:
     update_every = int(train_freq[0] if isinstance(train_freq, (list, tuple)) else train_freq)
     gradient_steps = int(cfg.get("gradient_steps", 1))
     learning_starts = int(cfg.get("transitions_before_learn", batch_size))
+    eval_every = int(cfg.get("logger", {}).get("log_eval_freq", 0))
+    n_eval_episodes = int(cfg.get("n_eval_episodes", 0))
 
     obs_td = env.reset()
     metrics = TrainMetrics()
 
     print(
-        f"Starting training: steps={total_steps}, n_envs={env.num_envs}, "
+        f"Starting training: steps={total_steps}, batch with {env.env_batch_size} envs, "
         f"learning_starts={learning_starts}, update_every={update_every}, gradient_steps={gradient_steps}"
     )
 
     # --- Training loop ---
-    for step in range(total_steps):
+    for step in tqdm(range(total_steps), desc="Training", unit="step", total=total_steps):
         with torch.no_grad():
             # Note: outputs added to tensordict in place
             backbone_module(obs_td) # predicts features and adds to obs_td in place
@@ -447,6 +532,13 @@ def main() -> None:
                 f"qvalue_loss={metrics.qvalue_loss:.4f} "
                 f"alpha={metrics.alpha:.4f}"
             )
+            # periodic evaluation
+            if eval_every > 0 and n_eval_episodes > 0 and (step + 1) % eval_every == 0:
+                try:
+                    _res = evaluate_policy(inference_policy, eval_env, n_eval_episodes)
+                    print(f"Periodic evaluation step={step+1} avg_return={_res['avg_return']:.4f}")
+                except Exception as e:
+                    print(f"Warning: periodic evaluation failed: {e}")
 
     # --- Save final checkpoint ---
     # (actor/critic heads + optimizers, no frozen backbone, no replay buffer)
@@ -462,4 +554,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    cfg = load_cfg(args.cfg_path)
+
+    device = resolve_device(args.device)
+    set_seed(args.seed)
+    print(f"Using device: {device}")
+
+    main(args, cfg, device)

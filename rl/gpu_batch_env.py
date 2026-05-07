@@ -100,7 +100,7 @@ class AvoidEverythingEnv(EnvBase):
         terminate_ep_on_collision: bool = True,
         action_delta_clip: float | Sequence[float] = 0.2,
         max_delta_q: float = 1.0,
-        batch_size: int = 1,
+        batch_size: int = 64,
         device: str | torch.device | None = None,
     ) -> None:
         if batch_size < 1:
@@ -112,8 +112,8 @@ class AvoidEverythingEnv(EnvBase):
             else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.device = resolved_device
-        self.num_envs = int(batch_size)
-        super().__init__(device=self.device, batch_size=torch.Size([self.num_envs]))
+        self.env_batch_size = batch_size
+        super().__init__(device=self.device, batch_size=torch.Size([batch_size]))
 
         self.urdf_path = urdf_path
         self.robot = Robot(urdf_path, device=self.device)
@@ -171,28 +171,28 @@ class AvoidEverythingEnv(EnvBase):
         pc_high = torch.tensor([1.5, 1.5, 1.5], device=self.device)
         
         # For batched specs, expand to [B, *shape]
-        pc_low_batched = pc_low.unsqueeze(0).unsqueeze(0).expand(*self.batch_size, self.total_points, 3)
-        pc_high_batched = pc_high.unsqueeze(0).unsqueeze(0).expand(*self.batch_size, self.total_points, 3)
+        pc_low_batched = pc_low.unsqueeze(0).unsqueeze(0).expand(self.env_batch_size, self.total_points, 3)
+        pc_high_batched = pc_high.unsqueeze(0).unsqueeze(0).expand(self.env_batch_size, self.total_points, 3)
         
         self.observation_spec = Composite(
             point_cloud=Bounded(
                 low=pc_low_batched,
                 high=pc_high_batched,
-                shape=torch.Size([*self.batch_size, self.total_points, 3]),
+                shape=torch.Size([self.env_batch_size, self.total_points, 3]),
                 dtype=torch.float32,
                 device=self.device,
             ),
             point_cloud_labels=Bounded(
                 low=0,
                 high=2,
-                shape=torch.Size([*self.batch_size, self.total_points, 1]),
+                shape=torch.Size([self.env_batch_size, self.total_points, 1]),
                 dtype=torch.int32,
                 device=self.device,
             ),
             configuration=Bounded(
                 low=-1.0,
                 high=1.0,
-                shape=torch.Size([*self.batch_size, self.robot.MAIN_DOF]),
+                shape=torch.Size([self.env_batch_size, self.robot.MAIN_DOF]),
                 dtype=torch.float32,
                 device=self.device,
             ),
@@ -203,13 +203,13 @@ class AvoidEverythingEnv(EnvBase):
         self.action_spec = Bounded(
             low=-self.max_delta_q,
             high=self.max_delta_q,
-            shape=torch.Size([*self.batch_size, self.robot.MAIN_DOF]),
+            shape=torch.Size([self.env_batch_size, self.robot.MAIN_DOF]),
             dtype=torch.float32,
             device=self.device,
         )
         
         self.reward_spec = Unbounded(
-            shape=torch.Size([*self.batch_size, 1]),
+            shape=torch.Size([self.env_batch_size, 1]),
             dtype=torch.float32,
             device=self.device,
         )
@@ -218,21 +218,21 @@ class AvoidEverythingEnv(EnvBase):
             done=Bounded(
                 low=False,
                 high=True,
-                shape=torch.Size([*self.batch_size, 1]),
+                shape=torch.Size([self.env_batch_size, 1]),
                 dtype=torch.bool,
                 device=self.device,
             ),
             terminated=Bounded(
                 low=False,
                 high=True,
-                shape=torch.Size([*self.batch_size, 1]),
+                shape=torch.Size([self.env_batch_size, 1]),
                 dtype=torch.bool,
                 device=self.device,
             ),
             truncated=Bounded(
                 low=False,
                 high=True,
-                shape=torch.Size([*self.batch_size, 1]),
+                shape=torch.Size([self.env_batch_size, 1]),
                 dtype=torch.bool,
                 device=self.device,
             ),
@@ -272,9 +272,9 @@ class AvoidEverythingEnv(EnvBase):
                 val = torch.as_tensor(val)
             out[key] = val.to(self.device, non_blocking=True)
 
-        if out["configuration"].shape[0] != self.num_envs:
+        if out["configuration"].shape[0] != self.env_batch_size:
             raise RuntimeError(
-                f"Expected dataloader batch dimension {self.num_envs}, "
+                f"Expected dataloader batch dimension {self.env_batch_size}, "
                 f"got {out['configuration'].shape[0]}."
             )
         return out
@@ -362,11 +362,11 @@ class AvoidEverythingEnv(EnvBase):
             self._point_cloud_labels = batch["point_cloud_labels"].to(torch.int32).clone()
             self._scene_primitives = self._build_scene_primitives(batch)
             self._episode_step_count = torch.zeros(
-                self.num_envs, dtype=torch.int64, device=self.device
+                self.env_batch_size, dtype=torch.int64, device=self.device
             )
 
             obs = self._get_obs()
-            false_flag = torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
+            false_flag = torch.zeros((self.env_batch_size, 1), dtype=torch.bool, device=self.device)
             out = TensorDict(
                 {
                     "point_cloud": obs["point_cloud"],
@@ -390,7 +390,7 @@ class AvoidEverythingEnv(EnvBase):
         # nothing to reset
         if not mask.any():
             obs = self._get_obs()
-            false_flag = torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
+            false_flag = torch.zeros((self.env_batch_size, 1), dtype=torch.bool, device=self.device)
             out = TensorDict(
                 {
                     "point_cloud": obs["point_cloud"],
@@ -446,7 +446,7 @@ class AvoidEverythingEnv(EnvBase):
         self._episode_step_count[idxs] = 0
 
         obs = self._get_obs()
-        false_flag = torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
+        false_flag = torch.zeros((self.env_batch_size, 1), dtype=torch.bool, device=self.device)
         out = TensorDict(
             {
                 "point_cloud": obs["point_cloud"],
@@ -471,9 +471,9 @@ class AvoidEverythingEnv(EnvBase):
         action = action.to(self.device, dtype=torch.float32)
         if action.ndim == 1:
             action = action.unsqueeze(0)
-        if action.shape != (self.num_envs, self.robot.MAIN_DOF):
+        if action.shape != (self.env_batch_size, self.robot.MAIN_DOF):
             raise ValueError(
-                f"Expected action shape {(self.num_envs, self.robot.MAIN_DOF)}, got {tuple(action.shape)}."
+                f"Expected action shape {(self.env_batch_size, self.robot.MAIN_DOF)}, got {tuple(action.shape)}."
             )
 
         clipped_action = torch.clamp(action, -self.action_delta_clip, self.action_delta_clip)
@@ -536,11 +536,8 @@ class AvoidEverythingEnv(EnvBase):
         dataset_type: DatasetType,
         num_workers: int = 0,
         random_scale: float = 0.0,
-        overfit_idx: Optional[int] = None,
         n_eval_episodes: Optional[int] | None = None,
         shuffle: bool = True,
-        env_idx: int = 0,
-        total_env_number: int = 1,
     ) -> None:
         dataset = TrajectoryDataset.load_from_directory(
             robot=self.robot,
@@ -553,37 +550,22 @@ class AvoidEverythingEnv(EnvBase):
             random_scale=random_scale,
         )
 
-        if overfit_idx is not None:
-            dataset = Subset(dataset, [overfit_idx])
-            shuffle = False
-        elif n_eval_episodes:
+        if n_eval_episodes:
             dataset = Subset(dataset, range(n_eval_episodes))
             shuffle = False
 
-        if overfit_idx is None and total_env_number > 1:
-            if env_idx < 0 or env_idx >= total_env_number:
-                raise ValueError(
-                    f"env_idx must be in [0, {total_env_number - 1}], got {env_idx}"
-                )
-            total_len = len(dataset)
-            indices_split = range(env_idx, total_len, total_env_number)
-            if not indices_split:
-                raise ValueError(
-                    f"Dataset split for env_idx={env_idx} is empty "
-                    f"(total_len={total_len}, total_env_number={total_env_number})."
-                )
-            dataset = Subset(dataset, indices_split)
+        
 
-        self._num_split_samples = len(dataset)
-        if self._num_split_samples < self.num_envs:
+        # self._num_split_samples = len(dataset)
+        if len(dataset) < self.env_batch_size:
             raise ValueError(
-                f"Dataset has {self._num_split_samples} samples but batch_size={self.num_envs}. "
+                f"Dataset has {len(dataset)} samples but batch_size={self.env_batch_size}. "
                 "Increase dataset size or reduce batch_size."
             )
 
         self.dataloader = DataLoader(
             dataset,
-            batch_size=self.num_envs,
+            batch_size=self.env_batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
             drop_last=True,
