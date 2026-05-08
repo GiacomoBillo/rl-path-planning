@@ -449,6 +449,9 @@ class MySAC(SACDebug):
             "actor_lr_count": 0,
             "critic_lr_count": 0,
             "ent_coef_lr_count": 0,
+            "target_q_sum": 0.0,
+            "current_q_sum": 0.0,
+            "actor_q_sum": 0.0,
         }
 
     def _new_task_metrics_accumulator(self) -> Dict[str, Any]:
@@ -497,6 +500,9 @@ class MySAC(SACDebug):
 
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
+        target_q = []   # The TD-target the critic is trying to learn
+        current_q = []  # The critic's estimate of the replay buffer actions
+        actor_q = []    # The critic's estimate of the Actor's NEW actions
         
         # Accumulators for new metrics (per-joint statistics)
         log_stds_per_joint = []  # List of [gradient_step, joint] tensors
@@ -564,10 +570,13 @@ class MySAC(SACDebug):
                 next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
                 # td error + entropy term
                 target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+                target_q.append(target_q_values.mean().item())
 
             # Get current Q-values estimates for each critic network
             # using action from the replay buffer
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
+            min_current_q = th.min(current_q_values[0], current_q_values[1])
+            current_q.append(min_current_q.mean().item())
 
             # Compute critic loss
             critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
@@ -584,6 +593,7 @@ class MySAC(SACDebug):
             # Min over all critic networks
             q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
             min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
+            actor_q.append(min_qf_pi.mean().item())
             actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
             actor_losses.append(actor_loss.item())
 
@@ -621,6 +631,9 @@ class MySAC(SACDebug):
                 f"{train_acc['log_std_sum_per_joint'].shape}"
             )
         train_acc["log_std_sum_per_joint"] += log_std_sum_per_joint
+        train_acc["target_q_sum"] += float(np.sum(target_q))
+        train_acc["current_q_sum"] += float(np.sum(current_q))
+        train_acc["actor_q_sum"] += float(np.sum(actor_q))
 
         # Dump train metrics every configured number of gradient updates.
         prefix = "train" # for episode-level metrics
@@ -632,6 +645,9 @@ class MySAC(SACDebug):
             self.logger.record(f"{prefix}/ent_coef", train_acc["ent_coef_sum"] / train_steps)
             self.logger.record(f"{prefix}/actor_loss", train_acc["actor_loss_sum"] / train_steps)
             self.logger.record(f"{prefix}/critic_loss", train_acc["critic_loss_sum"] / train_steps)
+            self.logger.record(f"{prefix}/target_q", train_acc["target_q_sum"] / train_steps)
+            self.logger.record(f"{prefix}/current_q", train_acc["current_q_sum"] / train_steps)
+            self.logger.record(f"{prefix}/actor_q", train_acc["actor_q_sum"] / train_steps)
             if train_acc["ent_coef_loss_steps"] > 0:
                 ent_coef_loss_steps = float(train_acc["ent_coef_loss_steps"])
                 self.logger.record(f"{prefix}/ent_coef_loss", train_acc["ent_coef_loss_sum"] / ent_coef_loss_steps)
