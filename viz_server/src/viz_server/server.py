@@ -11,16 +11,16 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Union
 
 import fasteners
 import numpy as np
 import rclpy
-import yaml
 import zmq
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import JointState, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
@@ -30,13 +30,60 @@ from tf2_ros import StaticTransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 from urdf_parser_py.urdf import URDF  # should maybe use urchin instead
 from visualization_msgs.msg import Marker, MarkerArray
+import yaml
 
 from robofin.robots import Robot
-from spherification.spherification_utils import convert_mesh_paths_to_absolute
+
 
 LOCK_FILE = "/tmp/viz_server.lock"
 ZMQ_PORT  = 5556
 
+MAX_GHOST_ROBOT_MARKERS = 69
+MAX_OBSTACLES = 40
+
+def convert_mesh_paths_to_absolute(urdf_path, output_path=None):
+    """
+    Convert relative mesh paths in a URDF to absolute file:// paths.
+    Useful for making URDFs compatible with RViz and Foxglove.
+    
+    Args:
+        urdf_path: Path to input URDF file
+        output_path: Path for output URDF (optional, defaults to input path with _absolute suffix)
+    """
+    urdf_path = Path(urdf_path)
+    
+    if output_path is None:
+        output_path = urdf_path.parent / f"{urdf_path.stem}_abs.urdf"
+    
+    print(f"Converting mesh paths to absolute: {urdf_path} -> {output_path}")
+    
+    # Parse URDF
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    urdf_dir = urdf_path.parent
+    
+    converted_count = 0
+    
+    # Convert mesh paths
+    for mesh in root.findall('.//mesh'):
+        filename = mesh.get('filename')
+        if filename and not filename.startswith('file://'):
+            if filename.startswith('package://'):
+                filename = filename[len('package://'):]
+            
+            abs_path = urdf_dir / filename
+            if abs_path.exists():
+                mesh.set('filename', f'file://{abs_path.absolute()}')
+                converted_count += 1
+            else:
+                print(f"WARNING: Mesh file not found: {abs_path}")
+    
+    tree.write(output_path, encoding='utf-8', xml_declaration=True)
+    
+    print(f"SUCCESS: Converted {converted_count} mesh paths to absolute")
+    print(f"  Output: {output_path}")
+    
+    return output_path
 
 class VizServer(Node):
     """
@@ -83,14 +130,33 @@ class VizServer(Node):
         # ------------------------------------------------------------------ #
         # ROS publishers
         # ------------------------------------------------------------------ #
-        qos = QoSProfile(depth=1)
-        self.js_pub     = self.create_publisher(JointState,   "/joint_states",  qos)
-        self.marker_pub = self.create_publisher(MarkerArray,  "/viz/markers",   qos)
+        # Use more robust QoS to avoid drops under bursty publishing
+        js_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        marker_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=20,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,  # latch last marker state
+        )
+        pc_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.js_pub     = self.create_publisher(JointState,   "/joint_states",  js_qos)
+        self.marker_pub = self.create_publisher(MarkerArray,  "/viz/markers",   marker_qos)
 
         # Multiple point cloud publishers for different types
-        self.pc_robot_pub    = self.create_publisher(PointCloud2, "/viz/robot_points",    qos)
-        self.pc_target_pub   = self.create_publisher(PointCloud2, "/viz/target_points",   qos)
-        self.pc_obstacle_pub = self.create_publisher(PointCloud2, "/viz/obstacle_points", qos)
+        self.pc_robot_pub    = self.create_publisher(PointCloud2, "/viz/robot_points",    pc_qos)
+        self.pc_target_pub   = self.create_publisher(PointCloud2, "/viz/target_points",   pc_qos)
+        self.pc_obstacle_pub = self.create_publisher(PointCloud2, "/viz/obstacle_points", pc_qos)
 
         # Static transform broadcaster for world frame
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -105,18 +171,9 @@ class VizServer(Node):
         # ------------------------------------------------------------------ #
         
         cprint("Starting robot_state_publisher...", "green")
-        xml = Path(self.abs_urdf_path).read_text()
-
-        self.rsp_proc = subprocess.Popen(
-            [
-                "ros2", "run", "robot_state_publisher", "robot_state_publisher",
-                "--ros-args", "-p", f"robot_description:={xml}"
-            ],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        
-        # Wait a bit for robot_state_publisher to start, then publish neutral state
-        threading.Thread(target=self._publish_neutral_state, daemon=True).start()
+        self._start_robot_state_publisher()
+        # Keep robot_state_publisher alive in the background
+        threading.Thread(target=self._rsp_watchdog, daemon=True).start()
         
         # Publish static transform from world to base link
         self._publish_world_to_base_transform()
@@ -151,7 +208,7 @@ class VizServer(Node):
                     case "ghost_end_effector": self._handle_ghost_end_effector(hdr)
                     case "ghost_robot": self._handle_ghost_robot(hdr)
                     case "clear_ghost_end_effector": self._handle_clear_ghost_end_effector()
-                    case "clear_ghost_robot": self._handle_clear_ghost_robot()
+                    case "clear_ghost_robots": self._handle_clear_ghost_robots()
                     case "obstacles":  self._handle_obstacles(hdr, payload)
                     case "clear_obstacles": self._handle_clear_obstacles()
                     case "shutdown":   self._handle_shutdown()
@@ -165,24 +222,32 @@ class VizServer(Node):
     # ====================================================================== #
     def _handle_joints(self, hdr: Dict) -> None:
         """Publish one JointState message."""
-        self._publish_joints(hdr["joints"])
-        self.sock.send_json({"status": "ok"})
+        try:
+            self._publish_joints(hdr["joints"])
+            self.sock.send_json({"status": "ok"})
+        except Exception as e:
+            self.sock.send_json({"status": "error", "msg": f"joints: {e}"})
 
     def _handle_config(self, hdr: Dict) -> None:
         """
         Publish one JointState message, based on main joint config vector. 
         Auxiliary joints take default values.
         """
-        config = hdr["config"]
-        joints = dict(zip(self.robot.main_joint_names, config))
-        for joint_name, joint_value in self.robot.auxiliary_joint_defaults.items():
-            joints[joint_name] = joint_value
+        try:
+            config = hdr["config"]
+            joints = dict(zip(self.robot.main_joint_names, config))
+            for joint_name, joint_value in self.robot.auxiliary_joint_defaults.items():
+                joints[joint_name] = joint_value
 
-        self._publish_joints(joints)
-        self.sock.send_json({"status": "ok"})
+            self._publish_joints(joints)
+            self.sock.send_json({"status": "ok"})
+        except Exception as e:
+            self.sock.send_json({"status": "error", "msg": f"config: {e}"})
 
     def _publish_joints(self, joints: Dict[str, float]) -> None:
         """Publish joint state without ZMQ response (for internal use)."""
+        # Ensure robot_state_publisher is alive; restart if needed
+        self._ensure_robot_state_publisher()
         resolved_joints = self._resolve_mimic_joints(joints)
         
         js               = JointState()
@@ -190,6 +255,89 @@ class VizServer(Node):
         js.name          = self.joint_names
         js.position      = [resolved_joints[n] for n in self.joint_names]
         self.js_pub.publish(js)
+
+    # ------------------------------------------------------------------ #
+    # robot_state_publisher management
+    # ------------------------------------------------------------------ #
+    def _is_robot_state_publisher_alive(self) -> bool:
+        try:
+            return hasattr(self, 'rsp_proc') and self.rsp_proc is not None and self.rsp_proc.poll() is None
+        except Exception:
+            return False
+
+    def _start_robot_state_publisher(self) -> None:
+        """Start robot_state_publisher if it isn't running."""
+        if self._is_robot_state_publisher_alive():
+            return
+
+        try:
+            xml = Path(self.abs_urdf_path).read_text()
+        except Exception as e:
+            cprint(f"Failed reading URDF XML for robot_state_publisher: {e}", "red")
+            return
+
+        # Write params file to avoid huge/quoted CLI args
+        try:
+            params = {
+                "robot_state_publisher": {
+                    "ros__parameters": {
+                        "robot_description": xml
+                    }
+                }
+            }
+            params_path = Path("/tmp/rsp_params.yaml")
+            with open(params_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(params, f, default_flow_style=False, allow_unicode=True)
+        except Exception as e:
+            cprint(f"Failed writing params file for robot_state_publisher: {e}", "red")
+            return
+
+        try:
+            # Source ROS before launching to ensure 'ros2' is on PATH
+            cmd = (
+                "source /opt/ros/humble/setup.bash && "
+                f"ros2 run robot_state_publisher robot_state_publisher --ros-args --params-file {params_path}"
+            )
+            log_path = Path("/tmp/robot_state_publisher.log")
+            log_file = open(log_path, "ab", buffering=0)
+            self.rsp_proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=log_file,
+                shell=True,
+                executable="/bin/bash"
+            )
+
+            # Give it a moment and check if it died immediately
+            time.sleep(0.5)
+            if self.rsp_proc.poll() is not None:
+                cprint("robot_state_publisher failed to start", "red")
+                try:
+                    tail = Path("/tmp/robot_state_publisher.log").read_bytes()[-4000:]
+                    cprint(tail.decode(errors="ignore"), "yellow")
+                except Exception:
+                    pass
+                self.rsp_proc = None
+                return
+
+            # Publish a neutral state shortly after startup so RSP has data
+            threading.Thread(target=self._publish_neutral_state, daemon=True).start()
+        except Exception as e:
+            cprint(f"Failed to start robot_state_publisher: {e}", "red")
+
+    def _ensure_robot_state_publisher(self) -> None:
+        """Ensure robot_state_publisher is running; restart if it died."""
+        if not self._is_robot_state_publisher_alive():
+            cprint("robot_state_publisher not running — restarting…", "yellow")
+            self._start_robot_state_publisher()
+
+    def _rsp_watchdog(self) -> None:
+        """Background watchdog that restarts robot_state_publisher if it dies."""
+        while rclpy.ok():
+            if not self._is_robot_state_publisher_alive():
+                cprint("[watchdog] robot_state_publisher down — attempting restart", "yellow")
+                self._start_robot_state_publisher()
+            time.sleep(1.0)
 
     def _handle_trajectory(self, hdr: Dict) -> None:
         """Launch background interpolation thread."""
@@ -305,6 +453,11 @@ class VizServer(Node):
         config: list[float] = hdr["config"]
         color: list[float] = hdr.get("color", [0.0, 1.0, 0.0])
         alpha: float = hdr.get("alpha", 0.5)
+        index: int = hdr.get("index", 0)
+
+        if index >= MAX_GHOST_ROBOT_MARKERS:
+            self.sock.send_json({"status": "error", "msg": f"index {index} is too large"})
+            return
 
         auxiliary_joint_values = {}
         for joint_name in self.robot.auxiliary_joint_names:
@@ -334,6 +487,7 @@ class VizServer(Node):
             x,y,z = squeezed_pose[:3, 3]
 
             m = Marker()
+            m.id = index
             m.header.frame_id = self.robot.base_link_name
             m.header.stamp = self.get_clock().now().to_msg()
             m.ns   = f"ghost_robot_{link_name}"
@@ -357,18 +511,20 @@ class VizServer(Node):
         markers = []
         timestamp = self.get_clock().now().to_msg()
         
-        for link_name in self.robot.eef_visual_link_names:
-            m = Marker()
-            m.header.frame_id = self.robot.base_link_name
-            m.header.stamp = timestamp
-            m.ns = f"ghost_ee_{link_name}"
-            m.action = Marker.DELETEALL
-            markers.append(m)
+        for i in range(MAX_GHOST_ROBOT_MARKERS):
+            for link_name in self.robot.eef_visual_link_names:
+                m = Marker()
+                m.id = i
+                m.header.frame_id = self.robot.base_link_name
+                m.header.stamp = timestamp
+                m.ns = f"ghost_ee_{link_name}"
+                m.action = Marker.DELETEALL
+                markers.append(m)
 
         self.marker_pub.publish(MarkerArray(markers=markers))
         self.sock.send_json({"status": "ok"})
 
-    def _handle_clear_ghost_robot(self) -> None:
+    def _handle_clear_ghost_robots(self) -> None:
         """Clear all ghost robot markers."""
         markers = []
         timestamp = self.get_clock().now().to_msg()
@@ -430,6 +586,10 @@ class VizServer(Node):
                 self.sock.send_json({"status": "error", "msg": "Invalid cuboid parameters"})
                 return
             
+            if obstacle_idx >= MAX_OBSTACLES:
+                self.sock.send_json({"status": "warning", "msg": f"Too many obstacles, more than {MAX_OBSTACLES}"})
+                break
+
             m = Marker()
             m.header.frame_id = self.robot.base_link_name
             m.header.stamp = self.get_clock().now().to_msg()
@@ -458,7 +618,11 @@ class VizServer(Node):
             if len(center) != 3 or len(quat) != 4:
                 self.sock.send_json({"status": "error", "msg": "Invalid cylinder parameters"})
                 return
-            
+
+            if obstacle_idx >= MAX_OBSTACLES:
+                self.sock.send_json({"status": "warning", "msg": f"Too many obstacles, more than {MAX_OBSTACLES}"})
+                break
+
             m = Marker()
             m.header.frame_id = self.robot.base_link_name
             m.header.stamp = self.get_clock().now().to_msg()
@@ -493,7 +657,7 @@ class VizServer(Node):
         markers = []
         timestamp = self.get_clock().now().to_msg()
 
-        for i in range(40): # at most 40 obstacles in Avoid Everything
+        for i in range(MAX_OBSTACLES): # at most 40 obstacles in Avoid Everything
             m = Marker()
             m.header.frame_id = self.robot.base_link_name
             m.header.stamp = timestamp
@@ -674,8 +838,7 @@ class VizServer(Node):
         if set(resolved) != set(self.joint_names):
             missing = set(self.joint_names) - set(resolved)
             extra = set(resolved) - set(self.joint_names)
-            error_msg = f"joint set mismatch after mimic resolution. Missing: {missing}, Extra: {extra}"
-            self.sock.send_json({"status": "error", "msg": error_msg})
+            raise ValueError(f"joint set mismatch after mimic resolution. Missing: {missing}, Extra: {extra}")
 
         return resolved
 

@@ -1,0 +1,89 @@
+# MIT License
+#
+# Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES, University of Washington. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+training_model_parameters:
+  robot_dof: 7  # robot's degrees of freedom
+  # robot_dof: 6  # robot's degrees of freedom
+  point_match_loss_weight: 1.0  # point match loss (BC loss) weight for actor
+  collision_loss_weight: 5.0    # collision loss weight
+  collision_loss_margin: 0.03   # margin for collision loss [m]
+  actor_loss_weight: 0.001      # RL actor loss weight (try to match point match loss magnitude)
+  min_lr: 1.0e-5
+  max_lr: 5.0e-5
+  warmup_steps: 5000       # number of steps to warm up the learning rate linearly from min_lr to max_lr
+  weight_decay: 1.0e-4     # weight decay for AdamW optimizers
+  gamma: 0.99              # discount factor for Q-learning
+  exploration_noise: 0.015 # exploration noise for actor [std deviation]
+  action_clip: 0.5         # clip the actor actions to be within [-action_clip, action_clip], can be "None", which means no clipping
+  target_actor_noise: 0.03  # target actor noise [std deviation] [TD3]
+  target_actor_noise_clip: 0.1 # target actor noise clip [TD3]
+  use_huber_loss: true     # use Huber loss for critic loss instead of MSE loss
+  tau: 0.005               # target network's soft update rate
+  grad_clip_norm: 1.0      # gradient clipping norm
+  rollout_length: 69       # number of steps to rollout for the actor
+  pc_bounds: [[-1.5, -1.5, -0.1], [1.5, 1.5, 1.5]]  # bounds for the point clouds
+  
+data_module_parameters:
+  data_dir: /workspace/datasets/ae_aristotle1_5mm_cubbies
+  train_trajectory_key: "global_solutions"
+  val_trajectory_key: "global_solutions"
+  num_obstacle_points: 4096
+  num_target_points: 128
+  random_scale: 0.015 # std deviation of the noise added to the expert configurations (not in normalized config space, not to supervision configs)
+  include_reward: true
+  shuffle: true
+
+shared_parameters:
+  urdf_path: /workspace/assets/panda/panda_spheres.urdf
+  # urdf_path: /workspace/assets/gp7/gp7_spheres.urdf
+  num_robot_points: 2048
+  goal_reward: 1.0        # reward for reaching the goal
+  collision_reward: -1.0  # reward for colliding with an obstacle
+  step_reward: -0.02      # reward for each step that doesn't terminate the episode
+  reward_scale: 1.0       # proportional scaling that applies to all rewards
+
+num_workers: 16                      # number of CPU workers for the data loaders
+checkpoint_interval: 60              # how often to save model checkpoints [minutes]
+pretraining_steps: 20000            # how many steps to pretrain for before starting to sample from actor's replay buffer [global steps]
+start_using_actor_loss: 20000        # number of steps to wait before actor loss activates
+validate_every_n_steps: 10000        # how often to run mid-epoch validation epochs [global steps]
+collect_rollouts_every_n_steps: 500  # how often to collect actor rollouts for the replay buffer [global steps]
+log_every_n_steps: 50                # how often to log metrics to wandb [global steps]
+replay_buffer_capacity: 200000       # capacity of the replay buffer [number of transitions]
+n_gpus: 2                            # number of GPUs to use for training
+train_batch_size: 50                 # batch size for training
+val_batch_size: 50                   # batch size for validation
+mid_epoch_max_val_batches: 1000      # maximum number of batches to validate on during mid-epoch validation
+mid_epoch_max_val_rollouts: 200      # maximum number of rollouts to validate on during mid-epoch validation
+end_epoch_max_val_batches: 2000      # maximum number of batches to validate on at end-of-epoch validation
+end_epoch_max_val_rollouts: 400      # maximum number of rollouts to validate on at end-of-epoch validation
+expert_fraction: 0.25                # fraction of samples to sample from expert loader during fine-tuning
+actor_delay: 2                       # delay for actor network's and target network's updates [TD3]
+max_epochs: 100                      # maximum number of epochs to train for
+mintest: false                       # true: run minimal test run for debugging
+logging: true                        # true: log to wandb
+load_model_from_checkpoint: true
+load_actor_only: true
+load_checkpoint_path: /workspace/checkpoints/jqxqskq7-self-pretrained-franka2/best-fabric-epoch2-step572470.ckpt # PATH/TO/PRETRAINING/CHECKPOINT
+save_checkpoint_dir: /workspace/checkpoints
+experiment_name: "CoL: Avoid Everything Except Exploration"
+description: "Full CoL run with Franka Panda - collision loss on"
