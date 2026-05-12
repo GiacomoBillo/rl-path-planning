@@ -47,7 +47,8 @@ class MPiFormerBackbone(nn.Module):
         super().__init__()
         total_layers = len(bc_model.encoder.layers)
         self.split_layer = _validate_split_layer(split_layer, total_layers)
-        self.pc_bounds = bc_model.pc_bounds
+        self.pc_bounds = bc_model.pc_bounds.to(bc_model.device)
+        print(f"PC Bounds: {self.pc_bounds.device}")
         self.total_layers = total_layers
 
         if deep_copy:

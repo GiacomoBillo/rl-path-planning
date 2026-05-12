@@ -135,6 +135,7 @@ def run():
     )
     dm.setup("fit")
     train_trajectory_loader = fabric.setup_dataloaders(dm.train_trajectory_dataloader(), move_to_device=True)
+    print(f"Workers for train trajectory loader: {train_trajectory_loader.num_workers}, persistent_workers: {train_trajectory_loader.persistent_workers}")
     expert_loader = fabric.setup_dataloaders(dm.train_dataloader(), move_to_device=True)
     val_state_loader = fabric.setup_dataloaders(
         dm.val_state_dataloader(), move_to_device=True)
@@ -166,7 +167,8 @@ def run():
         if is_rank_zero:
             cprint(f"Loading model from checkpoint {config['load_checkpoint_path']}", "blue")
         trainer = SACMotionPolicyTrainer.load_from_checkpoint(
-            config["load_checkpoint_path"],
+            checkpoint_path=config["load_checkpoint_path"],
+            map_location=device,
             **(config["shared_parameters"] or {}),
             **(config["training_model_parameters"] or {}),
             actor_only=config["load_actor_only"],
@@ -176,6 +178,7 @@ def run():
             cprint("Initializing new model", "blue")
         bc_model = PretrainingMotionPolicyTransformer.load_from_checkpoint(
             checkpoint_path=config["bc_checkpoint_path"],
+            map_location=device,
             **(config["shared_parameters"] or {}),
             **(config["training_model_parameters"] or {}),
             **(config.get("bc_model_parameters") or {}),
@@ -260,6 +263,31 @@ def run():
         return trainer.compute_rollout_val_metrics()
     # --- ---
 
+    train_trajectory_loader_iterator = iter(train_trajectory_loader) # TODO: what if it finishes? should we reset it?
+    progress_bar = tqdm(
+            total=replay_buffer.capacity,
+            desc=f"Prefill buffer",
+            unit="transition",
+            leave=True,
+            disable=not is_rank_zero,
+            dynamic_ncols=True,
+        )
+    while len(replay_buffer) < replay_buffer.capacity:
+        # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
+        idx, q, a, q_next, r, done = trainer.simulation_step_v2(train_trajectory_loader_iterator)
+        replay_buffer.push(
+            idx=idx,
+            q=q,
+            a=a,
+            q_next=q_next,
+            r=r,
+            done=done.unsqueeze(1),
+        )
+        progress_bar.update(len(done))
+    progress_bar.close()
+    if is_rank_zero:
+         cprint(f"Initial replay buffer filled with {len(replay_buffer)} transitions.", "green")
+
     # --- training loop ---
     n_batches = max_train_batches if max_train_batches is not None else len(train_trajectory_loader)
     last_ckpt_time = time.time()
@@ -269,7 +297,7 @@ def run():
             total=n_batches,
             desc=f"Epoch {epoch+1}/{config['max_epochs']}",
             unit="batch",
-            leave=False,
+            leave=True,
             disable=not is_rank_zero,
             dynamic_ncols=True,
         )
@@ -282,7 +310,7 @@ def run():
 
             # --- Simulation step ---
             for _ in range(config["sim_steps_per_train_step"]):
-                idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader)
+                idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
                 replay_buffer.push(
                     idx=idx,
                     q=q,
@@ -309,7 +337,6 @@ def run():
                 fabric=fabric,
                 global_step=global_step,
             )
-            print(len(replay_buffer))
 
             # if global_step % config["collect_rollouts_every_n_steps"] == 0:
             #     actor_rollout_metrics = trainer.actor_rollout(batch, replay_buffer) # fill the replay buffer

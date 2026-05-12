@@ -89,13 +89,13 @@ bc_checkpoint_path: /workspace/checkpoints/avoid_everything_cubby.ckpt
 # ===== Top-level Training Configuration =====
 # Used directly from config dict (not unpacked into any component)
 
-num_workers: 0                        # DataLoader workers (debug: disabled)
+num_workers: 4                        # DataLoader workers (debug: disabled)
 pretraining_steps: 100              # Steps before RL loss activates (debug: reduced)
 sim_steps_per_train_step: 1         # Environment simulation steps per training step
 log_every_n_steps: 10               # Logging frequency (debug: reduced)
 replay_buffer_capacity: 10000       # Max transitions to store (debug: reduced)
 n_gpus: 1                           # GPUs to use
-train_batch_size: 8                 # Training batch size (debug: small)
+train_batch_size: 64                 # Training batch size (debug: small)
 val_batch_size: 8                   # Validation batch size (debug: small)
 end_epoch_max_val_batches: 20       # Max validation batches per epoch (debug: minimal)
 end_epoch_max_val_rollouts: 10      # Max validation rollouts per epoch (debug: minimal)

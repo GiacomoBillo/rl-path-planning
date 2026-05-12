@@ -119,6 +119,9 @@ class SACMotionPolicyTrainer():
         self.simulation_batch: dict | None = None
         self.simulation_q: torch.Tensor | None = None
         self.simulation_pc: torch.Tensor | None = None
+        # Cached obstacle objects (rebuilt only when episodes reset)
+        self.simulation_cuboids = None
+        self.simulation_cylinders = None
 
         self.val_position_error = torchmetrics.MeanMetric()
         self.val_orientation_error = torchmetrics.MeanMetric()
@@ -647,16 +650,19 @@ class SACMotionPolicyTrainer():
         return metrics
 
     @torch.no_grad()
-    def simulation_step(self, dataloader):
+    def simulation_step(self, dataloader_iterator: iter):
         """
         Run one step of the environment simulation with the current policy.
         Used for data collection. Maintains state across calls.
         """
         # Initialize batch on first call
         if self.simulation_batch is None:
-            self.simulation_batch = next(iter(dataloader))
+            self.simulation_batch = next(dataloader_iterator)
             self.simulation_q = self.simulation_batch["configuration"].clone()
             self.simulation_pc = self.simulation_batch["point_cloud"].clone()
+            self.cuboids = TorchCuboids(self.simulation_batch["cuboid_centers"], self.simulation_batch["cuboid_dims"], self.simulation_batch["cuboid_quats"])
+            self.cylinders = TorchCylinders(self.simulation_batch["cylinder_centers"], self.simulation_batch["cylinder_radii"],
+                                    self.simulation_batch["cylinder_heights"], self.simulation_batch["cylinder_quats"])
         
         # Extract current state
         q = self.simulation_q
@@ -674,10 +680,16 @@ class SACMotionPolicyTrainer():
         q_next = (q + a).clamp(-1, 1)
         q_next_unn = self.robot.unnormalize_joints(q_next)
         
-        # TODO: cache cuboid and cylinder objects if they don't change across steps
-        cuboids = TorchCuboids(batch["cuboid_centers"], batch["cuboid_dims"], batch["cuboid_quats"])
-        cylinders = TorchCylinders(batch["cylinder_centers"], batch["cylinder_radii"],
-                                   batch["cylinder_heights"], batch["cylinder_quats"])
+        # Rebuild cuboid/cylinder objects ONLY if they're not cached
+        if self.simulation_cuboids is None:
+            cuboids = TorchCuboids(batch["cuboid_centers"], batch["cuboid_dims"], batch["cuboid_quats"])
+            cylinders = TorchCylinders(batch["cylinder_centers"], batch["cylinder_radii"],
+                                       batch["cylinder_heights"], batch["cylinder_quats"])
+            self.simulation_cuboids = cuboids
+            self.simulation_cylinders = cylinders
+        else:
+            cuboids = self.simulation_cuboids
+            cylinders = self.simulation_cylinders
         
         # Compute termination and reward
         # TODO: termination
@@ -695,9 +707,10 @@ class SACMotionPolicyTrainer():
         # Reset done episodes
         reset_mask = done.squeeze(-1) if done.dim() > 1 else done
         if reset_mask.any():
-            reset_batch = next(iter(dataloader))
+            reset_batch = next(dataloader_iterator)
             q_next[reset_mask] = reset_batch["configuration"][reset_mask]
             pc_next[reset_mask] = reset_batch["point_cloud"][reset_mask]
+            # Update ALL batch fields
             batch["cuboid_centers"][reset_mask] = reset_batch["cuboid_centers"][reset_mask]
             batch["cuboid_dims"][reset_mask] = reset_batch["cuboid_dims"][reset_mask]
             batch["cuboid_quats"][reset_mask] = reset_batch["cuboid_quats"][reset_mask]
@@ -707,13 +720,112 @@ class SACMotionPolicyTrainer():
             batch["cylinder_quats"][reset_mask] = reset_batch["cylinder_quats"][reset_mask]
             batch["target_position"][reset_mask] = reset_batch["target_position"][reset_mask]
             batch["target_orientation"][reset_mask] = reset_batch["target_orientation"][reset_mask]
+            # Invalidate cached cuboids/cylinders so they're rebuilt on next step
+            self.simulation_cuboids = None
+            self.simulation_cylinders = None
         
         # Save state for next call
         self.simulation_q = q_next
         self.simulation_pc = pc_next
+        self.simulation_batch = batch
 
         # info        
         return idx, q, a, q_next, r_t, done 
+
+    @torch.no_grad()
+    def simulation_step_v2(self, dataloader_iterator: iter):
+        """
+        Optimized simulation step with active episode masking.
+        Only computes on active (non-finished) episodes, avoiding wasted computation.
+        Resets entire batch when all episodes are done.
+        
+        Pattern similar to actor_rollout(): track active mask, only forward/compute on subset.
+        """
+        # Initialize or reset batch when ALL episodes are done
+        if self.simulation_batch is None or not self.simulation_active.any():
+            self.simulation_batch = next(dataloader_iterator)
+            self.simulation_q = self.simulation_batch["configuration"].clone()
+            self.simulation_pc = self.simulation_batch["point_cloud"].clone()
+            B = self.simulation_q.size(0)
+            self.simulation_active = torch.ones(B, dtype=torch.bool, device=self.simulation_q.device)
+            self.simulation_cuboids = TorchCuboids(self.simulation_batch["cuboid_centers"], 
+                                                    self.simulation_batch["cuboid_dims"], 
+                                                    self.simulation_batch["cuboid_quats"])
+            self.simulation_cylinders = TorchCylinders(self.simulation_batch["cylinder_centers"], 
+                                                       self.simulation_batch["cylinder_radii"],
+                                                       self.simulation_batch["cylinder_heights"], 
+                                                       self.simulation_batch["cylinder_quats"])
+        
+        # Extract current state
+        q = self.simulation_q
+        pc = self.simulation_pc
+        batch: Dict = self.simulation_batch
+        active = self.simulation_active
+        idx = batch["pidx"]
+        
+        # Extract active subset for computation
+        q_act = q[active]
+        pc_act = pc[active]
+        batch_act = {key: val[active] if isinstance(val, torch.Tensor) else val 
+                     for key, val in batch.items()}
+        
+        # Actor step on active subset
+        # Create minimal batch dict for backbone
+        batch_for_backbone = {
+            "point_cloud": batch_act["point_cloud"],
+            "point_cloud_labels": batch_act["point_cloud_labels"],
+            "configuration": batch_act["configuration"],
+        }
+        q_features = self.backbone(batch_for_backbone)
+        qdeltas, log_prob, mean, log_std = self.actor.get_action(q_features)
+        a_act = qdeltas[:, -1, :] if qdeltas.dim() == 3 else qdeltas
+        if self.action_clip is not None:
+            a_act = torch.clamp(a_act, -self.action_clip, self.action_clip)
+        
+        q_next_act = (q_act + a_act).clamp(-1, 1)
+        q_next_unn_act = self.robot.unnormalize_joints(q_next_act)
+        
+        # Get cuboids/cylinders for active subset only
+        cuboids_act = self.simulation_cuboids[active]
+        cylinders_act = self.simulation_cylinders[active]
+        
+        # Compute termination and reward on active subset
+        reached_act = self._check_reaching_success(q_next_unn_act, 
+                                                    batch_act["target_position"], 
+                                                    batch_act["target_orientation"])
+        collided_act = self._check_for_collisions(q_next_unn_act, cuboids_act, cylinders_act)
+        done_act = reached_act | collided_act
+        r_t_act = torch.where(collided_act, self.collision_reward,
+                              torch.where(reached_act, self.goal_reward, self.step_reward)).unsqueeze(1)
+        
+        # Update point cloud for active subset
+        samples_act = self._sample(q_next_unn_act)[..., :3]
+        pc_act[: samples_act.size(0), :samples_act.size(1)] = samples_act
+        
+        # Mark newly done episodes as inactive
+        still_active_act = ~done_act
+        
+        # BEFORE updating active mask, extract data to return
+        # (idx_act is from current active set before it's updated)
+        idx_act = idx[active]
+        q_act_for_return = q_act  # This is the starting state for active episodes
+        
+        # Update active mask for next step
+        tmp = active.nonzero(as_tuple=False).squeeze(1)
+        active[tmp] = still_active_act
+        
+        # Write back active subset into full tensors (for still-active episodes only)
+        q[active] = q_next_act[still_active_act]
+        pc[active] = pc_act[still_active_act]
+        
+        # Save state for next call
+        self.simulation_q = q
+        self.simulation_pc = pc
+        self.simulation_active = active
+        
+        # Return active episode data
+        # All tensors are in "active" space: idx_act, q_act_for_return, a_act, q_next_act, r_t_act, done_act
+        return idx_act, q_act_for_return, a_act, q_next_act, r_t_act, done_act
 
 
     @torch.no_grad()
