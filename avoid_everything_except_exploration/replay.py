@@ -19,6 +19,7 @@ class ReplayBuffer:
         num_robot_points: int,
         num_target_points: int,
         dataset: Base,
+        pin_memory: bool = True,
     ):
         self.capacity = int(capacity)
         self.num_robot_points = num_robot_points
@@ -27,14 +28,15 @@ class ReplayBuffer:
         self.robot = None
         self.robot_sampler = None
         self.dataset = dataset # reference to the dataset (for extracting scene info)
+        self.pin_memory = pin_memory
 
         # data pinned to CPU memory (RAM)
-        self.idx   = torch.empty(capacity, dtype=torch.int64,  pin_memory=True)
-        self.q     = torch.empty(capacity, robot_dof, dtype=torch.float16, pin_memory=True)
-        self.a     = torch.empty_like(self.q)
-        self.qnext = torch.empty_like(self.q)
-        self.r     = torch.empty(capacity, 1, dtype=torch.float32, pin_memory=True)
-        self.done  = torch.empty(capacity, 1, dtype=torch.uint8,  pin_memory=True)
+        self.idx   = torch.empty(capacity, dtype=torch.int64,  pin_memory=pin_memory)
+        self.q     = torch.empty(capacity, robot_dof, dtype=torch.float16, pin_memory=pin_memory)
+        self.a = torch.empty(capacity, robot_dof, dtype=torch.float16, pin_memory=pin_memory)
+        self.qnext = torch.empty(capacity, robot_dof, dtype=torch.float16, pin_memory=pin_memory)
+        self.r     = torch.empty(capacity, 1, dtype=torch.float32, pin_memory=pin_memory)
+        self.done  = torch.empty(capacity, 1, dtype=torch.uint8,  pin_memory=pin_memory)
         self.ptr = 0
         self.full = False
 
@@ -51,7 +53,7 @@ class ReplayBuffer:
                 use_cache=True,
                 device=device,
             )
-        assert self.robot_sampler.device == device, "Sampler device mismatch"
+        # assert self.robot_sampler.device == device, "Sampler device mismatch"
         assert self.robot.device == device, "Robot device mismatch"
 
     def push(self, idx, q, a, q_next, r, done):
@@ -149,7 +151,7 @@ class ReplayBuffer:
         done = done.to(device, non_blocking=True)
 
         uniq, inv = torch.unique(idx, sorted=True, return_inverse=True)
-        sc = self.dataset.batch_scenes_by_idx(uniq.cpu())  # CPU pinned
+        sc = self.dataset.batch_scenes_by_idx(uniq.cpu(), pin=self.pin_memory)  # CPU pinned
         inv_cpu = inv.cpu()
         
         def to_dev(x):  # x: CPU pinned [U, ...]
@@ -170,26 +172,43 @@ class ReplayBuffer:
         self._ensure_robot_sampler(device)
         assert self.robot is not None
         assert self.robot_sampler is not None
+
+        # state reconstruction: unnormalize q, sample robot point cloud, update point cloud and labels from dataset
         q_unn = self.robot.unnormalize_joints(q)
         robot_points = self.robot_sampler.sample(q_unn)[..., :3]  # [B, N_robot, 3]
-
-        
         pc = torch.cat([robot_points, scene_points, target_points], dim=1)  # [B, N_total, 3]
         B = pc.size(0)
         if not hasattr(self, "_labels"):
             R, S, T = self.num_robot_points, self.dataset.num_obstacle_points, self.num_target_points
-            self._labels = torch.cat([torch.zeros(R,1), torch.ones(S,1), 2*torch.ones(T,1)], dim=0).pin_memory()
+            self._labels = torch.cat([torch.zeros(R,1), torch.ones(S,1), 2*torch.ones(T,1)], dim=0)
+            if self.pin_memory:
+                self._labels = self._labels.pin_memory()
         labels = self._labels.expand(B, -1, -1).to(device, non_blocking=True)
+
+        # next state reconstruction
+        qn_unn = self.robot.unnormalize_joints(qn)
+        robot_points_next = self.robot_sampler.sample(qn_unn)[..., :3]  # [B, N_robot, 3]
+        pc_next = torch.cat([robot_points_next, scene_points, target_points], dim=1)  # [B, N_total, 3]
 
         batch = {
             "idx": idx,
-            "configuration": q,
+            # "configuration": q,
+            "state": {
+                "configuration": q,
+                "point_cloud": pc,
+                "point_cloud_labels": labels,
+            },
             "action": a,
-            "next_configuration": qn,
+            # "next_configuration": qn,
+            "next_state": {
+                "configuration": qn,
+                "point_cloud": pc_next,
+                "point_cloud_labels": labels, # labels next = labels (fixed number of points per category)
+            },
             "reward": r,
             "done": done,
-            "point_cloud": pc,
-            "point_cloud_labels": labels,
+            # "point_cloud": pc,
+            # "point_cloud_labels": labels,
             "cuboid_centers": cuboid_centers,
             "cuboid_dims": cuboid_dims,
             "cuboid_quats": cuboid_quats,
