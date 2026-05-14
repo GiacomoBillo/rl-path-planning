@@ -41,6 +41,7 @@ from lightning.pytorch.loggers import WandbLogger  # Fabric can use PL loggers
 import numpy as np
 import torch
 import yaml
+from collections import defaultdict
 
 from avoid_everything_except_exploration.data_loader import DataModule
 from avoid_everything_except_exploration.mixed_batch_provider import MixedBatchProvider
@@ -317,6 +318,10 @@ def run():
         "replay_sample_time": 0.0,
         "training_time": 0.0,
     }
+    
+    train_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
+    train_metrics_count = 0 
+    
     for epoch in range(config["max_epochs"]):
         epoch_bar = tqdm(
             total=n_batches,
@@ -366,7 +371,7 @@ def run():
             t2 = time.time()
             replay_sample_time = t2 - t1
             with torch.cuda.amp.autocast(dtype=torch.float16):
-                metrics = trainer.train_step(
+                train_metrics = trainer.train_step(
                     batch,
                     # fabric=fabric,
                     global_step=global_step,
@@ -386,17 +391,20 @@ def run():
             #             step=global_step)
             #         logger.log_metrics({"train/replay_buffer_size": len(replay_buffer)}, step=global_step)
 
-            log_actor_loss_when_available = False
-            if logger and (global_step % config["log_every_n_steps"] == 0):
-                logger.log_metrics(
-                    {f"train/{k}": v for k, v in metrics.items()}, step=global_step)
-                # if not use_actor_loss:
-                #     log_actor_loss_when_available = True
-            # make sure actor loss is logged roughly every log_every_n_steps steps also, despite actor_delay
-            # if logger and use_actor_loss and log_actor_loss_when_available:
-            #     logger.log_metrics(
-            #         {"train/actor_loss": metrics["actor_loss"]}, step=global_step)
-            #     log_actor_loss_when_available = False
+            for k, v in train_metrics.items():
+                if v is not None:
+                    train_metrics_accum[k] = train_metrics_accum[k] + v
+            
+            train_metrics_count += 1
+            
+            if logger and (global_step % config["log_train_freq"] == 0) and global_step > 0:
+                log_dict = {f"train/{k}": (s / train_metrics_count).item() 
+                            for k, s in train_metrics_accum.items()}
+                logger.log_metrics(log_dict, step=global_step)
+                
+                train_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
+                train_metrics_count = 0
+            # TODO: log time, episode, validation, replay buffer
 
             # increment with the number of batches consumed from the expert loader
             # NOTE: This makes it APPEAR as if training slows down to `expert_fraction` of pre-training speed

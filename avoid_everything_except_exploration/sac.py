@@ -549,13 +549,27 @@ class SACMotionPolicyTrainer():
                     # fabric: Fabric,
                     global_step: int
                     ):
-        # metrics = {
-        #     "actor_lr": float(self.actor_optimizer.param_groups[0]["lr"]),
-        #     "critic_lr": float(self.critic_optimizer.param_groups[0]["lr"]),
-        # }
-        # if self.entropy_autotune:
-        #     metrics["alpha_lr"] = float(self.alpha_optimizer.param_groups[0]["lr"])
+        """
+        Compute one training step and return metrics as GPU tensors (detached).
         
+        Do NOT call .item() here—defer to caller at log time to avoid GPU sync stalls.
+        Returning detached tensors allows caller to accumulate them and sync once per
+        log_every_n_steps instead of every step.
+        
+        Returns:
+            dict: Metrics with GPU tensors
+                - Always: qf_loss, qf1_loss, qf2_loss, current_q_min, current_q1, current_q2,
+                          target_q_min, target_q1, target_q2
+                - On policy_frequency steps: actor_loss, actor_q_min, entropy, action_mean, 
+                                           log_std_mean, alpha_loss (if autotune), alpha (if autotune)
+        """
+        metrics = {
+            "actor_lr": float(self.actor_optimizer.param_groups[0]["lr"]),
+            "critic_lr": float(self.critic_optimizer.param_groups[0]["lr"]),
+        }
+        if self.entropy_autotune:
+            metrics["alpha_lr"] = float(self.alpha_optimizer.param_groups[0]["lr"])
+
         states = batch["state"]
         next_states = batch["next_state"]
         actions = batch["action"]
@@ -564,14 +578,14 @@ class SACMotionPolicyTrainer():
 
         alpha = self.log_alpha.exp()
         with torch.no_grad():
-            next_state_features = self.backbone(next_states) # run backbone once
+            next_state_features = self.backbone(next_states)
             next_state_actions, next_state_log_pi, _, _ = self.actor.get_action(next_state_features)
             qf1_next_target = self.qf1_target(next_state_features, next_state_actions)
             qf2_next_target = self.qf2_target(next_state_features, next_state_actions)
             min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
             next_q_value = rewards.flatten() + (1 - dones.flatten()) * self.gamma * (min_qf_next_target).view(-1)
 
-        state_features = self.backbone(states) # run backbone once
+        state_features = self.backbone(states)
         qf1_a_values = self.qf1(state_features, actions).view(-1)
         qf2_a_values = self.qf2(state_features, actions).view(-1)
         qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
@@ -585,10 +599,20 @@ class SACMotionPolicyTrainer():
         self.critic_optimizer.step()
         # TODO: clip gradients?
 
-        if global_step % self.policy_frequency == 0:  # TD 3 Delayed update support
-            for _ in range(
-                self.policy_frequency
-            ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+        # Critic metrics (always computed) - return as detached tensors (no .item() calls!)
+        metrics["qf_loss"] = qf_loss.detach()
+        metrics["qf1_loss"] = qf1_loss.detach()
+        metrics["qf2_loss"] = qf2_loss.detach()
+        metrics["current_q_min"] = torch.min(qf1_a_values, qf2_a_values).mean().detach()
+        metrics["current_q1"] = qf1_a_values.mean().detach()
+        metrics["current_q2"] = qf2_a_values.mean().detach()
+        metrics["target_q_min"] = min_qf_next_target.mean().detach()
+        metrics["target_q1"] = qf1_next_target.mean().detach()
+        metrics["target_q2"] = qf2_next_target.mean().detach()
+
+        # Delayed policy update (TD3-style)
+        if global_step % self.policy_frequency == 0:
+            for _ in range(self.policy_frequency):
                 pi, log_pi, mu, log_std = self.actor.get_action(state_features)
                 qf1_pi = self.qf1(state_features, pi)
                 qf2_pi = self.qf2(state_features, pi)
@@ -596,61 +620,35 @@ class SACMotionPolicyTrainer():
                 actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
                 self.actor_optimizer.zero_grad()
-                # fabric.backward(actor_loss) 
                 actor_loss.backward()
                 self.actor_optimizer.step()
 
+                # Actor metrics (only on policy_frequency steps)
+                metrics["actor_loss"] = actor_loss.detach()
+                metrics["actor_q_min"] = min_qf_pi.mean().detach()
+                metrics["entropy"] = (-log_pi.mean()).detach()
+                metrics["action_mean"] = mu.abs().mean().detach()
+                metrics["log_std_mean"] = log_std.mean().detach()
+                # TODO: per-joint action/log_std metrics?
+
                 if self.entropy_autotune:
                     alpha_loss = (-self.log_alpha.exp() * (log_pi + self.target_entropy)).mean()
-                    metrics["alpha_loss"] = float(alpha_loss.detach().item())
+                    metrics["alpha_loss"] = alpha_loss.detach()
 
                     self.alpha_optimizer.zero_grad()
                     alpha_loss.backward()
-                    # fabric.backward(alpha_loss)
                     self.alpha_optimizer.step()
-                    self.alpha = self.log_alpha.exp().item()
+                    self.alpha = self.log_alpha.exp().detach()
                     metrics["alpha"] = self.alpha
 
-        # update the target networks
+        # Update target networks
         if global_step % self.target_network_frequency == 0:
             for param, target_param in zip(self.qf1.parameters(), self.qf1_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
             for param, target_param in zip(self.qf2.parameters(), self.qf2_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-        # log metrics
-        # if global_step % self.log_train_frequency == 0:
-        # TODO: no item() because it's slow
-        # TODO: not all values to be logged are always computed
-        # action_joints = mu.abs().mean(dim=0).cpu().tolist()
-        # log_std_joints = log_std.mean(dim=0).cpu().tolist()
-        # metrics.update({
-        #     "actor_loss": float(actor_loss.detach().item()),
-        #     "critic_loss": float(qf_loss.detach().item()),
-        #     "critic_loss_q1": float(qf1_loss.detach().item()),
-        #     "critic_loss_q2": float(qf2_loss.detach().item()),
-        #     "current_q_min": float(torch.min(qf1_a_values, qf2_a_values).mean().item()),
-        #     "current_q1": float(qf1_a_values.mean().item()),
-        #     "current_q2": float(qf2_a_values.mean().item()),
-        #     "target_q_min": float(min_qf_next_target.mean().item()),
-        #     "target_q1": float(qf1_next_target.mean().item()),
-        #     "target_q2": float(qf2_next_target.mean().item()),
-        #     "actor_q_min": float(min_qf_pi.mean().item()),
-        #     "entropy": float(-log_pi.mean().item()),
-        #     # TODO: entropy != log_std
-
-        #     "action_mean": float(mu.abs().mean().item()),
-        #     **{f"action_j{i}": float(v) for i,v in enumerate(action_joints)},
-        #     "log_std_mean": float(log_std.mean().item()), # or next?
-        #     **{f"log_std_j{i}": float(v) for i,v in enumerate(log_std_joints)},
-        #     # "update_step": update_step,
-        #     # global_step
-        #     # "SPS": int(global_step / (time.time() - self.start_time)), # steps per seconds
-        # })
-        # if self.entropy_autotune:
-        #     metrics["entropy_coef"] = self.alpha
-        #     metrics["entropy_loss"] = float(alpha_loss.detach().item())
-        return {} #metrics
+        return metrics
 
     @torch.no_grad()
     def simulation_step(self, dataloader_iterator: iter):
