@@ -130,7 +130,9 @@ class ReplayBuffer:
         """
         Sample a batch of transitions from the replay buffer.
         """
-        device = torch.device(device) if device is not None else torch.device('cpu')
+        if device is None:
+            device = "cpu"
+        device = device if isinstance(device, torch.device) else torch.device(device)
 
         with self._lock:
             n = len(self)
@@ -196,8 +198,7 @@ class ReplayBuffer:
         target_orientation= to_dev_fast(sc["target_orientation"])
         scene_points      = to_dev_fast(sc["scene_points"])
         target_points     = to_dev_fast(sc["target_points"])
-
-
+    
         self._ensure_robot_sampler(device)
         assert self.robot is not None
         assert self.robot_sampler is not None

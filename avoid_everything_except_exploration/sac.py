@@ -14,7 +14,7 @@ Does NOT use:
 """
 
 from typing import Dict, Tuple, Callable
-from lightning import Fabric
+# from lightning import Fabric
 
 import copy
 import time
@@ -77,12 +77,13 @@ class SACMotionPolicyTrainer():
         log_std_init: int,
         target_network_frequency: int = 1,
         policy_frequency: int = 1,
+        device=None,
         *args, **kwargs
     ):
         self.urdf_path = urdf_path
         self.robot = None
         self.fk_sampler = None
-        self.device = None
+        self.device = device if device is not None else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.num_robot_points = num_robot_points
         self.point_match_loss_weight = point_match_loss_weight
         self.collision_loss_weight = collision_loss_weight
@@ -139,13 +140,13 @@ class SACMotionPolicyTrainer():
         self.bc_model = bc_model # keep original model
         # TODO: original model head
         # split original model in backbone and actor and critic heads
-        self.backbone = MPiFormerBackbone(bc_model=bc_model, deep_copy=False)
-        self.actor = MPiFormerSACActorHead(bc_model=bc_model, split_layer=split_layer, log_std_init=log_std_init, deep_copy=True)
-        self.qf1 = MPiFormerCriticHead(bc_model=bc_model, split_layer=split_layer, deep_copy=True)
-        self.qf2 = MPiFormerCriticHead(bc_model=bc_model, split_layer=split_layer, deep_copy=True)
+        self.backbone = MPiFormerBackbone(bc_model=bc_model, deep_copy=False).to(self.device)
+        self.actor = MPiFormerSACActorHead(bc_model=bc_model, split_layer=split_layer, log_std_init=log_std_init, deep_copy=True).to(self.device)
+        self.qf1 = MPiFormerCriticHead(bc_model=bc_model, split_layer=split_layer, deep_copy=True).to(self.device)
+        self.qf2 = MPiFormerCriticHead(bc_model=bc_model, split_layer=split_layer, deep_copy=True).to(self.device)
         # Hard-deep-copy critics weights into targets; then call polyak_update() each step.
-        self.qf1_target = copy.deepcopy(self.qf1)
-        self.qf2_target = copy.deepcopy(self.qf2)
+        self.qf1_target = copy.deepcopy(self.qf1).to(self.device)
+        self.qf2_target = copy.deepcopy(self.qf2).to(self.device)
 
         self.actor_optimizer: torch.optim.Optimizer
         self.critic_optimizer: torch.optim.Optimizer
@@ -231,7 +232,7 @@ class SACMotionPolicyTrainer():
         """
         Resolve current device from model parameters.
         """
-        assert next (self.actor.parameters()).device == next(self.qf1.parameters()).device
+        assert next(self.actor.parameters()).device == next(self.qf1.parameters()).device
         assert next(self.actor.parameters()).device == next(self.qf2.parameters()).device
         assert next(self.actor.parameters()).device == next(self.qf1_target.parameters()).device
         assert next(self.actor.parameters()).device == next(self.qf2_target.parameters()).device
@@ -274,19 +275,20 @@ class SACMotionPolicyTrainer():
 
     #     return action_unn / joint_range_half
 
-    def setup(self, fabric: Fabric):
+    # def setup(self, fabric: Fabric):
+    def setup(self):
         """
         Device-critical initialization. Call after moving model to the desired 
         device. Initializes robot and point cloud sampler on current device.
         """
 
         # fabric setup: wrap trainable modules w/ their optimizers
-        self.actor,  self.actor_optimizer  = fabric.setup(self.actor,  self.actor_optimizer)
-        self.qf1, self.critic_optimizer = fabric.setup(self.qf1, self.critic_optimizer)
-        self.qf2 = fabric.setup(self.qf2) # shared optimizer for both critics
-        # target networks have no optimizers
-        self.qf1_target  = fabric.setup(self.qf1_target)
-        self.qf2_target = fabric.setup(self.qf2_target)
+        # self.actor,  self.actor_optimizer  = fabric.setup(self.actor,  self.actor_optimizer)
+        # self.qf1, self.critic_optimizer = fabric.setup(self.qf1, self.critic_optimizer)
+        # self.qf2 = fabric.setup(self.qf2) # shared optimizer for both critics
+        # # target networks have no optimizers
+        # self.qf1_target  = fabric.setup(self.qf1_target)
+        # self.qf2_target = fabric.setup(self.qf2_target)
 
         self.device = self._verify_device()
         # assert str(self.device) != "cpu", "You do not want to train on CPU"
@@ -544,17 +546,16 @@ class SACMotionPolicyTrainer():
 
     def train_step(self,
                     batch: dict[str, torch.Tensor],
-                    fabric: Fabric,
+                    # fabric: Fabric,
                     global_step: int
                     ):
-        metrics = {
-            "actor_lr": float(self.actor_optimizer.param_groups[0]["lr"]),
-            "critic_lr": float(self.critic_optimizer.param_groups[0]["lr"]),
-        }
-        if self.entropy_autotune:
-            metrics["alpha_lr"] = float(self.alpha_optimizer.param_groups[0]["lr"])
+        # metrics = {
+        #     "actor_lr": float(self.actor_optimizer.param_groups[0]["lr"]),
+        #     "critic_lr": float(self.critic_optimizer.param_groups[0]["lr"]),
+        # }
+        # if self.entropy_autotune:
+        #     metrics["alpha_lr"] = float(self.alpha_optimizer.param_groups[0]["lr"])
         
-        # TODO: introduce backbone
         states = batch["state"]
         next_states = batch["next_state"]
         actions = batch["action"]
@@ -579,7 +580,8 @@ class SACMotionPolicyTrainer():
 
         # optimize the model
         self.critic_optimizer.zero_grad()
-        fabric.backward(qf_loss) # qf_loss.backward()
+        # fabric.backward(qf_loss) 
+        qf_loss.backward()
         self.critic_optimizer.step()
         # TODO: clip gradients?
 
@@ -594,7 +596,8 @@ class SACMotionPolicyTrainer():
                 actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
                 self.actor_optimizer.zero_grad()
-                fabric.backward(actor_loss) # actor_loss.backward()
+                # fabric.backward(actor_loss) 
+                actor_loss.backward()
                 self.actor_optimizer.step()
 
                 if self.entropy_autotune:
@@ -602,8 +605,8 @@ class SACMotionPolicyTrainer():
                     metrics["alpha_loss"] = float(alpha_loss.detach().item())
 
                     self.alpha_optimizer.zero_grad()
-                    # alpha_loss.backward()
-                    fabric.backward(alpha_loss)
+                    alpha_loss.backward()
+                    # fabric.backward(alpha_loss)
                     self.alpha_optimizer.step()
                     self.alpha = self.log_alpha.exp().item()
                     metrics["alpha"] = self.alpha
@@ -619,35 +622,35 @@ class SACMotionPolicyTrainer():
         # if global_step % self.log_train_frequency == 0:
         # TODO: no item() because it's slow
         # TODO: not all values to be logged are always computed
-        action_joints = mu.abs().mean(dim=0).cpu().tolist()
-        log_std_joints = log_std.mean(dim=0).cpu().tolist()
-        metrics.update({
-            "actor_loss": float(actor_loss.detach().item()),
-            "critic_loss": float(qf_loss.detach().item()),
-            "critic_loss_q1": float(qf1_loss.detach().item()),
-            "critic_loss_q2": float(qf2_loss.detach().item()),
-            "current_q_min": float(torch.min(qf1_a_values, qf2_a_values).mean().item()),
-            "current_q1": float(qf1_a_values.mean().item()),
-            "current_q2": float(qf2_a_values.mean().item()),
-            "target_q_min": float(min_qf_next_target.mean().item()),
-            "target_q1": float(qf1_next_target.mean().item()),
-            "target_q2": float(qf2_next_target.mean().item()),
-            "actor_q_min": float(min_qf_pi.mean().item()),
-            "entropy": float(-log_pi.mean().item()),
-            # TODO: entropy != log_std
+        # action_joints = mu.abs().mean(dim=0).cpu().tolist()
+        # log_std_joints = log_std.mean(dim=0).cpu().tolist()
+        # metrics.update({
+        #     "actor_loss": float(actor_loss.detach().item()),
+        #     "critic_loss": float(qf_loss.detach().item()),
+        #     "critic_loss_q1": float(qf1_loss.detach().item()),
+        #     "critic_loss_q2": float(qf2_loss.detach().item()),
+        #     "current_q_min": float(torch.min(qf1_a_values, qf2_a_values).mean().item()),
+        #     "current_q1": float(qf1_a_values.mean().item()),
+        #     "current_q2": float(qf2_a_values.mean().item()),
+        #     "target_q_min": float(min_qf_next_target.mean().item()),
+        #     "target_q1": float(qf1_next_target.mean().item()),
+        #     "target_q2": float(qf2_next_target.mean().item()),
+        #     "actor_q_min": float(min_qf_pi.mean().item()),
+        #     "entropy": float(-log_pi.mean().item()),
+        #     # TODO: entropy != log_std
 
-            "action_mean": float(mu.abs().mean().item()),
-            **{f"action_j{i}": float(v) for i,v in enumerate(action_joints)},
-            "log_std_mean": float(log_std.mean().item()), # or next?
-            **{f"log_std_j{i}": float(v) for i,v in enumerate(log_std_joints)},
-            # "update_step": update_step,
-            # global_step
-            # "SPS": int(global_step / (time.time() - self.start_time)), # steps per seconds
-        })
-        if self.entropy_autotune:
-            metrics["entropy_coef"] = self.alpha
-            metrics["entropy_loss"] = float(alpha_loss.detach().item())
-        return metrics
+        #     "action_mean": float(mu.abs().mean().item()),
+        #     **{f"action_j{i}": float(v) for i,v in enumerate(action_joints)},
+        #     "log_std_mean": float(log_std.mean().item()), # or next?
+        #     **{f"log_std_j{i}": float(v) for i,v in enumerate(log_std_joints)},
+        #     # "update_step": update_step,
+        #     # global_step
+        #     # "SPS": int(global_step / (time.time() - self.start_time)), # steps per seconds
+        # })
+        # if self.entropy_autotune:
+        #     metrics["entropy_coef"] = self.alpha
+        #     metrics["entropy_loss"] = float(alpha_loss.detach().item())
+        return {} #metrics
 
     @torch.no_grad()
     def simulation_step(self, dataloader_iterator: iter):
@@ -657,7 +660,7 @@ class SACMotionPolicyTrainer():
         """
         # Initialize batch on first call
         if self.simulation_batch is None:
-            self.simulation_batch = next(dataloader_iterator)
+            self.simulation_batch = self.move_batch_to_device(next(dataloader_iterator), self.device)
             self.simulation_q = self.simulation_batch["configuration"].clone()
             self.simulation_pc = self.simulation_batch["point_cloud"].clone()
             self.cuboids = TorchCuboids(self.simulation_batch["cuboid_centers"], self.simulation_batch["cuboid_dims"], self.simulation_batch["cuboid_quats"])
@@ -743,7 +746,7 @@ class SACMotionPolicyTrainer():
         """
         # Initialize or reset batch when ALL episodes are done
         if self.simulation_batch is None or not self.simulation_active.any():
-            self.simulation_batch = next(dataloader_iterator)
+            self.simulation_batch = self.move_batch_to_device(next(dataloader_iterator), self.device)
             self.simulation_q = self.simulation_batch["configuration"].clone()
             self.simulation_pc = self.simulation_batch["point_cloud"].clone()
             B = self.simulation_q.size(0)

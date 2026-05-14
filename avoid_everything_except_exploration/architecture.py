@@ -230,8 +230,8 @@ class MPiFormerSACActorHead(nn.Module):
         self.action_dim = bc_model.action_decoder.out_features
 
         # scale and bias for action output, applied after tanh squashing in SAC implementation (by default it leaves the action unchanged)
-        self.action_scale = action_scale
-        self.action_bias = action_bias
+        self.register_buffer("action_scale", torch.tensor(action_scale))
+        self.register_buffer("action_bias", torch.tensor(action_bias))
 
         self.mu = nn.Linear(self.tail.d_model, self.action_dim)
         # self.log_std = nn.Parameter(torch.full((action_dim,), float(log_std_init))) # State-independent log std
@@ -245,7 +245,6 @@ class MPiFormerSACActorHead(nn.Module):
             # initialize log_std
             self.log_std.weight.zero_() 
             self.log_std.bias.fill_(log_std_init)
-
 
     def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = self.tail(features)

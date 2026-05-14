@@ -36,7 +36,7 @@ from contextlib import contextmanager
 
 from tqdm import tqdm
 from termcolor import cprint
-from lightning.fabric import Fabric
+# from lightning.fabric import Fabric
 from lightning.pytorch.loggers import WandbLogger  # Fabric can use PL loggers
 import numpy as np
 import torch
@@ -109,18 +109,20 @@ def run():
     save_dir = Path(base_save_dir) / run_id
     os.makedirs(save_dir, exist_ok=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    fabric = Fabric(accelerator=device, devices=config["n_gpus"], precision="32-true")
-    fabric.launch()
-    is_rank_zero: bool = fabric.global_rank == 0
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # fabric = Fabric(accelerator=device, devices=config["n_gpus"], precision="32-true")
+    # fabric = Fabric(accelerator=device, devices=config["n_gpus"], precision="16-mixed")
+    # fabric.launch()
+    is_rank_zero: bool = True #fabric.global_rank == 0
 
     if is_rank_zero:
+        print("Using device:", device)
         cprint(f"Experiment name: {config['experiment_name']}", "blue")
         if not config["logging"]:
             cprint("Logs disabled", "red")
 
     # make deterministic-ish
-    seed = 42 + fabric.global_rank
+    seed = 42 #+ fabric.global_rank
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -135,8 +137,9 @@ def run():
         **(config["data_module_parameters"] or {}),
     )
     dm.setup("fit")
-    train_trajectory_loader = fabric.setup_dataloaders(dm.train_trajectory_dataloader(), move_to_device=True)
-    print(f"Workers for train trajectory loader: {train_trajectory_loader.num_workers}, persistent_workers: {train_trajectory_loader.persistent_workers}")
+    # train_trajectory_loader = fabric.setup_dataloaders(dm.train_trajectory_dataloader(), move_to_device=True)
+    train_trajectory_loader = dm.train_trajectory_dataloader(batch_size=config["prefill_batch_size"]) 
+    print(f"Workers for train trajectory loader: {train_trajectory_loader.num_workers}, persistent_workers: {train_trajectory_loader.persistent_workers}, batch_size: {train_trajectory_loader.batch_size}")
     # expert_loader = fabric.setup_dataloaders(dm.train_dataloader(), move_to_device=True)
     # val_state_loader = fabric.setup_dataloaders(
     #     dm.val_state_dataloader(), move_to_device=True)
@@ -155,7 +158,7 @@ def run():
     async_replay = AsyncReplay(
         replay=replay_buffer,
         batch_size=config["train_batch_size"],
-        device=fabric.device,
+        device=device,  # fabric.device,
         prefetch=config["async_replay_prefetch"],
     )
     # mixed_provider = MixedBatchProvider(
@@ -179,6 +182,7 @@ def run():
             **(config["shared_parameters"] or {}),
             **(config["training_model_parameters"] or {}),
             actor_only=config["load_actor_only"],
+            device=device,
         )
     else:
         if is_rank_zero:
@@ -195,6 +199,7 @@ def run():
             **(config["training_model_parameters"] or {}),
             **config["sac_parameters"],
             bc_model=bc_model,
+            device=device,
         )
 
     # clear any cached memory before training
@@ -203,7 +208,7 @@ def run():
         torch.cuda.empty_cache()
 
     trainer.configure_optimizers()
-    trainer.setup(fabric)
+    trainer.setup() # trainer.setup(fabric)
 
     if is_rank_zero:
         cprint("Model parameters:", "blue")
@@ -281,7 +286,8 @@ def run():
         )
     while len(replay_buffer) < replay_buffer.capacity/10:
         # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
-        idx, q, a, q_next, r, done = trainer.simulation_step_v2(train_trajectory_loader_iterator)
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            idx, q, a, q_next, r, done = trainer.simulation_step_v2(train_trajectory_loader_iterator)
         replay_buffer.push(
             idx=idx,
             q=q,
@@ -296,14 +302,21 @@ def run():
          cprint(f"Initial replay buffer filled with {len(replay_buffer)} transitions.", "green")
 
     # --- training loop ---
-    train_trajectory_loader.batch_size = config["simulation_batch_size"] # set the batch size for training (can be different from pre-filling)
-    print(f"Workers for train trajectory loader: {train_trajectory_loader.num_workers}, persistent_workers: {train_trajectory_loader.persistent_workers}")
-    val_trajectory_loader = fabric.setup_dataloaders(
-        dm.val_trajectory_dataloader(), move_to_device=True)
+    # train_trajectory_loader = fabric.setup_dataloaders(dm.train_trajectory_dataloader(batch_size=config["simulation_batch_size"]), move_to_device=True) # re-setup dataloader with new batch size
+    train_trajectory_loader = dm.train_trajectory_dataloader(batch_size=config["simulation_batch_size"]) 
+    print(f"Workers for train trajectory loader: {train_trajectory_loader.num_workers}, persistent_workers: {train_trajectory_loader.persistent_workers}, batch_size: {train_trajectory_loader.batch_size}")
+    # val_trajectory_loader = fabric.setup_dataloaders(
+    #     dm.val_trajectory_dataloader(), move_to_device=True)
+    val_trajectory_loader = dm.val_trajectory_dataloader()
 
     n_batches = max_train_batches if max_train_batches is not None else len(train_trajectory_loader)
     last_ckpt_time = time.time()
     global_step = 0
+    times = {
+        "simulation_time": 0.0,
+        "replay_sample_time": 0.0,
+        "training_time": 0.0,
+    }
     for epoch in range(config["max_epochs"]):
         epoch_bar = tqdm(
             total=n_batches,
@@ -321,9 +334,11 @@ def run():
             pretraining: bool = global_step < config["pretraining_steps"]
 
             # --- Simulation step ---
+            t0 = time.time()
             for _ in range(config["sim_steps_per_train_step"]):
-                # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
-                idx, q, a, q_next, r, done = trainer.simulation_step_v2(train_trajectory_loader_iterator) # TODO: is this a problem? simulating a non-constant num of steps between training steps?
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
+                    idx, q, a, q_next, r, done = trainer.simulation_step_v2(train_trajectory_loader_iterator) # TODO: is this a problem? simulating a non-constant num of steps between training steps?
                 replay_buffer.push(
                     idx=idx,
                     q=q,
@@ -332,6 +347,8 @@ def run():
                     r=r,
                     done=done.unsqueeze(1),
                 )
+            t1 = time.time()
+            simulation_time = t1 - t0
 
             # batch, data_loader_iterations = mixed_provider.sample(
             #     8 if config["mintest"] else config["train_batch_size"],
@@ -344,13 +361,22 @@ def run():
 
             # update_targets: bool = global_step % config["actor_delay"] == 0
             # use_actor_loss: bool = update_targets and (global_step > config["start_using_actor_loss"])
-            # batch = replay_buffer.sample(config["train_batch_size"], device=fabric.device)
+            # batch = replay_buffer.sample(config["train_batch_size"], device=device)
             batch = async_replay.get()  # Blocks until next prefetched batch is ready
-            metrics = trainer.train_step(
-                batch,
-                fabric=fabric,
-                global_step=global_step,
-            )
+            t2 = time.time()
+            replay_sample_time = t2 - t1
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                metrics = trainer.train_step(
+                    batch,
+                    # fabric=fabric,
+                    global_step=global_step,
+                )
+            training_time = time.time() - t2
+            times["simulation_time"] += simulation_time
+            times["replay_sample_time"] += replay_sample_time
+            times["training_time"] += training_time
+            if is_rank_zero and global_step>0 and global_step % 100 == 0:
+                print(f"Step {global_step:06d}  sim_time={times['simulation_time']/global_step:.4f}s  replay_sample_time={times['replay_sample_time']/global_step:.4f}s  training_time={times['training_time']/global_step:.4f}s")
 
             # if global_step % config["collect_rollouts_every_n_steps"] == 0:
             #     actor_rollout_metrics = trainer.actor_rollout(batch, replay_buffer) # fill the replay buffer
@@ -425,7 +451,7 @@ def run():
         #     logger.log_metrics({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
 
     async_replay.close()  # cleanly shutdown the async replay background thread
-    cprint("Finished Fabric training run.", "green")
+    cprint("Finished training run.", "green")
 
 if __name__ == "__main__":
     run()

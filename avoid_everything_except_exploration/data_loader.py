@@ -859,25 +859,26 @@ class DataModule:
             drop_last=True,
         )
     
-    def train_trajectory_dataloader(self) -> DataLoader:
+    def train_trajectory_dataloader(self, batch_size=None) -> DataLoader:
         """
         Method to get the dataloader for training trajectories
 
         :rtype DataLoader: The training trajectory dataloader
         """
-        self.data_train_trajectory = TrajectoryDataset.load_from_directory(
-            self.robot,
-            self.data_dir,
-            dataset_type=DatasetType.TRAIN,
-            trajectory_key=self.train_trajectory_key, # TODO: what? here?
-            num_robot_points=self.num_robot_points,
-            num_obstacle_points=self.num_obstacle_points,
-            num_target_points=self.num_target_points,
-            random_scale=0.0,
-        )
+        if not hasattr(self, "data_train_trajectory"):
+            self.data_train_trajectory = TrajectoryDataset.load_from_directory(
+                self.robot,
+                self.data_dir,
+                dataset_type=DatasetType.TRAIN,
+                trajectory_key=self.train_trajectory_key, # TODO: what? here?
+                num_robot_points=self.num_robot_points,
+                num_obstacle_points=self.num_obstacle_points,
+                num_target_points=self.num_target_points,
+                random_scale=0.0,
+            )
         return DataLoader(
             self.data_train_trajectory,
-            self.train_batch_size,
+            batch_size if batch_size is not None else self.train_batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
             shuffle=self.shuffle,
