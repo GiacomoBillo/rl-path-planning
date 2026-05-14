@@ -45,6 +45,7 @@ import yaml
 from avoid_everything_except_exploration.data_loader import DataModule
 from avoid_everything_except_exploration.mixed_batch_provider import MixedBatchProvider
 from avoid_everything_except_exploration.replay import ReplayBuffer
+from avoid_everything_except_exploration.mixed_batch_provider import AsyncReplay
 from avoid_everything_except_exploration.sac import SACMotionPolicyTrainer
 from avoid_everything.pretraining import PretrainingMotionPolicyTransformer
 
@@ -125,7 +126,7 @@ def run():
     random.seed(seed)
 
     dm = DataModule(
-        train_batch_size=8 if config["mintest"] else config["train_batch_size"],
+        train_batch_size=8 if config["mintest"] else config["prefill_batch_size"],
         val_batch_size=8 if config["mintest"] else config["val_batch_size"],
         num_workers=(
             0 if config["mintest"] else config["num_workers"]
@@ -136,11 +137,11 @@ def run():
     dm.setup("fit")
     train_trajectory_loader = fabric.setup_dataloaders(dm.train_trajectory_dataloader(), move_to_device=True)
     print(f"Workers for train trajectory loader: {train_trajectory_loader.num_workers}, persistent_workers: {train_trajectory_loader.persistent_workers}")
-    expert_loader = fabric.setup_dataloaders(dm.train_dataloader(), move_to_device=True)
-    val_state_loader = fabric.setup_dataloaders(
-        dm.val_state_dataloader(), move_to_device=True)
-    val_trajectory_loader = fabric.setup_dataloaders(
-        dm.val_trajectory_dataloader(), move_to_device=True)
+    # expert_loader = fabric.setup_dataloaders(dm.train_dataloader(), move_to_device=True)
+    # val_state_loader = fabric.setup_dataloaders(
+    #     dm.val_state_dataloader(), move_to_device=True)
+    # val_trajectory_loader = fabric.setup_dataloaders(
+    #     dm.val_trajectory_dataloader(), move_to_device=True)
 
     replay_buffer = ReplayBuffer(
         capacity=config["replay_buffer_capacity"],
@@ -150,6 +151,12 @@ def run():
         num_target_points=config["data_module_parameters"]["num_target_points"],
         dataset=dm.data_train,
         pin_memory= device == "cuda", # pin memory if using GPU to speed up transfers
+    )
+    async_replay = AsyncReplay(
+        replay=replay_buffer,
+        batch_size=config["train_batch_size"],
+        device=fabric.device,
+        prefetch=config["async_replay_prefetch"],
     )
     # mixed_provider = MixedBatchProvider(
     #     expert_loader=expert_loader,
@@ -272,7 +279,7 @@ def run():
             disable=not is_rank_zero,
             dynamic_ncols=True,
         )
-    while len(replay_buffer) < replay_buffer.capacity:
+    while len(replay_buffer) < replay_buffer.capacity/10:
         # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
         idx, q, a, q_next, r, done = trainer.simulation_step_v2(train_trajectory_loader_iterator)
         replay_buffer.push(
@@ -289,6 +296,11 @@ def run():
          cprint(f"Initial replay buffer filled with {len(replay_buffer)} transitions.", "green")
 
     # --- training loop ---
+    train_trajectory_loader.batch_size = config["simulation_batch_size"] # set the batch size for training (can be different from pre-filling)
+    print(f"Workers for train trajectory loader: {train_trajectory_loader.num_workers}, persistent_workers: {train_trajectory_loader.persistent_workers}")
+    val_trajectory_loader = fabric.setup_dataloaders(
+        dm.val_trajectory_dataloader(), move_to_device=True)
+
     n_batches = max_train_batches if max_train_batches is not None else len(train_trajectory_loader)
     last_ckpt_time = time.time()
     global_step = 0
@@ -310,7 +322,8 @@ def run():
 
             # --- Simulation step ---
             for _ in range(config["sim_steps_per_train_step"]):
-                idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
+                # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
+                idx, q, a, q_next, r, done = trainer.simulation_step_v2(train_trajectory_loader_iterator) # TODO: is this a problem? simulating a non-constant num of steps between training steps?
                 replay_buffer.push(
                     idx=idx,
                     q=q,
@@ -331,7 +344,8 @@ def run():
 
             # update_targets: bool = global_step % config["actor_delay"] == 0
             # use_actor_loss: bool = update_targets and (global_step > config["start_using_actor_loss"])
-            batch = replay_buffer.sample(config["train_batch_size"], device=fabric.device)
+            # batch = replay_buffer.sample(config["train_batch_size"], device=fabric.device)
+            batch = async_replay.get()  # Blocks until next prefetched batch is ready
             metrics = trainer.train_step(
                 batch,
                 fabric=fabric,
@@ -410,6 +424,7 @@ def run():
         # if logger:
         #     logger.log_metrics({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
 
+    async_replay.close()  # cleanly shutdown the async replay background thread
     cprint("Finished Fabric training run.", "green")
 
 if __name__ == "__main__":

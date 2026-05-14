@@ -41,6 +41,21 @@ class ReplayBuffer:
         self.full = False
 
         self._lock = threading.Lock()
+        self.robot_dof = robot_dof
+        # Cache pinned batch buffers keyed by batch_size to avoid losing pinned status on indexing
+        self._batch_buffers = {}
+
+    def _get_or_create_batch_buffer(self, batch_size: int, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+        """Get or create a pinned batch buffer for the given batch size."""
+        key = (batch_size, shape, dtype)
+        if key not in self._batch_buffers:
+            buffer_shape = (batch_size,) + shape
+            self._batch_buffers[key] = torch.empty(
+                buffer_shape,
+                dtype=dtype,
+                pin_memory=self.pin_memory
+            )
+        return self._batch_buffers[key]
 
     def _ensure_robot_sampler(self, device: torch.device):
         if self.robot_sampler is None or self.robot is None:
@@ -59,7 +74,7 @@ class ReplayBuffer:
     def push(self, idx, q, a, q_next, r, done):
         """
         Add a transition to the replay buffer. Expects tensors on GPU or CPU; 
-        moves them to CPU pinned asynchronously
+        moves them to CPU pinned asynchronously. Dtype conversion happens during transfer.
 
         :param idx: [B]
         :param q: [B, DOF], in normalized configuration space ([-1, 1])
@@ -68,19 +83,13 @@ class ReplayBuffer:
         :param r: [B, 1]
         :param done: [B, 1]
         """
-        idx    = idx.to(dtype=torch.int64)
-        q      = q.to(dtype=torch.float16)
-        a      = a.to(dtype=torch.float16)
-        q_next = q_next.to(dtype=torch.float16)
-        r      = r.to(dtype=torch.float32)
-        done   = done.to(dtype=torch.uint8)
-
         B = idx.shape[0]
         with self._lock:
             end = self.ptr + B
             if end <= self.capacity:
                 sl = slice(self.ptr, end)
-                self.idx[sl].copy_(idx,      non_blocking=True)  # src may be CUDA -> pinned CPU (async)
+                # copy_() handles dtype conversion and device transfer asynchronously
+                self.idx[sl].copy_(idx,      non_blocking=True)
                 self.q[sl].copy_(q,          non_blocking=True)
                 self.a[sl].copy_(a,          non_blocking=True)
                 self.qnext[sl].copy_(q_next, non_blocking=True)
@@ -128,13 +137,30 @@ class ReplayBuffer:
             assert n >= batch_size, "replay underflow"
             ids = torch.randint(n, (batch_size,), device='cpu')
 
-            # snapshot rows on CPU to detach from concurrent writers
-            idx   = self.idx[ids].clone()
-            q     = self.q[ids].clone().to(dtype=torch.float32)
-            a     = self.a[ids].clone().to(dtype=torch.float32)
-            qn    = self.qnext[ids].clone().to(dtype=torch.float32)
-            r     = self.r[ids].clone()
-            done  = self.done[ids].clone().to(dtype=torch.float32)
+            # Get or create pinned batch buffers for this batch size
+            idx_buf   = self._get_or_create_batch_buffer(batch_size, (), torch.int64)
+            q_buf     = self._get_or_create_batch_buffer(batch_size, (self.robot_dof,), torch.float32)
+            a_buf     = self._get_or_create_batch_buffer(batch_size, (self.robot_dof,), torch.float32)
+            qn_buf    = self._get_or_create_batch_buffer(batch_size, (self.robot_dof,), torch.float32)
+            r_buf     = self._get_or_create_batch_buffer(batch_size, (1,), torch.float32)
+            done_buf  = self._get_or_create_batch_buffer(batch_size, (1,), torch.float32)
+            
+            # Copy indexed data into pinned buffers (CPU-to-CPU, preserves pinned memory status)
+            # otherwise indexing returns non-pinned tensors, which would cause GPU transfers to be synchronous and slow
+            idx_buf.copy_(self.idx[ids])
+            q_buf.copy_(self.q[ids].to(dtype=torch.float32))
+            a_buf.copy_(self.a[ids].to(dtype=torch.float32))
+            qn_buf.copy_(self.qnext[ids].to(dtype=torch.float32))
+            r_buf.copy_(self.r[ids])
+            done_buf.copy_(self.done[ids].to(dtype=torch.float32))
+            
+            # Keep references to buffers while lock is held
+            idx   = idx_buf
+            q     = q_buf
+            a     = a_buf
+            qn    = qn_buf
+            r     = r_buf
+            done  = done_buf
 
         max_idx = int(len(self.dataset))
         bad = (idx < 0) | (idx >= max_idx)
@@ -142,7 +168,7 @@ class ReplayBuffer:
             # Let AsyncReplay retry instead of crashing the thread:
             raise ValueError(f"ReplayBuffer invalid indices: {int(bad.sum())}/{bad.numel()}")
 
-        # (after releasing lock) move to device
+        # (after releasing lock) move pinned tensors to device asynchronously
         idx  = idx.to(device, non_blocking=True)
         q    = q.to(device, non_blocking=True)
         a    = a.to(device, non_blocking=True)
@@ -150,23 +176,26 @@ class ReplayBuffer:
         r    = r.to(device, non_blocking=True)
         done = done.to(device, non_blocking=True)
 
+        # only load unique scenes in the batch, then transfer to device and expand back to batch size using inv indices
         uniq, inv = torch.unique(idx, sorted=True, return_inverse=True)
         sc = self.dataset.batch_scenes_by_idx(uniq.cpu(), pin=self.pin_memory)  # CPU pinned
-        inv_cpu = inv.cpu()
         
-        def to_dev(x):  # x: CPU pinned [U, ...]
-            return x[inv_cpu].to(device, non_blocking=True)  # -> [B, ...]
-        cuboid_centers    = to_dev(sc["cuboid_centers"])
-        cuboid_dims       = to_dev(sc["cuboid_dims"])
-        cuboid_quats      = to_dev(sc["cuboid_quats"])
-        cylinder_centers  = to_dev(sc["cylinder_centers"])
-        cylinder_radii    = to_dev(sc["cylinder_radii"])
-        cylinder_heights  = to_dev(sc["cylinder_heights"])
-        cylinder_quats    = to_dev(sc["cylinder_quats"])
-        target_position   = to_dev(sc["target_position"])
-        target_orientation= to_dev(sc["target_orientation"])
-        scene_points      = to_dev(sc["scene_points"])
-        target_points     = to_dev(sc["target_points"])
+        def to_dev_fast(x):  # x: CPU pinned [U, ...], inv: GPU tensor
+            # Transfer pinned tensor to GPU (async), then expand on GPU to avoid roundtrips
+            x_dev = x.to(device, non_blocking=True)  # [U, ...] -> GPU
+            return x_dev[inv]  # [U, ...] -> [B, ...] on GPU
+        
+        cuboid_centers    = to_dev_fast(sc["cuboid_centers"])
+        cuboid_dims       = to_dev_fast(sc["cuboid_dims"])
+        cuboid_quats      = to_dev_fast(sc["cuboid_quats"])
+        cylinder_centers  = to_dev_fast(sc["cylinder_centers"])
+        cylinder_radii    = to_dev_fast(sc["cylinder_radii"])
+        cylinder_heights  = to_dev_fast(sc["cylinder_heights"])
+        cylinder_quats    = to_dev_fast(sc["cylinder_quats"])
+        target_position   = to_dev_fast(sc["target_position"])
+        target_orientation= to_dev_fast(sc["target_orientation"])
+        scene_points      = to_dev_fast(sc["scene_points"])
+        target_points     = to_dev_fast(sc["target_points"])
 
 
         self._ensure_robot_sampler(device)
