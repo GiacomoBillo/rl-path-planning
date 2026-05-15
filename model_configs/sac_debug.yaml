@@ -33,19 +33,28 @@ training_model_parameters:
   collision_loss_weight: 5.0
   collision_loss_margin: 0.03
   actor_loss_weight: 0.001
-  min_lr: 1.0e-5
-  max_lr: 5.0e-5
-  warmup_steps: 100
-  weight_decay: 1.0e-4
+  
+  # Learning rates: separate configs for actor, critic; constant for alpha
+  # Actor LR: can be "constant" or "linear_warmup" schedule
+  actor_lr:
+    type: "constant"         # "constant" or "linear_warmup"
+    start_lr: 0
+    # end_lr: 0                # Only used for "linear_warmup" type
+    # warmup_steps: 100        # Only used for "linear_warmup" type
+  
+  # Critic LR: can be "constant" or "linear_warmup" schedule
+  critic_lr:
+    type: "constant"         # "constant" or "linear_warmup"
+    start_lr: 1.0e-3
+    # end_lr: 0                # Only used for "linear_warmup" type
+    # warmup_steps: 100        # Only used for "linear_warmup" type
+  
+  # Alpha LR: constant learning rate only
+  alpha_lr: 0.0
+  
   gamma: 0.99
-  exploration_noise: 0.015
-  action_clip: 0.5
-  target_actor_noise: 0.03
-  target_actor_noise_clip: 0.1
-  use_huber_loss: true
   tau: 0.005
-  grad_clip_norm: 1.0
-  rollout_length: 69
+  rollout_length: 100 #69
   pc_bounds: [[-1.5, -1.5, -0.1], [1.5, 1.5, 1.5]]
   # BC checkpoint compatibility - required for PretrainingMotionPolicyTransformer.load_from_checkpoint()
   train_batch_size: 8
@@ -78,13 +87,13 @@ bc_model_parameters:
 sac_parameters:
   target_network_frequency: 1       # Update target networks every N step
   policy_frequency: 1               # Update policy every N steps (TD3-style delay)
-  entropy_coef_init: "0.001"        # Fixed entropy coefficient (string "0.001" or "auto_0.001")
+  entropy_coef_init: "auto_0.01"        # Fixed entropy coefficient (string "0.001" or "auto_0.001")
   target_entropy: -30               # Used if entropy_coef_init starts with "auto_"
   split_layer: 7                    # Split point: transformer layers [0:split_layer] in backbone, [split_layer:] in heads
-  log_std_init: -10                 # Initial log standard deviation for policy (low = deterministic)
+  log_std_init: -5                 # Initial log standard deviation for policy (low = deterministic)
 
 # BC checkpoint path - loaded if load_model_from_checkpoint=false
-bc_checkpoint_path: /workspace/checkpoints/avoid_everything_cubby.ckpt
+bc_checkpoint_path: /workspace/checkpoints/mpiformer_cubby.ckpt
 
 # ===== Top-level Training Configuration =====
 # Used directly from config dict (not unpacked into any component)
@@ -93,21 +102,22 @@ num_workers: 2                        # DataLoader workers (debug: disabled)
 pretraining_steps: 100              # Steps before RL loss activates (debug: reduced)
 sim_steps_per_train_step: 1         # Environment simulation steps per training step
 log_every_n_steps: 10               # Logging frequency (debug: reduced)
-replay_buffer_capacity: 100000       # Max transitions to store (debug: reduced)
+replay_buffer_capacity: 1000000       # Max transitions to store (debug: reduced)
 async_replay_prefetch: 2            # Batches to prefetch in async replay (debug: reduced)
 n_gpus: 1                           # GPUs to use
 prefill_batch_size: 128
-simulation_batch_size: 32              # Parallel envs for simulation (debug: small)
+simulation_batch_size: 64              # Parallel envs for simulation (debug: small)
 train_batch_size: 64                 # Training batch size (debug: small)
 val_batch_size: 8                   # Validation batch size (debug: small)
 end_epoch_max_val_batches: 20       # Max validation batches per epoch (debug: minimal)
 end_epoch_max_val_rollouts: 10      # Max validation rollouts per epoch (debug: minimal)
-max_epochs: 2                       # Total training epochs (debug: minimal)
+max_epochs: 1                       # Total training epochs (debug: minimal)
 mintest: false                      # Minimal test mode
 logging: false                      # Disable wandb/tensorboard
-load_model_from_checkpoint: false   # Start from BC checkpoint (true) or train from scratch (false)
+load_model_from_checkpoint: true   # Start from BC checkpoint (true) or train from scratch (false)
 load_actor_only: false              # Only load actor weights (ignored if load_model_from_checkpoint=false)
 load_checkpoint_path: null          # Path to SAC checkpoint (ignored if load_model_from_checkpoint=false)
 save_checkpoint_dir: /workspace/checkpoints
-experiment_name: "SAC Debug: Avoid Everything Except Exploration"
-description: "Debug run with minimal parameters for fast iteration"
+experiment_name: "SAC Debug"
+description: "SAC implemented in pytorch for Avoid Everything finetuning"
+

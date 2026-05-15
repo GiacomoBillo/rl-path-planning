@@ -54,10 +54,6 @@ class SACMotionPolicyTrainer():
         collision_loss_weight: float,
         actor_loss_weight: float,
         collision_loss_margin: float,
-        min_lr: float,
-        max_lr: float,
-        warmup_steps: int,
-        weight_decay: float,
         gamma: float,
         # exploration_noise: float,
         # target_actor_noise: float,
@@ -77,6 +73,11 @@ class SACMotionPolicyTrainer():
         log_std_init: int,
         target_network_frequency: int = 1,
         policy_frequency: int = 1,
+        # Separate LR configs for actor and critic (with schedule support)
+        actor_lr: dict | None = None,
+        critic_lr: dict | None = None,
+        alpha_lr: float | None = None,
+
         device=None,
         *args, **kwargs
     ):
@@ -89,10 +90,12 @@ class SACMotionPolicyTrainer():
         self.collision_loss_weight = collision_loss_weight
         self.actor_loss_weight = actor_loss_weight
         # self.loss_fun = CoLLossFn(self.urdf_path, collision_loss_margin)
-        self.min_lr = min_lr
-        self.max_lr = max_lr
-        self.warmup_steps = warmup_steps
-        self.weight_decay = weight_decay
+        
+        # Store learning rate configs
+        self.actor_lr = actor_lr
+        self.critic_lr = critic_lr
+        self.alpha_lr = alpha_lr
+        
         self.pc_bounds = torch.as_tensor(pc_bounds)
         self.rollout_length = rollout_length
         self.robot_dof = robot_dof
@@ -103,9 +106,7 @@ class SACMotionPolicyTrainer():
         self.gamma = gamma
         self.policy_frequency = policy_frequency
         self.target_network_frequency = target_network_frequency
-        # self.exploration_noise = exploration_noise
-        # self.target_actor_noise = target_actor_noise
-        # self.target_actor_noise_clip = target_actor_noise_clip
+
         if isinstance(action_clip, str):
             self.action_clip = None
         else:
@@ -187,30 +188,84 @@ class SACMotionPolicyTrainer():
 
     def configure_optimizers(self):
         """
-        Build separate optimizers/schedulers for actor and critic.
-        Target networks are updated via Polyak soft updates (no optimizer).
-        """
-        betas = (0.9, 0.95)
-        self.actor_optimizer  = torch.optim.AdamW(
-            self.actor.parameters(),  lr=self.min_lr,  weight_decay=self.weight_decay, betas=betas)
+        Build separate optimizers/schedulers for actor and critic with independent learning rates.
+        Alpha optimizer (for entropy) has constant learning rate (no schedule).
+        Actor and critic can have either constant or linear decay schedules.
+        """        
+        # Helper to get LR from config (actor_lr and critic_lr are dicts with type/start_lr/end_lr)
+        def get_optimizer_lr(lr_config):
+            if isinstance(lr_config, dict):
+                lr = lr_config["start_lr"]
+            else:
+                lr = lr_config
+            if lr is None:
+                raise ValueError("Learning rate config cannot be None")
+            return lr
+        
+        # Actor optimizer with separate LR
+        actor_base_lr = get_optimizer_lr(self.actor_lr)
+        self.actor_optimizer = torch.optim.AdamW(
+            self.actor.parameters(),
+            lr=actor_base_lr,
+        )
+        
+        # Critic optimizer with separate LR
+        critic_base_lr = get_optimizer_lr(self.critic_lr)
         critic_param_groups = [
-            {"params": self.qf1.parameters(),         "lr": self.min_lr, "name": "critic_q1"},
-            {"params": self.qf2.parameters(),         "lr": self.min_lr, "name": "critic_q2"},
+            {"params": self.qf1.parameters(), "lr": critic_base_lr, "name": "critic_q1"},
+            {"params": self.qf2.parameters(), "lr": critic_base_lr, "name": "critic_q2"},
         ]
         self.critic_optimizer = torch.optim.AdamW(
-            critic_param_groups, lr=self.min_lr, weight_decay=self.weight_decay, betas=betas)
-
-        def lr_lambda(step):
-            lr = self.min_lr + (self.max_lr - self.min_lr) * min(1.0, step / self.warmup_steps)
-            return lr / self.min_lr
-
-        self.actor_scheduler  = LambdaLR(self.actor_optimizer,  lr_lambda)
-        self.critic_scheduler = LambdaLR(self.critic_optimizer, lr_lambda)
-
+            critic_param_groups,
+            lr=critic_base_lr,
+        )
+        
+        # Create LR schedulers based on schedule type (constant or linear_warmup)
+        def make_lr_schedule(lr_config):
+            """
+            Create a LambdaLR schedule based on config type.
+            
+            Types:
+            - "constant": Fixed learning rate (start_lr)
+            - "linear_warmup": Ramp from start_lr to end_lr over warmup_steps, then constant at end_lr
+            """
+            if lr_config is None:
+                return lambda step: 1.0  # Identity schedule
+            
+            if isinstance(lr_config, dict):
+                schedule_type = lr_config.get("type", "constant")
+                start_lr = lr_config["start_lr"]
+                
+                if schedule_type == "constant":
+                    return lambda step: 1.0  # Constant learning rate
+                
+                elif schedule_type == "linear_warmup":
+                    # Ramp from start_lr to end_lr over warmup_steps, then stay at end_lr
+                    end_lr = lr_config.get("end_lr", start_lr)
+                    warmup_steps = lr_config.get("warmup_steps", 1000)
+                    
+                    def warmup_schedule(step):
+                        lr = start_lr + (end_lr - start_lr) * min(1.0, step / max(1, warmup_steps))
+                        return lr / start_lr if start_lr > 0 else 1.0
+                    return warmup_schedule
+            
+            return lambda step: 1.0  # Default: constant
+        
+        self.actor_scheduler = LambdaLR(
+            self.actor_optimizer,
+            make_lr_schedule(self.actor_lr)
+        )
+        self.critic_scheduler = LambdaLR(
+            self.critic_optimizer,
+            make_lr_schedule(self.critic_lr)
+        )
+        
+        # Alpha optimizer: constant learning rate only (no schedule)
         if self.entropy_autotune:
-            self.alpha_optimizer = torch.optim.AdamW([self.log_alpha], lr=self.min_lr, betas=betas)
-            self.alpha_scheduler = LambdaLR(self.alpha_optimizer, lr_lambda)
-
+            alpha_lr = self.alpha_lr if isinstance(self.alpha_lr, (int, float)) else 1.0e-5
+            self.alpha_optimizer = torch.optim.AdamW([self.log_alpha], lr=alpha_lr)
+            self.alpha_scheduler = LambdaLR(self.alpha_optimizer, lambda step: 1.0)  # Constant schedule
+        
         return {
             "actor_optimizer": self.actor_optimizer,
             "critic_optimizer": self.critic_optimizer,
