@@ -124,6 +124,10 @@ class SACMotionPolicyTrainer():
         # Cached obstacle objects (rebuilt only when episodes reset)
         self.simulation_cuboids = None
         self.simulation_cylinders = None
+        self.simulation_active = None
+        # Per-episode tracking for info dict
+        self.simulation_step_counts: torch.Tensor | None = None  # steps per active episode
+        self.simulation_cumulative_rewards: torch.Tensor | None = None  # cumulative reward per active episode
 
         self.val_position_error = torchmetrics.MeanMetric()
         self.val_orientation_error = torchmetrics.MeanMetric()
@@ -710,6 +714,7 @@ class SACMotionPolicyTrainer():
         """
         Run one step of the environment simulation with the current policy.
         Used for data collection. Maintains state across calls.
+        Compatible with simulation_step_v2() for episode continuation.
         """
         # Initialize batch on first call
         if self.simulation_batch is None:
@@ -719,6 +724,10 @@ class SACMotionPolicyTrainer():
             self.cuboids = TorchCuboids(self.simulation_batch["cuboid_centers"], self.simulation_batch["cuboid_dims"], self.simulation_batch["cuboid_quats"])
             self.cylinders = TorchCylinders(self.simulation_batch["cylinder_centers"], self.simulation_batch["cylinder_radii"],
                                     self.simulation_batch["cylinder_heights"], self.simulation_batch["cylinder_quats"])
+            # Initialize per-episode tracking (for compatibility with simulation_step_v2)
+            B = self.simulation_q.size(0)
+            self.simulation_step_counts = torch.zeros(B, dtype=torch.long, device=self.simulation_q.device)
+            self.simulation_cumulative_rewards = torch.zeros(B, dtype=torch.float32, device=self.simulation_q.device)
         
         # Extract current state
         q = self.simulation_q
@@ -748,8 +757,7 @@ class SACMotionPolicyTrainer():
             cylinders = self.simulation_cylinders
         
         # Compute termination and reward
-        # TODO: termination
-        reached = self._check_reaching_success(q_next_unn, batch["target_position"], batch["target_orientation"])
+        reached, pos_err, orient_err = self._compute_target_reached(q_next_unn, batch["target_position"], batch["target_orientation"])
         collided = self._check_for_collisions(q_next_unn, cuboids, cylinders)
         done = reached | collided
         r_t = torch.where(collided, self.collision_reward,
@@ -759,6 +767,10 @@ class SACMotionPolicyTrainer():
         samples = self._sample(q_next_unn)[..., :3]
         pc_next = pc.clone()
         pc_next[:, :samples.size(1)] = samples
+        
+        # Update tracking for all episodes
+        self.simulation_step_counts += 1
+        self.simulation_cumulative_rewards += r_t.squeeze(1)
         
         # Reset done episodes
         reset_mask = done.squeeze(-1) if done.dim() > 1 else done
@@ -776,17 +788,36 @@ class SACMotionPolicyTrainer():
             batch["cylinder_quats"][reset_mask] = reset_batch["cylinder_quats"][reset_mask]
             batch["target_position"][reset_mask] = reset_batch["target_position"][reset_mask]
             batch["target_orientation"][reset_mask] = reset_batch["target_orientation"][reset_mask]
+            # Reset tracking for episodes that ended
+            self.simulation_step_counts[reset_mask] = 0
+            self.simulation_cumulative_rewards[reset_mask] = 0.0
             # Invalidate cached cuboids/cylinders so they're rebuilt on next step
             self.simulation_cuboids = None
             self.simulation_cylinders = None
+        
+        # Determine timeout: reached step limit (num_steps == rollout_length)
+        timeout = self.simulation_step_counts >= self.rollout_length
+        
+        # Create info dict for each episode
+        info_dict = {
+            "collision": collided,
+            "target_reached": reached,
+            "position_error": pos_err,
+            "orientation_error": orient_err,
+            "num_steps": self.simulation_step_counts.float(),
+            "timeout": timeout,
+            "reward": r_t.squeeze(1),
+            "cumulative_reward": self.simulation_cumulative_rewards,
+            "action": a,
+        }
         
         # Save state for next call
         self.simulation_q = q_next
         self.simulation_pc = pc_next
         self.simulation_batch = batch
 
-        # info        
-        return idx, q, a, q_next, r_t, done 
+        # Return all episode data with info dict
+        return idx, q, a, q_next, r_t, done, info_dict 
 
     @torch.no_grad()
     def simulation_step_v2(self, dataloader_iterator: iter):
@@ -811,6 +842,9 @@ class SACMotionPolicyTrainer():
                                                        self.simulation_batch["cylinder_radii"],
                                                        self.simulation_batch["cylinder_heights"], 
                                                        self.simulation_batch["cylinder_quats"])
+            # Initialize per-episode tracking
+            self.simulation_step_counts = torch.zeros(B, dtype=torch.long, device=self.simulation_q.device)
+            self.simulation_cumulative_rewards = torch.zeros(B, dtype=torch.float32, device=self.simulation_q.device)
         
         # Extract current state
         q = self.simulation_q
@@ -846,7 +880,7 @@ class SACMotionPolicyTrainer():
         cylinders_act = self.simulation_cylinders[active]
         
         # Compute termination and reward on active subset
-        reached_act = self._check_reaching_success(q_next_unn_act, 
+        reached_act, pos_err_act, orient_err_act = self._compute_target_reached(q_next_unn_act, 
                                                     batch_act["target_position"], 
                                                     batch_act["target_orientation"])
         collided_act = self._check_for_collisions(q_next_unn_act, cuboids_act, cylinders_act)
@@ -874,14 +908,35 @@ class SACMotionPolicyTrainer():
         q[active] = q_next_act[still_active_act]
         pc[active] = pc_act[still_active_act]
         
+        # Update step counts for active episodes
+        self.simulation_step_counts[tmp] += 1
+        # Update cumulative rewards for all active episodes
+        self.simulation_cumulative_rewards[tmp] += r_t_act.squeeze(1)
+        
+        # Determine timeout: still active but reached step limit (num_steps == rollout_length)
+        timeout_act = still_active_act & (self.simulation_step_counts[tmp] >= self.rollout_length)
+        
+        # Create info dict for each active episode
+        info_dict = {
+            "collision": collided_act,
+            "target_reached": reached_act,
+            "position_error": pos_err_act,
+            "orientation_error": orient_err_act,
+            "num_steps": self.simulation_step_counts[tmp].float(),
+            "timeout": timeout_act,
+            "reward": r_t_act.squeeze(1),
+            "cumulative_reward": self.simulation_cumulative_rewards[tmp],
+            "action_magnitude": a_act.abs(),
+        }
+        
         # Save state for next call
         self.simulation_q = q
         self.simulation_pc = pc
         self.simulation_active = active
         
         # Return active episode data
-        # All tensors are in "active" space: idx_act, q_act_for_return, a_act, q_next_act, r_t_act, done_act
-        return idx_act, q_act_for_return, a_act, q_next_act, r_t_act, done_act
+        # All tensors are in "active" space: idx_act, q_act_for_return, a_act, q_next_act, r_t_act, done_act, info_dict
+        return idx_act, q_act_for_return, a_act, q_next_act, r_t_act, done_act, info_dict
 
 
     @torch.no_grad()
@@ -986,29 +1041,32 @@ class SACMotionPolicyTrainer():
             "transitions_collected": transitions_collected,
         }
 
-    def _check_reaching_success(
+
+    def _compute_target_reached(
         self,
         q_unnorm: torch.Tensor,
         target_position: torch.Tensor,
         target_orientation: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Checks if a batch of trajectories has reached the target position and 
-        orientation within a tolerance.
+        Efficiently compute target reached status and errors with single FK call.
+        Returns: (target_reached, pos_errors, orient_errors)
         """
         assert self.fk_sampler is not None
-        eff_poses = self.fk_sampler.end_effector_pose(q_unnorm)
+        eff_pose = self.fk_sampler.end_effector_pose(q_unnorm)
         pos_errors = torch.linalg.vector_norm(
-            eff_poses[:, :3, -1] - target_position, dim=-1
+            eff_pose[:, :3, -1] - target_position, dim=-1
         )
         R = torch.matmul(
-            eff_poses[:, :3, :3],
+            eff_pose[:, :3, :3],
             target_orientation.transpose(-1, -2),
         )
         trace = R.diagonal(offset=0, dim1=-1, dim2=-2).sum(-1)
         cos_value = torch.clamp((trace - 1) / 2, -1, 1)
         orient_errors = torch.abs(torch.rad2deg(torch.acos(cos_value)))
-        return torch.logical_and(orient_errors < 15, pos_errors < 0.01) # less than 15 degrees and 1cm
+        target_reached = torch.logical_and(orient_errors < 15, pos_errors < 0.01)
+        return target_reached, pos_errors, orient_errors
+
 
     def _check_for_collisions(
         self, q_unnorm: torch.Tensor, cuboids: TorchCuboids, cylinders: TorchCylinders

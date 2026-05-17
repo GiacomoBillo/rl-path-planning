@@ -276,6 +276,12 @@ def run():
         return trainer.compute_rollout_val_metrics()
     # --- ---
 
+    train_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
+    train_metrics_count = 0
+    
+    episode_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
+    episode_metrics_count = 0
+
     train_trajectory_loader_iterator = iter(train_trajectory_loader) # TODO: what if it finishes? should we reset it?
     progress_bar = tqdm(
             total=replay_buffer.capacity,
@@ -288,7 +294,7 @@ def run():
     while len(replay_buffer) < replay_buffer.capacity/10:
         # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
         with torch.cuda.amp.autocast(dtype=torch.float16):
-            idx, q, a, q_next, r, done = trainer.simulation_step_v2(train_trajectory_loader_iterator)
+            idx, q, a, q_next, r, done, info = trainer.simulation_step_v2(train_trajectory_loader_iterator)
         replay_buffer.push(
             idx=idx,
             q=q,
@@ -297,10 +303,24 @@ def run():
             r=r,
             done=done.unsqueeze(1),
         )
+        # Accumulate episode metrics for episodes that just ended
+        mask = done.bool()
+        if mask.any():
+            for key, val in info.items():
+                episode_metrics_accum[key] = episode_metrics_accum[key] + val[mask].sum()
+        episode_metrics_count += mask.sum().item()
         progress_bar.update(len(done))
     progress_bar.close()
     if is_rank_zero:
          cprint(f"Initial replay buffer filled with {len(replay_buffer)} transitions.", "green")
+
+    if logger and episode_metrics_count > 0:
+        log_ep_dict = {f"ep/{k}": (s / episode_metrics_count).item()
+                    for k, s in episode_metrics_accum.items()}
+        logger.log_metrics(log_ep_dict, step=0)
+        
+        episode_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
+        episode_metrics_count = 0
 
     # --- training loop ---
     # train_trajectory_loader = fabric.setup_dataloaders(dm.train_trajectory_dataloader(batch_size=config["simulation_batch_size"]), move_to_device=True) # re-setup dataloader with new batch size
@@ -319,8 +339,6 @@ def run():
         "training_time": 0.0,
     }
     
-    train_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
-    train_metrics_count = 0 
     
     for epoch in range(config["max_epochs"]):
         epoch_bar = tqdm(
@@ -335,15 +353,12 @@ def run():
         batch_idx = 0
 
         for _ in range(n_batches):
-            # --- Phase management ---
-            pretraining: bool = global_step < config["pretraining_steps"]
-
             # --- Simulation step ---
             t0 = time.time()
             for _ in range(config["sim_steps_per_train_step"]):
                 with torch.cuda.amp.autocast(dtype=torch.float16):
                     # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
-                    idx, q, a, q_next, r, done = trainer.simulation_step_v2(train_trajectory_loader_iterator) # TODO: is this a problem? simulating a non-constant num of steps between training steps?
+                    idx, q, a, q_next, r, done, info = trainer.simulation_step_v2(train_trajectory_loader_iterator) # TODO: is this a problem? simulating a non-constant num of steps between training steps?
                 replay_buffer.push(
                     idx=idx,
                     q=q,
@@ -352,6 +367,13 @@ def run():
                     r=r,
                     done=done.unsqueeze(1),
                 )
+                
+                # Accumulate episode metrics for episodes that just ended
+                mask = done.bool()
+                if mask.any():
+                    for key, val in info.items():
+                        episode_metrics_accum[key] = episode_metrics_accum[key] + val[mask].sum()
+                episode_metrics_count += mask.sum().item()
             t1 = time.time()
             simulation_time = t1 - t0
 
@@ -398,12 +420,16 @@ def run():
             train_metrics_count += 1
             
             if logger and (global_step % config["log_train_freq"] == 0) and global_step > 0:
-                log_dict = {f"train/{k}": (s / train_metrics_count).item() 
+                log_train_dict = {f"train/{k}": (s / train_metrics_count).item() 
                             for k, s in train_metrics_accum.items()}
-                logger.log_metrics(log_dict, step=global_step)
+                log_ep_dict = {f"ep/{k}": (s / episode_metrics_count).item()
+                            for k, s in episode_metrics_accum.items()}
+                logger.log_metrics({**log_train_dict, **log_ep_dict}, step=global_step)
                 
                 train_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
                 train_metrics_count = 0
+                episode_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
+                episode_metrics_count = 0
             # TODO: log time, episode, validation, replay buffer
 
             # increment with the number of batches consumed from the expert loader
@@ -457,6 +483,22 @@ def run():
         #     val_trajectory_loader, max_val_batches=config["end_epoch_max_val_rollouts"]))
         # if logger:
         #     logger.log_metrics({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
+
+    # checkpoint at end of training
+    ckpt_path = Path(save_dir) / "model.ckpt"
+    torch.save({
+        "actor": trainer.actor.state_dict(), 
+        "critic_q1": trainer.qf1.state_dict(), 
+        "critic_q2": trainer.qf2.state_dict(),
+        "actor_optimizer": trainer.actor_optimizer.state_dict(), 
+        "critic_optimizer": trainer.critic_optimizer.state_dict(),
+        "actor_scheduler": trainer.actor_scheduler.state_dict(),
+        "critic_scheduler": trainer.critic_scheduler.state_dict(),
+        "global_step": global_step,
+        },
+        str(ckpt_path), 
+    )
+    cprint(f"Saved checkpoint to {ckpt_path}", "green")
 
     async_replay.close()  # cleanly shutdown the async replay background thread
     cprint("Finished training run.", "green")
