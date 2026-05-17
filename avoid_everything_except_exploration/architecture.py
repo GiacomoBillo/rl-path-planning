@@ -48,7 +48,6 @@ class MPiFormerBackbone(nn.Module):
         total_layers = len(bc_model.encoder.layers)
         self.split_layer = _validate_split_layer(split_layer, total_layers)
         self.pc_bounds = bc_model.pc_bounds.to(bc_model.device)
-        print(f"PC Bounds: {self.pc_bounds.device}")
         self.total_layers = total_layers
 
         if deep_copy:
@@ -221,7 +220,7 @@ class MPiFormerSACActorHead(nn.Module):
         *,
         split_layer: int = 7,
         deep_copy: bool = True,
-        log_std_init: float = -10.0,
+        log_std_init: float = -5.0,
         action_scale: float = 1.0,
         action_bias: float = 0.0,
     ):
@@ -233,25 +232,30 @@ class MPiFormerSACActorHead(nn.Module):
         self.register_buffer("action_scale", torch.tensor(action_scale))
         self.register_buffer("action_bias", torch.tensor(action_bias))
 
-        self.mu = nn.Linear(self.tail.d_model, self.action_dim)
+        self.mu_layer = nn.Linear(self.tail.d_model, self.action_dim)
         # self.log_std = nn.Parameter(torch.full((action_dim,), float(log_std_init))) # State-independent log std
-        self.log_std = nn.Linear(self.tail.d_model, self.action_dim) # State-dependent log std, initialized to log_std_init
+        self.log_std_layer = nn.Linear(self.tail.d_model, self.action_dim) # State-dependent log std, initialized to log_std_init
 
         # Same actor-head initialization currently done in rl/common.py.
         with torch.no_grad():
-            self.mu.weight.copy_(bc_model.action_decoder.weight)
-            self.mu.bias.copy_(bc_model.action_decoder.bias)
+            self.mu_layer.weight.copy_(bc_model.action_decoder.weight)
+            self.mu_layer.bias.copy_(bc_model.action_decoder.bias)
 
             # initialize log_std
-            self.log_std.weight.zero_() 
-            self.log_std.bias.fill_(log_std_init)
+            self.log_std_layer.weight.zero_() 
+            self.log_std_layer.bias.fill_(log_std_init)
+            print(f"Initialized log_std bias to {log_std_init}")
 
     def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = self.tail(features)
-        mean = self.mu(hidden)
-        log_std = self.log_std(hidden)
-        log_std = torch.tanh(log_std)
-        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
+        mean = self.mu_layer(hidden)
+        log_std = self.log_std_layer(hidden)
+
+        # original cleanrl implementation applies tanh to log_std output, but this would require a different log_std initialization
+        # clamp instead for safety but gradients woulb be zero if log_std goes out of bounds, 
+        # log_std = torch.tanh(log_std)
+        # log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
+        log_std = log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
         return mean, log_std
     
     def get_action(self, x: torch.Tensor):

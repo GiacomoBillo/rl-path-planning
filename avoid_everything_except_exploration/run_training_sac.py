@@ -187,7 +187,7 @@ def run():
         )
     else:
         if is_rank_zero:
-            cprint("Initializing new model", "blue")
+            cprint("Loading model from BC checkpoint", "blue")
         bc_model = PretrainingMotionPolicyTransformer.load_from_checkpoint(
             checkpoint_path=config["bc_checkpoint_path"],
             map_location=device,
@@ -281,6 +281,7 @@ def run():
     
     episode_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
     episode_metrics_count = 0
+    tot_episodes_done = 0
 
     train_trajectory_loader_iterator = iter(train_trajectory_loader) # TODO: what if it finishes? should we reset it?
     progress_bar = tqdm(
@@ -292,9 +293,9 @@ def run():
             dynamic_ncols=True,
         )
     while len(replay_buffer) < replay_buffer.capacity/10:
-        # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
         with torch.cuda.amp.autocast(dtype=torch.float16):
-            idx, q, a, q_next, r, done, info = trainer.simulation_step_v2(train_trajectory_loader_iterator)
+            idx, q, a, q_next, r, done, info = trainer.simulation_step(train_trajectory_loader_iterator) 
+            # idx, q, a, q_next, r, done, info = trainer.simulation_step_v2(train_trajectory_loader_iterator) 
         replay_buffer.push(
             idx=idx,
             q=q,
@@ -307,7 +308,7 @@ def run():
         mask = done.bool()
         if mask.any():
             for key, val in info.items():
-                episode_metrics_accum[key] = episode_metrics_accum[key] + val[mask].sum()
+                episode_metrics_accum[key] = episode_metrics_accum[key] + val[mask].float().sum()
         episode_metrics_count += mask.sum().item()
         progress_bar.update(len(done))
     progress_bar.close()
@@ -317,6 +318,9 @@ def run():
     if logger and episode_metrics_count > 0:
         log_ep_dict = {f"ep/{k}": (s / episode_metrics_count).item()
                     for k, s in episode_metrics_accum.items()}
+        log_ep_dict["ep/replay_buffer_size"] = len(replay_buffer) / replay_buffer.capacity
+        tot_episodes_done += episode_metrics_count
+        log_ep_dict["ep/tot_ep_done"] = tot_episodes_done
         logger.log_metrics(log_ep_dict, step=0)
         
         episode_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
@@ -339,7 +343,7 @@ def run():
         "training_time": 0.0,
     }
     
-    
+    trainer.torch_compile()  # compile the model for faster training 
     for epoch in range(config["max_epochs"]):
         epoch_bar = tqdm(
             total=n_batches,
@@ -358,7 +362,7 @@ def run():
             for _ in range(config["sim_steps_per_train_step"]):
                 with torch.cuda.amp.autocast(dtype=torch.float16):
                     # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
-                    idx, q, a, q_next, r, done, info = trainer.simulation_step_v2(train_trajectory_loader_iterator) # TODO: is this a problem? simulating a non-constant num of steps between training steps?
+                    idx, q, a, q_next, r, done, info = trainer.simulation_step(train_trajectory_loader_iterator) # TODO: is this a problem? simulating a non-constant num of steps between training steps?
                 replay_buffer.push(
                     idx=idx,
                     q=q,
@@ -372,7 +376,7 @@ def run():
                 mask = done.bool()
                 if mask.any():
                     for key, val in info.items():
-                        episode_metrics_accum[key] = episode_metrics_accum[key] + val[mask].sum()
+                        episode_metrics_accum[key] = episode_metrics_accum[key] + val[mask].float().sum()
                 episode_metrics_count += mask.sum().item()
             t1 = time.time()
             simulation_time = t1 - t0
@@ -402,8 +406,10 @@ def run():
             times["simulation_time"] += simulation_time
             times["replay_sample_time"] += replay_sample_time
             times["training_time"] += training_time
-            if is_rank_zero and global_step>0 and global_step % 100 == 0:
-                print(f"Step {global_step:06d}  sim_time={times['simulation_time']/global_step:.4f}s  replay_sample_time={times['replay_sample_time']/global_step:.4f}s  training_time={times['training_time']/global_step:.4f}s")
+            if is_rank_zero and global_step>0 and global_step % 1000 == 0:
+                print(f"Step {global_step:06d} ",
+                      f"\n\tpartial\tsim_time={simulation_time:.4f}s  replay_sample_time={replay_sample_time:.4f}s  training_time={training_time:.4f}s  ", 
+                      f"\n\ttotal\tsim_time={times['simulation_time']/(global_step + 1):.4f}s  replay_sample_time={times['replay_sample_time']/(global_step + 1):.4f}s  training_time={times['training_time']/(global_step + 1):.4f}s")
 
             # if global_step % config["collect_rollouts_every_n_steps"] == 0:
             #     actor_rollout_metrics = trainer.actor_rollout(batch, replay_buffer) # fill the replay buffer
@@ -424,6 +430,8 @@ def run():
                             for k, s in train_metrics_accum.items()}
                 log_ep_dict = {f"ep/{k}": (s / episode_metrics_count).item()
                             for k, s in episode_metrics_accum.items()}
+                tot_episodes_done += episode_metrics_count
+                log_ep_dict["ep/tot_ep_done"] = tot_episodes_done
                 logger.log_metrics({**log_train_dict, **log_ep_dict}, step=global_step)
                 
                 train_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))

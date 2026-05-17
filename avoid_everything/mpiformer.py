@@ -77,6 +77,17 @@ class PositionEncoding3D(nn.Module):
         return pos.detach()
 
 
+# wrapper functions to disable torch.compile for functions that call C++ extensions (which are not compatible with torch.compile as of this writing).
+@torch.compiler.disable
+def safe_fps(pos, batch, ratio):
+    # This forces PyTorch to run this specific C++ extension in eager mode
+    return fps(pos, batch, ratio=ratio)
+
+@torch.compiler.disable
+def safe_radius(pos1, pos2, r, batch1, batch2, max_num_neighbors):
+    # This forces PyTorch to run this specific C++ extension in eager mode
+    return radius(pos1, pos2, r, batch1, batch2, max_num_neighbors=max_num_neighbors)
+    
 class SAModule(nn.Module):
     """
     Set aggregation module from PointNet++ (based on implementation in pytorch geometric).
@@ -91,8 +102,8 @@ class SAModule(nn.Module):
     def forward(
         self, x: torch.Tensor, pos: torch.Tensor, batch: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        idx = fps(pos, batch, ratio=self.ratio)
-        row, col = radius(
+        idx = safe_fps(pos, batch, ratio=self.ratio)
+        row, col = safe_radius(
             pos, pos[idx], self.r, batch, batch[idx], max_num_neighbors=64
         )
         edge_index = torch.stack([col, row], dim=0)

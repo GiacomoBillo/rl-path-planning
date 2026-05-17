@@ -60,6 +60,9 @@ training_model_parameters:
   train_batch_size: 8
   disable_viz: true
   decay_rate: null
+  min_lr: 1.0e-5
+  max_lr: 5.0e-5
+  warmup_steps: 5000
 
 data_module_parameters:
   data_dir: /workspace/datasets/ae_aristotle1_5mm_cubbies
@@ -76,7 +79,7 @@ shared_parameters:
   num_robot_points: 2048
   goal_reward: 1.0
   collision_reward: -1.0
-  step_reward: -0.02
+  step_reward: 0.0
   reward_scale: 1.0
 
 # BC model parameters (passed separately to PretrainingMotionPolicyTransformer)
@@ -111,7 +114,7 @@ end_epoch_max_val_batches: 20       # Max validation batches per epoch (debug: m
 end_epoch_max_val_rollouts: 10      # Max validation rollouts per epoch (debug: minimal)
 max_epochs: 1                       # Total training epochs (debug: minimal)
 mintest: false                      # Minimal test mode
-logging: true                      # Disable wandb/tensorboard
+logging: false                      # Disable wandb/tensorboard
 load_model_from_checkpoint: false   # Start from BC checkpoint (true) or train from scratch (false)
 load_actor_only: false              # Only load actor weights (ignored if load_model_from_checkpoint=false)
 load_checkpoint_path: null          # Path to SAC checkpoint (ignored if load_model_from_checkpoint=false)
