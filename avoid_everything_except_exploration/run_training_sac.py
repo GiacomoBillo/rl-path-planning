@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict
 import time
 from contextlib import contextmanager
+from itertools import cycle
 
 from tqdm import tqdm
 from termcolor import cprint
@@ -58,7 +59,7 @@ def setup_logger(
     should_log: bool,
     experiment_name: str,
     config_values: Dict[str, Any],
-    project_name: str = "avoid-everything-except-exploration",
+    project_name: str = "rl-avoid-everything",
 ) -> WandbLogger | None:
     if not should_log:
         return None
@@ -283,7 +284,7 @@ def run():
     episode_metrics_count = 0
     tot_episodes_done = 0
 
-    train_trajectory_loader_iterator = iter(train_trajectory_loader) # TODO: what if it finishes? should we reset it?
+    train_trajectory_loader_iterator = iter(cycle(train_trajectory_loader))
     progress_bar = tqdm(
             total=replay_buffer.capacity,
             desc=f"Prefill buffer",
@@ -292,7 +293,7 @@ def run():
             disable=not is_rank_zero,
             dynamic_ncols=True,
         )
-    while len(replay_buffer) < replay_buffer.capacity/10:
+    while len(replay_buffer) < replay_buffer.capacity * config.get("prefill_buffer_ratio", 0.1):
         with torch.cuda.amp.autocast(dtype=torch.float16):
             idx, q, a, q_next, r, done, info = trainer.simulation_step(train_trajectory_loader_iterator) 
             # idx, q, a, q_next, r, done, info = trainer.simulation_step_v2(train_trajectory_loader_iterator) 
@@ -342,141 +343,126 @@ def run():
         "replay_sample_time": 0.0,
         "training_time": 0.0,
     }
-    
+
+    critic_warmup = config["training_model_parameters"]["actor_lr"]["type"] == "constant" and config["training_model_parameters"]["actor_lr"]["start_lr"] == 0.0
     trainer.torch_compile()  # compile the model for faster training 
-    for epoch in range(config["max_epochs"]):
-        epoch_bar = tqdm(
-            total=n_batches,
-            desc=f"Epoch {epoch+1}/{config['max_epochs']}",
-            unit="batch",
-            leave=True,
-            disable=not is_rank_zero,
-            dynamic_ncols=True,
-        )
-
-        batch_idx = 0
-
-        for _ in range(n_batches):
-            # --- Simulation step ---
-            t0 = time.time()
-            for _ in range(config["sim_steps_per_train_step"]):
-                with torch.cuda.amp.autocast(dtype=torch.float16):
-                    # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
-                    idx, q, a, q_next, r, done, info = trainer.simulation_step(train_trajectory_loader_iterator) # TODO: is this a problem? simulating a non-constant num of steps between training steps?
-                replay_buffer.push(
-                    idx=idx,
-                    q=q,
-                    a=a,
-                    q_next=q_next,
-                    r=r,
-                    done=done.unsqueeze(1),
-                )
-                
-                # Accumulate episode metrics for episodes that just ended
-                mask = done.bool()
-                if mask.any():
-                    for key, val in info.items():
-                        episode_metrics_accum[key] = episode_metrics_accum[key] + val[mask].float().sum()
-                episode_metrics_count += mask.sum().item()
-            t1 = time.time()
-            simulation_time = t1 - t0
-
-            # batch, data_loader_iterations = mixed_provider.sample(
-            #     8 if config["mintest"] else config["train_batch_size"],
-            #     expert_fraction=config["expert_fraction"],
-            #     pretraining=pretraining,
-            #     device=fabric.device,
-            # )
-
-            # --- Training step ---
-
-            # update_targets: bool = global_step % config["actor_delay"] == 0
-            # use_actor_loss: bool = update_targets and (global_step > config["start_using_actor_loss"])
-            # batch = replay_buffer.sample(config["train_batch_size"], device=device)
-            batch = async_replay.get()  # Blocks until next prefetched batch is ready
-            t2 = time.time()
-            replay_sample_time = t2 - t1
+    
+    for global_step in tqdm(
+        range(config["train_steps"]),
+        desc="Critic Warmup" if critic_warmup else "Training",
+        unit="step",
+        leave=True,
+        disable=not is_rank_zero,
+        dynamic_ncols=True,
+    ):
+        # --- Simulation step ---
+        t0 = time.time()
+        for _ in range(config["sim_steps_per_train_step"]):
             with torch.cuda.amp.autocast(dtype=torch.float16):
-                train_metrics = trainer.train_step(
-                    batch,
-                    # fabric=fabric,
-                    global_step=global_step,
-                )
-            training_time = time.time() - t2
-            times["simulation_time"] += simulation_time
-            times["replay_sample_time"] += replay_sample_time
-            times["training_time"] += training_time
-            if is_rank_zero and global_step>0 and global_step % 1000 == 0:
-                print(f"Step {global_step:06d} ",
-                      f"\n\tpartial\tsim_time={simulation_time:.4f}s  replay_sample_time={replay_sample_time:.4f}s  training_time={training_time:.4f}s  ", 
-                      f"\n\ttotal\tsim_time={times['simulation_time']/(global_step + 1):.4f}s  replay_sample_time={times['replay_sample_time']/(global_step + 1):.4f}s  training_time={times['training_time']/(global_step + 1):.4f}s")
-
-            # if global_step % config["collect_rollouts_every_n_steps"] == 0:
-            #     actor_rollout_metrics = trainer.actor_rollout(batch, replay_buffer) # fill the replay buffer
-            #     if logger:
-            #         logger.log_metrics(
-            #             {f"train/actor_rollouts/{k}": v for k, v in actor_rollout_metrics.items()},
-            #             step=global_step)
-            #         logger.log_metrics({"train/replay_buffer_size": len(replay_buffer)}, step=global_step)
-
-            for k, v in train_metrics.items():
-                if v is not None:
-                    train_metrics_accum[k] = train_metrics_accum[k] + v
+                # idx, q, a, q_next, r, done = trainer.simulation_step(train_trajectory_loader_iterator)
+                idx, q, a, q_next, r, done, info = trainer.simulation_step(train_trajectory_loader_iterator) # TODO: is this a problem? simulating a non-constant num of steps between training steps?
+            replay_buffer.push(
+                idx=idx,
+                q=q,
+                a=a,
+                q_next=q_next,
+                r=r,
+                done=done.unsqueeze(1),
+            )
             
-            train_metrics_count += 1
+            # Accumulate episode metrics for episodes that just ended
+            mask = done.bool()
+            if mask.any():
+                for key, val in info.items():
+                    episode_metrics_accum[key] = episode_metrics_accum[key] + val[mask].float().sum()
+            episode_metrics_count += mask.sum().item()
+        t1 = time.time()
+        simulation_time = t1 - t0
+
+        # batch, data_loader_iterations = mixed_provider.sample(
+        #     8 if config["mintest"] else config["train_batch_size"],
+        #     expert_fraction=config["expert_fraction"],
+        #     pretraining=pretraining,
+        #     device=fabric.device,
+        # )
+
+        # --- Training step ---
+
+        # update_targets: bool = global_step % config["actor_delay"] == 0
+        # use_actor_loss: bool = update_targets and (global_step > config["start_using_actor_loss"])
+        # batch = replay_buffer.sample(config["train_batch_size"], device=device)
+        batch = async_replay.get()  # Blocks until next prefetched batch is ready
+        t2 = time.time()
+        replay_sample_time = t2 - t1
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            train_metrics = trainer.train_step(
+                batch,
+                # fabric=fabric,
+                global_step=global_step,
+                critic_warmup=critic_warmup,
+            )
+        training_time = time.time() - t2
+        times["simulation_time"] += simulation_time
+        times["replay_sample_time"] += replay_sample_time
+        times["training_time"] += training_time
+        # if is_rank_zero and global_step>0 and global_step % 1000 == 0:
+        #     print(f"Step {global_step:06d} ",
+        #           f"\n\tpartial\tsim_time={simulation_time:.4f}s  replay_sample_time={replay_sample_time:.4f}s  training_time={training_time:.4f}s  ", 
+        #           f"\n\ttotal\tsim_time={times['simulation_time']/(global_step + 1):.4f}s  replay_sample_time={times['replay_sample_time']/(global_step + 1):.4f}s  training_time={times['training_time']/(global_step + 1):.4f}s")
+
+        # if global_step % config["collect_rollouts_every_n_steps"] == 0:
+        #     actor_rollout_metrics = trainer.actor_rollout(batch, replay_buffer) # fill the replay buffer
+        #     if logger:
+        #         logger.log_metrics(
+        #             {f"train/actor_rollouts/{k}": v for k, v in actor_rollout_metrics.items()},
+        #             step=global_step)
+        #         logger.log_metrics({"train/replay_buffer_size": len(replay_buffer)}, step=global_step)
+
+        for k, v in train_metrics.items():
+            if v is not None:
+                train_metrics_accum[k] = train_metrics_accum[k] + v
+        
+        train_metrics_count += 1
+        
+        if logger and (global_step % config["log_train_freq"] == 0) and global_step > 0:
+            log_train_dict = {f"train/{k}": (s / train_metrics_count).item() 
+                        for k, s in train_metrics_accum.items()}
+            log_ep_dict = {f"ep/{k}": (s / episode_metrics_count).item()
+                        for k, s in episode_metrics_accum.items()}
+            tot_episodes_done += episode_metrics_count
+            log_ep_dict["ep/tot_ep_done"] = tot_episodes_done
+            log_time_dict = {f"time/{k}": (s / train_metrics_count) for k, s in times.items()}
+            logger.log_metrics({**log_train_dict, **log_ep_dict, **log_time_dict}, step=global_step)
             
-            if logger and (global_step % config["log_train_freq"] == 0) and global_step > 0:
-                log_train_dict = {f"train/{k}": (s / train_metrics_count).item() 
-                            for k, s in train_metrics_accum.items()}
-                log_ep_dict = {f"ep/{k}": (s / episode_metrics_count).item()
-                            for k, s in episode_metrics_accum.items()}
-                tot_episodes_done += episode_metrics_count
-                log_ep_dict["ep/tot_ep_done"] = tot_episodes_done
-                logger.log_metrics({**log_train_dict, **log_ep_dict}, step=global_step)
-                
-                train_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
-                train_metrics_count = 0
-                episode_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
-                episode_metrics_count = 0
-            # TODO: log time, episode, validation, replay buffer
+            train_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
+            train_metrics_count = 0
+            episode_metrics_accum = defaultdict(lambda: torch.tensor(0.0, device=device))
+            episode_metrics_count = 0
+            times = { k: 0.0 for k in times.keys() }
+        # TODO: log time, episode, validation, replay buffer
 
-            # increment with the number of batches consumed from the expert loader
-            # NOTE: This makes it APPEAR as if training slows down to `expert_fraction` of pre-training speed
-            prev = batch_idx
-            # batch_idx = min(n_batches, batch_idx + data_loader_iterations)
-            batch_idx += 1
-            if is_rank_zero:
-                # epoch_bar.set_postfix(
-                #     ordered_dict={
-                #         "point_match_loss": metrics["point_match_loss"], 
-                #         "pretraining": "True" if pretraining else "False",
-                #     })
-                epoch_bar.update(batch_idx - prev)
-            if batch_idx >= n_batches:
-                break
+        # if logger and (global_step % config["validate_every_n_steps"] == 0) and global_step>0:
+        #     if is_rank_zero:
+        #         cprint(f"\nValidation at global step {global_step}", "blue")
+        #     val_metrics = run_state_val_epoch(
+        #         val_state_loader, max_val_batches=config["mid_epoch_max_val_batches"])
+        #     val_metrics.update(run_rollout_val_epoch(
+        #         val_trajectory_loader, max_val_batches=config["mid_epoch_max_val_rollouts"]))
+        #     if logger:
+        #         logger.log_metrics({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
 
-            # if logger and (global_step % config["validate_every_n_steps"] == 0) and global_step>0:
-            #     if is_rank_zero:
-            #         cprint(f"\nValidation at global step {global_step}", "blue")
-            #     val_metrics = run_state_val_epoch(
-            #         val_state_loader, max_val_batches=config["mid_epoch_max_val_batches"])
-            #     val_metrics.update(run_rollout_val_epoch(
-            #         val_trajectory_loader, max_val_batches=config["mid_epoch_max_val_rollouts"]))
-            #     if logger:
-            #         logger.log_metrics({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
-
-            # # periodic checkpointing based on wall time
-            # if config["checkpoint_interval"] > 0 and (time.time() - last_ckpt_time) / 60.0 >= config["checkpoint_interval"]:
-            #     ckpt_path = Path(save_dir) / f"fabric-epoch{epoch+1}-step{global_step}.ckpt"
-            #     fabric.save(str(ckpt_path), {
-            #         "actor": trainer.actor.state_dict(), 
-            #         "critic_q1": trainer.qf1.state_dict(), 
-            #         "critic_q2": trainer.qf2.state_dict(),
-            #         "actor_optimizer": trainer.actor_optimizer.state_dict(), 
-            #         "critic_optimizer": trainer.critic_optimizer.state_dict(),
-            #         "actor_scheduler": trainer.actor_scheduler.state_dict(),
-            #         "critic_scheduler": trainer.critic_scheduler.state_dict(),
-            #     },)
+        # # periodic checkpointing based on wall time
+        # if config["checkpoint_interval"] > 0 and (time.time() - last_ckpt_time) / 60.0 >= config["checkpoint_interval"]:
+        #     ckpt_path = Path(save_dir) / f"fabric-epoch{epoch+1}-step{global_step}.ckpt"
+        #     fabric.save(str(ckpt_path), {
+        #         "actor": trainer.actor.state_dict(), 
+        #         "critic_q1": trainer.qf1.state_dict(), 
+        #         "critic_q2": trainer.qf2.state_dict(),
+        #         "actor_optimizer": trainer.actor_optimizer.state_dict(), 
+        #         "critic_optimizer": trainer.critic_optimizer.state_dict(),
+        #         "actor_scheduler": trainer.actor_scheduler.state_dict(),
+        #         "critic_scheduler": trainer.critic_scheduler.state_dict(),
+        #     },)
             #     cprint(f"Saved checkpoint to {ckpt_path}", "green")
             #     last_ckpt_time = time.time()
 

@@ -107,8 +107,10 @@ replay_buffer_capacity: 1000000       # Max transitions to store (debug: reduced
 async_replay_prefetch: 2            # Batches to prefetch in async replay (debug: reduced)
 n_gpus: 1                           # GPUs to use
 prefill_batch_size: 128
+prefill_buffer: 0.1                  # Percentage of replay buffer to prefill 
 simulation_batch_size: 64              # Parallel envs for simulation (debug: small)
 train_batch_size: 64                 # Training batch size (debug: small)
+train_steps: 100000                # Total training steps (debug: minimal)
 val_batch_size: 8                   # Validation batch size (debug: small)
 end_epoch_max_val_batches: 20       # Max validation batches per epoch (debug: minimal)
 end_epoch_max_val_rollouts: 10      # Max validation rollouts per epoch (debug: minimal)

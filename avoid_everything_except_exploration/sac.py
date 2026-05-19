@@ -657,7 +657,8 @@ class SACMotionPolicyTrainer():
     def train_step(self,
                     batch: dict[str, torch.Tensor],
                     # fabric: Fabric,
-                    global_step: int
+                    global_step: int,
+                    critic_warmup: bool = False,
                     ):
         """
         Compute one training step and return metrics as GPU tensors (detached).
@@ -719,9 +720,10 @@ class SACMotionPolicyTrainer():
         metrics["target_q_min"] = min_qf_next_target.mean().detach()
         metrics["target_q1"] = qf1_next_target.mean().detach()
         metrics["target_q2"] = qf2_next_target.mean().detach()
+        metrics["critic_warmup"] = critic_warmup
 
         # Delayed policy update (TD3-style)
-        if global_step % self.policy_frequency == 0:
+        if not critic_warmup and global_step % self.policy_frequency == 0:
             for _ in range(self.policy_frequency):
                 pi, log_pi, mu, log_std = self.actor.get_action(state_features)
                 qf1_pi = self.qf1(state_features, pi)
@@ -781,6 +783,8 @@ class SACMotionPolicyTrainer():
             # Initialize reset batch queue with pre-loaded batch (async)
             self.reset_queue = self.move_batch_to_device(next(dataloader_iterator), self.device, non_blocking=True)
             self.reset_queue_idx = 0
+            # PREFETCH a second batch to sit idle on the GPU    
+            self.prefetched_batch = self.move_batch_to_device(next(dataloader_iterator), self.device, non_blocking=True)
         
         # Extract current state
         batch: Dict = self.simulation_batch
@@ -825,23 +829,30 @@ class SACMotionPolicyTrainer():
         reset_mask = done.squeeze(-1) if done.dim() > 1 else done
         num_resets = reset_mask.sum().item()
         if num_resets > 0:    
-            # Check if queue has at least one batch of samples; refill if needed
             available = self.reset_queue["configuration"].size(0) - self.reset_queue_idx
-            if available < q.size(0): 
-                # Fetch new batch and append to existing queue
-                new_batch = self.move_batch_to_device(next(dataloader_iterator), self.device, non_blocking=True)
-                self.reset_queue = {
-                    k: torch.cat([v[self.reset_queue_idx:], new_batch[k]], dim=0)
+            
+            if num_resets <= available:
+                # Happy path: enough in queue, just slice and increment pointer (O(1))
+                reset_batch = {
+                    k: v[self.reset_queue_idx:self.reset_queue_idx + num_resets]
                     for k, v in self.reset_queue.items()
                 }
-                self.reset_queue_idx = 0
-            
-            # Extract exactly num_resets samples from queue front
-            reset_batch = {
-                k: v[self.reset_queue_idx:self.reset_queue_idx + num_resets]
-                for k, v in self.reset_queue.items()
-            }
-            self.reset_queue_idx += num_resets
+                self.reset_queue_idx += num_resets
+            else:
+                # Need to refill: split resets between remaining queue and prefetch
+                num_from_queue = available
+                num_from_prefetch = num_resets - num_from_queue
+                
+                reset_batch = {
+                    k: torch.cat([self.reset_queue[k][self.reset_queue_idx:],
+                                  self.prefetched_batch[k][:num_from_prefetch]], dim=0)
+                    for k in self.reset_queue.keys()
+                }
+                
+                # Promote prefetched batch to queue and prefetch next batch
+                self.reset_queue = self.prefetched_batch
+                self.reset_queue_idx = num_from_prefetch
+                self.prefetched_batch = self.move_batch_to_device(next(dataloader_iterator), self.device, non_blocking=True)
             
             # Apply resets to done episodes
             batch["configuration"][reset_mask] = reset_batch["configuration"]

@@ -289,43 +289,47 @@ class MPiFormerCriticHead(nn.Module):
         *,
         split_layer: int = 7,
         deep_copy: bool = True,
-        type_action_merge: Literal["MLP", "FiLM", "action_token", "Cross-attention"] = "FiLM"
+        type_action_injection: Literal["MLP", "FiLM", "action_token", "Cross-attention"] = "FiLM"
     ):
         super().__init__()
         self.tail = _TailNetwork(bc_model, split_layer=split_layer, deep_copy=deep_copy)
-        action_dim = bc_model.action_decoder.out_features
-        critic_in_dim = self.tail.d_model + action_dim
-        self.q = nn.Linear(critic_in_dim, 1)
+        self.action_dim = bc_model.action_decoder.out_features
+        # critic_in_dim = self.tail.d_model + action_dim
+        # self.q = nn.Linear(critic_in_dim, 1)
 
-        self.type_action_merge = type_action_merge
-        if type_action_merge == "FiLM":
-            self.film_layer = nn.Linear(action_dim, self.tail.d_model * 2) # outputs scale and shift for FiLM modulation
+        self.type_action_injection = type_action_injection
+        if type_action_injection == "FiLM":
+            self.film_layer = nn.Linear(self.action_dim, self.tail.d_model * 2) # outputs scale and shift for FiLM modulation
+            self.linear = nn.Linear(self.tail.d_model, 1)
             self.forward = self._forward_film
-        elif type_action_merge == "MLP":
-            self.q = nn.Sequential(
-                nn.Linear(critic_in_dim, 256),
+        elif type_action_injection == "MLP":
+            self.mlp = nn.Sequential(
+                nn.Linear(self.tail.d_model + self.action_dim, 256),
                 nn.ReLU(),
                 nn.Linear(256, 256),
                 nn.ReLU(),
                 nn.Linear(256, 1)
             )
-            self.forward = self._forward
+            self.forward = self._forward_mlp    
         else:
-            print("Warning: type_action_merge not implemented")
-        print(f"Critic type_action_merge: {type_action_merge}")
+            print("Warning: type_action_injection not implemented")
+        print(f"Critic type_action_injection: {type_action_injection}")
 
-    def _forward(self, features: torch.Tensor, rl_action: torch.Tensor) -> torch.Tensor:
+    def _forward_mlp(self, features: torch.Tensor, rl_action: torch.Tensor) -> torch.Tensor:
         # Merge action after transformer layers by concatenation, then pass through Linear or MLP
         latent = self.tail(features)
         x = torch.cat([latent, rl_action], dim=-1)
-        return self.q(x)
+        return self.mlp(x)
     
     def _forward_film(self, features: torch.Tensor, rl_action: torch.Tensor) -> torch.Tensor:
+        # Merge action with features using FiLM modulation: predict scale and shift from action, 
+        # then apply to intermediate transformer tokens 
+        # before passing through remaining transformer layers and final Q output linear layer.
         film_params = self.film_layer(rl_action)
         scale, shift = film_params.chunk(2, dim=-1)
         features = features * (scale + 1) + shift  # FiLM modulation, identity initialization
         latent = self.tail(features)
-        return self.q(latent)
+        return self.linear(latent)
 
 
 if __name__ == "__main__":
